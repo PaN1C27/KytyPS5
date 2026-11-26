@@ -430,6 +430,7 @@ public:
 			Fail(0, "resources already tracked");
 		}
 		ForwardPrivateLds();
+		FoldDominatedBranchConditions(m_program.blocks);
 		FoldBoundedLoopSelectors();
 		PlanScalarReads();
 		EliminateDeadCode(m_program.blocks);
@@ -775,13 +776,38 @@ private:
 			if (projected != nullptr) cached->second = Value(projected);
 			return cached->second;
 		}
-		if (inst->NumArgs() != 2u || inst->NumPhiBlocks() != 2u || inst->GetType() != Type::U32) {
+		const auto* merge = inst->Parent();
+		if (merge == nullptr || inst->NumPhiBlocks() != inst->NumArgs() ||
+		    inst->GetType() != Type::U32) {
 			return value;
 		}
-		const auto* merge = inst->Parent();
-		const auto* branch = inst->PhiBlock(0);
-		if (merge == nullptr || branch == nullptr || inst->PhiBlock(1) == nullptr ||
-		    branch == inst->PhiBlock(1)) {
+		std::array<size_t, 2> live_arms {};
+		size_t                live_count = 0;
+		for (size_t arm = 0; arm < inst->NumArgs(); ++arm) {
+			const auto* incoming = inst->PhiBlock(arm);
+			if (incoming == nullptr) {
+				return value;
+			}
+			if (IsUnreachablePhiEdge(incoming, merge)) {
+				continue;
+			}
+			if (live_count == 2u) {
+				return value;
+			}
+			live_arms[live_count++] = arm;
+		}
+		if (live_count == 0u) {
+			return value;
+		}
+		if (live_count == 1u) {
+			cached->second = LowerDescriptorValue(inst->Arg(live_arms[0]));
+			return cached->second;
+		}
+		const size_t arm0   = live_arms[0];
+		const size_t arm1   = live_arms[1];
+		const auto*  branch = inst->PhiBlock(arm0);
+		if (branch == nullptr || inst->PhiBlock(arm1) == nullptr ||
+		    branch == inst->PhiBlock(arm1)) {
 			return value;
 		}
 		if (branch->ImmSuccessors().size() != 2u) {
@@ -795,7 +821,7 @@ private:
 		}
 		std::array<const Block*, 2> targets;
 		for (uint32_t arm = 0; arm < 2; arm++) {
-			const auto* incoming = inst->PhiBlock(arm);
+			const auto* incoming = inst->PhiBlock(live_arms[arm]);
 			if (incoming == merge ||
 			    (incoming != branch &&
 			     (incoming->ImmPredecessors().size() != 1u ||
@@ -812,17 +838,22 @@ private:
 		    !((term.true_block == targets[0] && term.false_block == targets[1]) ||
 		      (term.false_block == targets[0] && term.true_block == targets[1])) ||
 		    !ValidateRuntimeValue(m_program, info.condition, m_shader_writes
-		        ? RuntimeValueType::ImmutableInteger : RuntimeValueType::Integer) ||
-		    !ValidateRuntimeValue(m_program, inst->Arg(0)) ||
-		    !ValidateRuntimeValue(m_program, inst->Arg(1))) {
+		        ? RuntimeValueType::ImmutableInteger : RuntimeValueType::Integer)) {
+			return value;
+		}
+		const auto lowered0 = LowerDescriptorValue(inst->Arg(arm0));
+		const auto lowered1 = LowerDescriptorValue(inst->Arg(arm1));
+		if (!ValidateRuntimeValue(m_program, lowered0) ||
+		    !ValidateRuntimeValue(m_program, lowered1)) {
 			return value;
 		}
 		// Retain a host expression; replacing the GPU Phi would break SSA dominance.
-		const auto true_arg = term.true_block == targets[0] ? 0u : 1u;
-		auto&      selected = m_program.value_storage.emplace_back(ValueOpcode::SelectU32);
+		const auto true_val  = term.true_block == targets[0] ? lowered0 : lowered1;
+		const auto false_val = term.true_block == targets[0] ? lowered1 : lowered0;
+		auto&      selected  = m_program.value_storage.emplace_back(ValueOpcode::SelectU32);
 		selected.SetArg(0, info.condition);
-		selected.SetArg(1, inst->Arg(true_arg));
-		selected.SetArg(2, inst->Arg(true_arg ^ 1u));
+		selected.SetArg(1, true_val);
+		selected.SetArg(2, false_val);
 		cached->second = Value(&selected);
 		return cached->second;
 	}

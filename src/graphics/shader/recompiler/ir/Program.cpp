@@ -174,6 +174,40 @@ bool EquivalentSelectorDomain(const ResourcePlan& program,
 	       EquivalentValue(program, left.selector_mask, right.selector_mask);
 }
 
+bool IsUnreachablePhiEdge(const Block* pred, const Block* merge) {
+	const Block* from = pred;
+	const Block* to   = merge;
+	for (uint32_t depth = 0; depth < 16u; ++depth) {
+		if (from == nullptr || to == nullptr || from == to) {
+			return false;
+		}
+		if (from->terminator.kind == CFG::TerminatorKind::ConditionalBranch &&
+		    from->terminator.true_block != from->terminator.false_block) {
+			const auto cond = from->condition.Resolve();
+			if (cond.IsImmediate() && cond.GetType() == Type::U1) {
+				const auto* taken =
+				    cond.U1() ? from->terminator.true_block : from->terminator.false_block;
+				if (taken != to) {
+					return true;
+				}
+			}
+		}
+		if (from->ImmPredecessors().size() != 1u) {
+			return false;
+		}
+		const Block* prev = from->ImmPredecessors()[0];
+		if (prev == nullptr ||
+		    !((prev->terminator.kind == CFG::TerminatorKind::Branch &&
+		       prev->terminator.true_block == from) ||
+		      prev->terminator.kind == CFG::TerminatorKind::ConditionalBranch)) {
+			return false;
+		}
+		to   = from;
+		from = prev;
+	}
+	return false;
+}
+
 Value ResolveInvariantPhi(const ResourcePlan& program, Value value) {
 	value            = value.Resolve();
 	const auto* root = value.TryInstruction();
@@ -191,7 +225,12 @@ Value ResolveInvariantPhi(const ResourcePlan& program, Value value) {
 			if (!visited.insert(inst).second) {
 				continue;
 			}
+			const auto* merge = inst->Parent();
 			for (size_t index = 0; index < inst->NumArgs(); index++) {
+				if (merge != nullptr && index < inst->NumPhiBlocks() &&
+				    IsUnreachablePhiEdge(inst->PhiBlock(index), merge)) {
+					continue;
+				}
 				pending.push_back(inst->Arg(index));
 			}
 			continue;

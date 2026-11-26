@@ -8,5 +8,6 @@ struct Program;
 
 void RemoveIdentities(Program& program);
 void EliminateDeadCode(const BlockList& blocks);
+bool FoldDominatedBranchConditions(const BlockList& blocks);
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

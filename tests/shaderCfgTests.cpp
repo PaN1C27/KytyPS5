@@ -11764,6 +11764,140 @@ void TestUniformSelectedWritableDescriptor() {
   }
 }
 
+void TestDominatedBranchAndNestedDiamondDescriptor() {
+  using namespace ShaderRecompiler::IR;
+  // Case A: dominated scalar check guards a nested diamond descriptor chain after a
+  // dynamic v_readlane_b32 write to the descriptor register on the skipped arm.
+  {
+    const uint32_t shader[] = {
+        EncodeSmem0(0x00u, 12u, 2u),  (125u << 25u) | 0u, // 0..1: s_load_dword s12, s[4:5], 0
+        EncodeSop2(0x0eu, 12u, 128u + 8u, 12u),           // 2: s_and_b32 s12, 8, s12
+        EncodeSopc(0x07u, 128u, 12u),                     // 3: s_cmp_lg_u32 0, s12
+        EncodeSopp(0x04u, 26u),                           // 4: s_cbranch_scc0 +26 -> exit (31)
+        EncodeSopc(0x06u, 128u, 2u),                      // 5: s_cmp_eq_u32 0, s2
+        EncodeSopp(0x04u, 3u),                            // 6: s_cbranch_scc0 +3 -> outer_else (10)
+        EncodeSmem0(0x00u, 6u, 2u),   (125u << 25u) | 16u,// 7..8: s_load_dword s6, s[4:5], 16
+        EncodeSopp(0x02u, 2u),                            // 9: s_branch +2 -> outer_merge (12)
+        EncodeSmem0(0x00u, 6u, 2u),   (125u << 25u) | 32u,// 10..11: s_load_dword s6, s[4:5], 32
+        EncodeSMovB32(7u, 128u),                          // 12: s_mov_b32 s7, 0
+        EncodeVop3Word0(0x360u, 10u),                     // 13..14: v_readlane_b32 s10, v0, 0
+        EncodeVop3Word1(256u + 0u, 128u, 0u),
+        EncodeSopc(0x07u, 128u, 12u),                     // 15: s_cmp_lg_u32 0, s12 (redundant)
+        EncodeSopp(0x04u, 12u),                           // 16: s_cbranch_scc0 +12 -> merge (29)
+        EncodeSopc(0x06u, 128u, 1u),                      // 17: s_cmp_eq_u32 0, s1
+        EncodeSopp(0x05u, 4u),                            // 18: s_cbranch_scc1 +4 -> inner_skip (23)
+        EncodeSmem0(0x00u, 13u, 2u),  (125u << 25u) | 48u,// 19..20: s_load_dword s13, s[4:5], 48
+        EncodeSop2(0x00u, 8u, 6u, 13u),                   // 21: s_add_u32 s8, s6, s13
+        EncodeSopp(0x02u, 1u),                            // 22: s_branch +1 -> inner_merge (24)
+        EncodeSMovB32(8u, 6u),                            // 23: s_mov_b32 s8, s6
+        EncodeSop2(0x10u, 9u, 7u, 255u), 0x00040000u,     // 24..25: s_or_b32 s9, s7, 0x00040000
+        EncodeSMovB32(10u, 3u),                           // 26: s_mov_b32 s10, s3
+        EncodeSMovB32(11u, 255u), 0x00016204u,            // 27..28: s_mov_b32 s11, 0x00016204
+        EncodeMubuf0(0x1cu, 0u, true),                    // 29..30: buffer_store_dword v0, v1, s[8:11], 0
+        EncodeMubuf1(0u, 2u, 1u),
+        EncodeSopp(0x01u),                                // 31: s_endpgm
+    };
+    std::array<uint32_t, 6> user_data{0u, 0u, 0u, 16u, 0x2000u, 0u};
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    options.user_data = user_data;
+    auto translated = ShaderRecompiler::TranslateProgram(shader, options);
+    auto plan = ExtractResourcePlan(translated.program);
+    Check(plan.info.buffers.size() == 1 && plan.info.buffers[0].written,
+          "dominated nested-diamond shader lost its writable buffer");
+
+    struct Memory {
+      const uint32_t *flag1;
+      const uint32_t *flag2;
+      uint32_t unavailable = 0;
+    } memory{&user_data[2], &user_data[1]};
+    FakeGuestMemory fake(+[](void *data, uint64_t address, std::span<uint32_t> words) {
+      auto &m = *static_cast<Memory *>(data);
+      const bool outer_then = *m.flag1 == 0u;
+      const bool inner_add = *m.flag2 != 0u;
+      bool available = false;
+      switch (address) {
+      case 0x2000u: words[0] = 8u; available = true; break;
+      case 0x2010u: words[0] = 0x100u; available = outer_then; break;
+      case 0x2020u: words[0] = 0x200u; available = !outer_then; break;
+      case 0x2030u: words[0] = 0x40u; available = inner_add; break;
+      default: break;
+      }
+      m.unavailable += !available;
+      return available;
+    }, &memory);
+
+    const SrtRuntime runtime{.user_data = user_data};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    for (const uint32_t f1 : {0u, 1u}) {
+      for (const uint32_t f2 : {0u, 1u}) {
+        user_data[2] = f1;
+        user_data[1] = f2;
+        Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+                  memory.unavailable == 0u,
+              "nested-diamond descriptor materialized unavailable arm or failed");
+        const uint32_t expected_base = (f1 == 0u ? 0x100u : 0x200u) + (f2 != 0u ? 0x40u : 0u);
+        const auto &descriptor = snapshot.buffers[0].dwords;
+        Check(descriptor[0] == expected_base && descriptor[1] == 0x00040000u &&
+                  descriptor[2] == 16u && descriptor[3] == 0x00016204u,
+              "nested-diamond descriptor produced wrong materialized dwords");
+      }
+    }
+
+    const auto result = RecompileForTest(shader, options);
+    CheckSpirvBinaryValidates(result.spirv);
+  }
+
+  // Case B: complementary dominated comparison (INotEqual32 vs swapped IEqual32).
+  {
+    const uint32_t shader[] = {
+        EncodeSmem0(0x00u, 12u, 2u), (125u << 25u) | 0u,  // 0..1: s_load_dword s12, s[4:5], 0
+        EncodeSop2(0x0eu, 12u, 128u + 8u, 12u),           // 2: s_and_b32 s12, 8, s12
+        EncodeSopc(0x07u, 128u, 12u),                     // 3: s_cmp_lg_u32 0, s12
+        EncodeSopp(0x04u, 12u),                           // 4: s_cbranch_scc0 +12 -> exit (17)
+        EncodeVop3Word0(0x360u, 10u),                     // 5..6: v_readlane_b32 s10, v0, 0
+        EncodeVop3Word1(256u + 0u, 128u, 0u),
+        EncodeSopc(0x06u, 12u, 128u),                     // 7: s_cmp_eq_u32 s12, 0 (complementary)
+        EncodeSopp(0x05u, 6u),                            // 8: s_cbranch_scc1 +6 -> merge (15)
+        EncodeSMovB32(8u, 0u),                            // 9: s_mov_b32 s8, s0
+        EncodeSMovB32(9u, 255u), 0x00040000u,             // 10..11: s_mov_b32 s9, 0x00040000
+        EncodeSMovB32(10u, 3u),                           // 12: s_mov_b32 s10, s3
+        EncodeSMovB32(11u, 255u), 0x00016204u,            // 13..14: s_mov_b32 s11, 0x00016204
+        EncodeMubuf0(0x1cu, 0u, true),                    // 15..16: buffer_store_dword v0, v1, s[8:11], 0
+        EncodeMubuf1(0u, 2u, 1u),
+        EncodeSopp(0x01u),                                // 17: s_endpgm
+    };
+    std::array<uint32_t, 6> user_data{0x1200u, 0u, 0u, 24u, 0x2000u, 0u};
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    options.user_data = user_data;
+    auto translated = ShaderRecompiler::TranslateProgram(shader, options);
+    auto plan = ExtractResourcePlan(translated.program);
+    Check(plan.info.buffers.size() == 1 && plan.info.buffers[0].written,
+          "complementary dominated-branch shader lost its writable buffer");
+
+    FakeGuestMemory fake(+[](void *, uint64_t address, std::span<uint32_t> words) {
+      if (address == 0x2000u) {
+        words[0] = 8u;
+        return true;
+      }
+      return false;
+    });
+    const SrtRuntime runtime{.user_data = user_data};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              snapshot.buffers.size() == 1u,
+          "complementary dominated-branch descriptor materialization failed");
+    const auto &descriptor = snapshot.buffers[0].dwords;
+    Check(descriptor[0] == 0x1200u && descriptor[1] == 0x00040000u &&
+              descriptor[2] == 24u && descriptor[3] == 0x00016204u,
+          "complementary dominated-branch produced wrong materialized dwords");
+
+    const auto result = RecompileForTest(shader, options);
+    CheckSpirvBinaryValidates(result.spirv);
+  }
+}
+
 void TestUniformSelectedDescriptorLoadAddress() {
   using namespace ShaderRecompiler::IR;
   const uint32_t shader[] = {
@@ -13895,6 +14029,7 @@ int main() {
   TestPatternFill();
   TestGpuProducedWritableDescriptor();
   TestUniformSelectedWritableDescriptor();
+  TestDominatedBranchAndNestedDiamondDescriptor();
   TestUniformSelectedDescriptorLoadAddress();
   TestBoundedScalarMaterialImageKeys();
   TestImmutableDescriptorPredicate();

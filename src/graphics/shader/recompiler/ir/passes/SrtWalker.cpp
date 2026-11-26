@@ -352,8 +352,17 @@ private:
 			              axis.IsImmediate() && axis.GetType() == Type::U32 && axis.U32() < 3u);
 		}
 		if (op == ValueOpcode::Phi) {
-			if (m_type != RuntimeValueType::Any && !ValidateArguments(*inst, false)) {
-				return finish(false);
+			if (m_type != RuntimeValueType::Any) {
+				const auto* merge = inst->Parent();
+				for (size_t index = 0; index < inst->NumArgs(); ++index) {
+					if (merge != nullptr && index < inst->NumPhiBlocks() &&
+					    IsUnreachablePhiEdge(inst->PhiBlock(index), merge)) {
+						continue;
+					}
+					if (!Validate(inst->Arg(index), false)) {
+						return finish(false);
+					}
+				}
 			}
 			const auto invariant = ResolveInvariantPhi(m_program, value);
 			if (invariant.IsEmpty()) {
