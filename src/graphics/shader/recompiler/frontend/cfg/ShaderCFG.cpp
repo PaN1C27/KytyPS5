@@ -1436,8 +1436,9 @@ Graph BuildGraph(const Decoder::Program& program) {
 
 	std::map<uint32_t, SetpcTargetInfo> setpc_targets;
 	for (uint32_t i = 0; i < program.instructions.size(); i++) {
-		const auto& inst    = program.instructions[i];
-		const auto  next_pc = InstructionEndPc(inst);
+		const auto& inst         = program.instructions[i];
+		const auto  next_pc      = InstructionEndPc(inst);
+		const auto  following_pc = i + 1u < program.instructions.size() ? program.instructions[i + 1u].pc : end_pc;
 		if (Decoder::IsDirectBranch(inst.opcode) ||
 		    (inst.opcode == Opcode::S_SWAPPC_B64 && inst.branch_target != UINT32_MAX)) {
 			if (!IsValidTarget(inst.branch_target, program.instructions, end_pc)) {
@@ -1446,8 +1447,9 @@ Graph BuildGraph(const Decoder::Program& program) {
 				                             inst.pc, inst.branch_target));
 			}
 			labels.push_back(inst.branch_target);
-			if (next_pc <= end_pc) {
-				labels.push_back(next_pc);
+			const auto split_pc = Decoder::IsConditionalBranch(inst.opcode) ? next_pc : following_pc;
+			if (split_pc <= end_pc) {
+				labels.push_back(split_pc);
 			}
 		} else if (inst.opcode == Opcode::S_SETPC_B64) {
 			SetpcTargetInfo target_info;
@@ -1469,11 +1471,11 @@ Graph BuildGraph(const Decoder::Program& program) {
 				labels.push_back(target);
 			}
 			setpc_targets.emplace(inst.pc, std::move(target_info));
-			if (next_pc <= end_pc) {
-				labels.push_back(next_pc);
+			if (following_pc <= end_pc) {
+				labels.push_back(following_pc);
 			}
 		} else if (inst.opcode == Opcode::S_ENDPGM || inst.opcode == Opcode::S_SWAPPC_B64) {
-			labels.push_back(next_pc);
+			labels.push_back(following_pc);
 		}
 	}
 
@@ -1494,12 +1496,15 @@ Graph BuildGraph(const Decoder::Program& program) {
 		BasicBlock block;
 		block.id         = static_cast<uint32_t>(graph.blocks.size());
 		block.start_pc   = start;
-		block.end_pc     = i + 1u < labels.size() ? labels[i + 1u] : end_pc;
+		const auto limit_pc = i + 1u < labels.size() ? labels[i + 1u] : end_pc;
 		block.inst_begin = static_cast<uint32_t>(begin - program.instructions.begin());
 		block.inst_end = static_cast<uint32_t>(
-		    std::lower_bound(program.instructions.begin(), program.instructions.end(), block.end_pc,
+		    std::lower_bound(program.instructions.begin(), program.instructions.end(), limit_pc,
 		                     [](const Instruction& inst, uint32_t pc) { return inst.pc < pc; }) -
 		    program.instructions.begin());
+		block.end_pc = block.inst_begin < block.inst_end
+		                   ? InstructionEndPc(program.instructions[block.inst_end - 1u])
+		                   : start;
 		graph.blocks.push_back(std::move(block));
 	}
 

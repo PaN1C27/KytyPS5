@@ -2168,6 +2168,40 @@ void TestDisabledDebugBranches() {
   }
 }
 
+void TestPostEndpgmColdBlockPastDebugHelper() {
+  using namespace ShaderRecompiler;
+  // Debug branch targets an undecodable helper right after S_ENDPGM, while a
+  // live conditional branch targets an out-of-line cold block placed after it
+  // that ends in an unconditional branch back before S_ENDPGM + zero padding.
+  const uint32_t cold_shader[] = {
+      EncodeSopp(0x19, 8),           // 0x00: s_cbranch_cdbgsys_or_user +8 -> 0x24 (debug helper)
+      0xbf068000u,                   // 0x04: s_cmp_eq_u32 s0, 0
+      EncodeSopp(0x04, 8),           // 0x08: s_cbranch_scc0 +8 -> 0x2c (cold block)
+      EncodeVop1(0x01, 1, 129),      // 0x0c: v_mov_b32 v1, 1
+      EncodeMubuf0(0x1c, 0, false),  // 0x10: buffer_store_dword v1, v0, s[0:3], 0
+      EncodeMubuf1(1, 0, 0),         // 0x14: word 1
+      EncodeSopp(0x01),              // 0x18: s_endpgm
+      0xffffffffu,                   // 0x1c: debug/unreachable pad
+      0xffffffffu,                   // 0x20: debug/unreachable pad
+      0xffffffffu,                   // 0x24: debug helper word 0 (must not decode)
+      0xffffffffu,                   // 0x28: debug helper word 1 (must not decode)
+      EncodeVop1(0x01, 1, 130),      // 0x2c: cold block: v_mov_b32 v1, 2
+      EncodeSopp(0x02, 0xfff7u),     // 0x30: s_branch -9 -> 0x10 (buffer_store_dword)
+      0u,                            // 0x34: trailing zero pad
+  };
+  Decoder::Program decoded;
+  Decoder::DecodeProgram(cold_shader, decoded);
+  Check(decoded.instructions.back().pc == 0x30u &&
+            decoded.instructions.back().opcode == Decoder::Opcode::S_BRANCH,
+        "post-ENDPGM cold block past debug helper was truncated");
+  auto graph = CFG::BuildGraph(decoded);
+  Check(graph.FindBlockByPc(0x2cu) != nullptr && graph.FindBlockByPc(0x24u) == nullptr,
+        "post-ENDPGM cold block or skipped debug helper produced wrong CFG blocks");
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  auto result = RecompileForTest(cold_shader, options);
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestOrderedPsDoneEndsProgram() {
   using namespace ShaderRecompiler;
   // Captured PPSA05366 POPS pixel shaders end in s_endpgm_ordered_ps_done, padded to 16 bytes.
@@ -13680,6 +13714,7 @@ int main() {
   TestNewShaderRecompilerBufferAtomicsGuardedByBounds();
   TestCapturedBufferAtomicsX2();
   TestDisabledDebugBranches();
+  TestPostEndpgmColdBlockPastDebugHelper();
   TestOrderedPsDoneEndsProgram();
   TestNewShaderRecompilerPixelImageSampleLodSelection();
   TestNewShaderRecompilerBranchConditionForms();

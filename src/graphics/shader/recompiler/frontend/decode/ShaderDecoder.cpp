@@ -393,7 +393,11 @@ void DecodeProgram(std::span<const uint32_t> code, Program& program) {
 	program.has_swap_pc = false;
 
 	std::vector<bool> branch_targets;
+	std::vector<bool> decoded_starts(code.size(), false);
+	bool              seen_endpgm       = false;
+	uint32_t          first_endpgm_word = UINT32_MAX;
 	for (uint32_t word_index = 0; word_index < code.size();) {
+		decoded_starts[word_index] = true;
 		program.instructions.emplace_back();
 		DecodeInstruction(code, word_index, program.instructions.back());
 
@@ -403,14 +407,42 @@ void DecodeProgram(std::span<const uint32_t> code, Program& program) {
 
 		if (IsDirectBranch(inst.opcode)) {
 			const auto target_index = inst.branch_target / sizeof(uint32_t);
-			if (branch_targets.empty()) {
-				branch_targets.resize(code.size());
+			if ((inst.branch_target & 3u) == 0u && target_index < code.size()) {
+				if (branch_targets.empty()) {
+					branch_targets.resize(code.size());
+				}
+				branch_targets[target_index] = true;
+				if (seen_endpgm && target_index >= first_endpgm_word &&
+				    target_index < word_index && !decoded_starts[target_index]) {
+					while (!program.instructions.empty() &&
+					       program.instructions.back().pc >= inst.branch_target) {
+						program.instructions.pop_back();
+					}
+					std::fill(decoded_starts.begin() + target_index,
+					          decoded_starts.begin() + word_index, false);
+					word_index = target_index;
+					continue;
+				}
 			}
-			branch_targets[target_index] = true;
 		}
-		if (inst.opcode == Opcode::S_ENDPGM &&
-		    (word_index >= code.size() || branch_targets.empty() || !branch_targets[word_index])) {
-			return;
+		if (inst.opcode == Opcode::S_ENDPGM && !seen_endpgm) {
+			seen_endpgm       = true;
+			first_endpgm_word = word_index;
+		}
+		if (seen_endpgm && (inst.opcode == Opcode::S_ENDPGM || inst.opcode == Opcode::S_BRANCH ||
+		                    inst.opcode == Opcode::S_SETPC_B64)) {
+			uint32_t next_target = word_index;
+			if (!branch_targets.empty()) {
+				while (next_target < code.size() && !branch_targets[next_target]) {
+					++next_target;
+				}
+			} else {
+				next_target = static_cast<uint32_t>(code.size());
+			}
+			if (next_target >= code.size()) {
+				return;
+			}
+			word_index = next_target;
 		}
 	}
 
