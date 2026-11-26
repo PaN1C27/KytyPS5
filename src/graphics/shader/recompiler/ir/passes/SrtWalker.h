@@ -60,7 +60,7 @@ private:
 	std::vector<std::pair<uint64_t, uint64_t>>& m_ranges;
 };
 
-enum class RuntimeValueType { Any, Integer, ImmutableInteger };
+enum class RuntimeValueType { Any, Integer, ScalarInteger, ImmutableInteger };
 
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
                           RuntimeValueType type = RuntimeValueType::Any);

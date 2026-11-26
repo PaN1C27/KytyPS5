@@ -297,6 +297,20 @@ private:
 		     SharedAccessOf(op) != SharedAccess::None)) {
 			return finish(false);
 		}
+		if (m_type == RuntimeValueType::ScalarInteger) {
+			const bool scalar_read =
+			    op == ValueOpcode::LoadAddressU32 &&
+			    inst->Flags<MemoryFlags>().index < m_program.memory_info.size() &&
+			    m_program.memory_info[inst->Flags<MemoryFlags>().index].kind ==
+			        ResourceKind::ScalarAddress;
+			if (!scalar_read &&
+			    (BufferAccessOf(op) != BufferAccess::None ||
+			     AddressOpcodeInfoOf(op).access != AddressAccess::None ||
+			     ImageOpcodeInfoOf(op).access != ImageAccess::None ||
+			     SharedAccessOf(op) != SharedAccess::None)) {
+				return finish(false);
+			}
+		}
 		if (op == ValueOpcode::ReadConst) {
 			const auto slot = inst->NumArgs() == 2 ? inst->Arg(1).Resolve() : Value {};
 			if (inst->NumArgs() != 2 || inst->Arg(0).Resolve().TryInstruction() == nullptr ||

@@ -422,7 +422,33 @@ public:
 		m_info.sampled_pairs.clear();
 		m_info.address_bases.clear();
 		m_info.user_address_bases.clear();
-		m_shader_writes = HasShaderMemoryWrites(program);
+		m_shader_writes      = HasShaderMemoryWrites(program);
+		for (const auto* block: program.blocks) {
+			for (const auto& inst: *block) {
+				if (AddressOpcodeInfoOf(inst.GetOpcode()).access != AddressAccess::Write) {
+					continue;
+				}
+				const auto index = inst.Flags<MemoryFlags>().index;
+				if (index >= program.memory_info.size()) {
+					m_has_address_writes = true;
+					break;
+				}
+				const auto& memory = program.memory_info[index];
+				if (memory.kind == ResourceKind::Scratch || memory.kind == ResourceKind::FlatLocal) {
+					continue;
+				}
+				if (memory.kind == ResourceKind::Flat && memory.address_is_full &&
+				    inst.NumArgs() >= 3u &&
+				    IsNoncanonicalFlatAddress(inst.Arg(2), inst.Arg(inst.NumArgs() - 1u))) {
+					continue;
+				}
+				m_has_address_writes = true;
+				break;
+			}
+			if (m_has_address_writes) {
+				break;
+			}
+		}
 	}
 
 	void Run() {
@@ -834,11 +860,13 @@ private:
 		}
 		const auto& info = *branch;
 		const auto& term = info.terminator;
+		const auto predicate_type = !m_shader_writes     ? RuntimeValueType::Integer
+		                          : m_has_address_writes ? RuntimeValueType::ImmutableInteger
+		                                                 : RuntimeValueType::ScalarInteger;
 		if (term.kind != CFG::TerminatorKind::ConditionalBranch ||
 		    !((term.true_block == targets[0] && term.false_block == targets[1]) ||
 		      (term.false_block == targets[0] && term.true_block == targets[1])) ||
-		    !ValidateRuntimeValue(m_program, info.condition, m_shader_writes
-		        ? RuntimeValueType::ImmutableInteger : RuntimeValueType::Integer)) {
+		    !ValidateRuntimeValue(m_program, info.condition, predicate_type)) {
 			return value;
 		}
 		const auto lowered0 = LowerDescriptorValue(inst->Arg(arm0));
@@ -5235,7 +5263,8 @@ private:
 	std::vector<IndirectDescriptorPlan>             m_indirect_descriptors;
 	std::map<const Inst*, Value>              m_descriptor_values;
 	mutable std::unordered_map<const Inst*, bool>   m_loop_proofs; // By loop-bound comparison.
-	bool                                       m_shader_writes = false;
+	bool                                       m_shader_writes      = false;
+	bool                                       m_has_address_writes = false;
 };
 
 UniformFillPlan RecognizePatternFill(Program& program, const Decoder::Program& decoded,

@@ -11704,9 +11704,21 @@ void TestImmutableDescriptorPredicate() {
     const auto reduced = emit(ValueOpcode::ReadFirstLane, {selected, mask});
     Check(ValidateRuntimeValue(plan, reduced, RuntimeValueType::Integer),
           "integer EXEC reduction lost its active-lane proof");
+    Check(!ValidateRuntimeValue(plan, reduced, RuntimeValueType::ScalarInteger),
+          "VMEM EXEC reduction was classified as scalar memory predicate");
     Check(!ValidateRuntimeValue(plan, reduced, RuntimeValueType::ImmutableInteger),
           "memory-dependent EXEC reduction was classified as immutable");
   }
+  plan.memory_info.push_back({.kind = ResourceKind::ScalarAddress});
+  const auto addr = emit(ValueOpcode::GetAddressResource, {Value(0x1000u), Value(0u)});
+  const auto scalar = emit(ValueOpcode::LoadAddressU32, {addr, Value(0u), Value(0u), Value(true)});
+  scalar.ResolveInstruction()->SetFlags(MemoryFlags{
+      .index = static_cast<uint32_t>(plan.memory_info.size() - 1u)});
+  const auto scalar_mask = emit(ValueOpcode::INotEqual32, {scalar, Value(0u)});
+  Check(ValidateRuntimeValue(plan, scalar_mask, RuntimeValueType::ScalarInteger),
+        "scalar-address predicate was rejected by ScalarInteger");
+  Check(!ValidateRuntimeValue(plan, scalar_mask, RuntimeValueType::ImmutableInteger),
+        "scalar-address predicate was accepted by ImmutableInteger");
 }
 
 void TestUniformSelectedWritableDescriptor() {
@@ -11896,6 +11908,77 @@ void TestDominatedBranchAndNestedDiamondDescriptor() {
     const auto result = RecompileForTest(shader, options);
     CheckSpirvBinaryValidates(result.spirv);
   }
+}
+
+void TestScalarMemorySelectedWritableDescriptor() {
+  using namespace ShaderRecompiler::IR;
+  // Mirrors CS 0x12070dfbb803ca3b Block $53..$55: an SMEM scalar flag selects
+  // a buffer address adjustment diamond feeding a writable buffer store.
+  const uint32_t shader[] = {
+      EncodeSmem0(0x00u, 106u, 2u),  (125u << 25u) | 40u,  // 0..1: s_load_dword vcc_lo, s[4:5], 40
+      EncodeSMovB32(8u, 0u),                               // 2: s_mov_b32 s8, s0
+      EncodeSMovB32(9u, 1u),                               // 3: s_mov_b32 s9, s1
+      EncodeSopc(0x0du, 106u, 128u + 3u),                  // 4: s_bitcmp1_b32 vcc_lo, 3
+      EncodeSopp(0x04u, 5u),                               // 5: s_cbranch_scc0 +5 -> skip_adjust (11)
+      EncodeSmem0(0x00u, 12u, 2u),   (125u << 25u) | 96u,  // 6..7: s_load_dword s12, s[4:5], 96
+      EncodeSop2(0x1eu, 12u, 12u, 128u + 2u),              // 8: s_lshl_b32 s12, s12, 2
+      EncodeSop2(0x00u, 8u, 8u, 12u),                      // 9: s_add_u32 s8, s8, s12
+      EncodeSop2(0x04u, 9u, 9u, 128u),                     // 10: s_addc_u32 s9, s9, 0
+      EncodeSmem0(0x00u, 10u, 2u),   (125u << 25u) | 104u, // 11..12: s_load_dword s10, s[4:5], 104
+      EncodeSMovB32(11u, 255u),      0x00016204u,          // 13..14: s_mov_b32 s11, 0x00016204
+      EncodeSop2(0x10u, 9u, 9u, 255u), 0x00040000u,        // 15..16: s_or_b32 s9, s9, 0x00040000
+      EncodeMubuf0(0x1cu, 0u, true),                       // 17..18: buffer_store_dword v0, v1, s[8:11], 0
+      EncodeMubuf1(0u, 2u, 1u),
+      EncodeSopp(0x01u),                                   // 19: s_endpgm
+  };
+  std::array<uint32_t, 6> user_data{0xffffff00u, 0u, 0u, 0u, 0x2000u, 0u};
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.user_data = user_data;
+  auto translated = ShaderRecompiler::TranslateProgram(shader, options);
+  auto plan = ExtractResourcePlan(translated.program);
+  Check(plan.info.buffers.size() == 1 && plan.info.buffers[0].written &&
+            plan.capture_specialization_reads,
+        "scalar-memory writable diamond descriptor lost buffer or alias capture");
+
+  struct Memory {
+    uint32_t flag = 0u;
+    uint32_t unavailable = 0u;
+  } memory;
+  FakeGuestMemory fake(+[](void *data, uint64_t address, std::span<uint32_t> words) {
+    auto &m = *static_cast<Memory *>(data);
+    bool available = false;
+    switch (address) {
+    case 0x2028u: words[0] = m.flag; available = true; break;
+    case 0x2060u: words[0] = 0x80u; available = (m.flag & 8u) != 0u; break;
+    case 0x2068u: words[0] = 32u; available = true; break;
+    default: break;
+    }
+    m.unavailable += !available;
+    return available;
+  }, &memory);
+
+  const SrtRuntime runtime{.user_data = user_data};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  for (const uint32_t flag : {0u, 8u, 0u}) {
+    memory.flag = flag;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              memory.unavailable == 0u,
+          "scalar-memory writable diamond failed or read untaken arm");
+    const auto &descriptor = snapshot.buffers[0].dwords;
+    const uint32_t expected_lo = flag ? 0x100u : 0xffffff00u;
+    const uint32_t expected_hi = flag ? 0x00040001u : 0x00040000u;
+    Check(descriptor[0] == expected_lo && descriptor[1] == expected_hi &&
+              descriptor[2] == 32u && descriptor[3] == 0x00016204u,
+          "scalar-memory writable diamond produced wrong dwords");
+    Check(std::ranges::find(snapshot.specialization_reads,
+                            std::pair<uint64_t, uint64_t>{0x2028u, 4u}) !=
+              snapshot.specialization_reads.end(),
+          "scalar-memory predicate address was missing from specialization_reads");
+  }
+
+  const auto result = RecompileForTest(shader, options);
+  CheckSpirvBinaryValidates(result.spirv);
 }
 
 void TestUniformSelectedDescriptorLoadAddress() {
@@ -14030,6 +14113,7 @@ int main() {
   TestGpuProducedWritableDescriptor();
   TestUniformSelectedWritableDescriptor();
   TestDominatedBranchAndNestedDiamondDescriptor();
+  TestScalarMemorySelectedWritableDescriptor();
   TestUniformSelectedDescriptorLoadAddress();
   TestBoundedScalarMaterialImageKeys();
   TestImmutableDescriptorPredicate();
