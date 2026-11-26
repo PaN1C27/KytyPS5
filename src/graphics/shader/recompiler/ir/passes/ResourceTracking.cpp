@@ -3796,8 +3796,14 @@ private:
 				} else result.maximum = std::max(result.maximum, SelectorMaximum(key, {}, 0u, active));
 			}
 		}
-		if (lane != nullptr) result = SelectedSelectorDomain(*lane, handle != nullptr ? lane->Arg(1) : Value {});
-		else if (handle == nullptr) result.maximum = SelectorMaximum(key);
+		if (lane != nullptr) {
+			result = SelectedSelectorDomain(*lane, handle != nullptr ? lane->Arg(1) : Value {});
+			if (result.maximum == UINT32_MAX &&
+			    (handle != nullptr || HasActiveLane(lane->Arg(1), lane->Parent())))
+				result.maximum = SelectorMaximum(lane->Arg(0), {}, 0u, lane->Arg(1));
+		} else if (handle == nullptr) {
+			result.maximum = SelectorMaximum(key);
+		}
 		if (result.maximum > UINT32_MAX / 4u ||
 		    uint64_t {result.maximum} * indirect.table_stride + indirect.table_offset > UINT32_MAX)
 			return false;
@@ -4519,7 +4525,8 @@ private:
 				// unless guard proves a waterfall key equal to the executing lanes' local value.
 				const auto local = EqualLocalKey(guard, value);
 				return local.IsEmpty() ? PossibleU32Bits(inst->Arg(0))
-				                       : SelectorMaximum(local, bounds, depth + 1u, guard);
+				                       : std::min(SelectorMaximum(local, bounds, depth + 1u, guard),
+				                                  PossibleU32Bits(inst->Arg(0)));
 			}
 			case ValueOpcode::Phi: {
 				const auto initial = InitialCandidateMask(value);
@@ -4528,7 +4535,7 @@ private:
 				if (post_test != UINT32_MAX) return post_test;
 				if (m_native_cfg.irreducible || !m_native_cfg.back_edges.empty() ||
 				    inst->NumArgs() == 0u || (inst->Parent() != nullptr && InCycle(inst->Parent())))
-					return UINT32_MAX;
+					return PossibleU32Bits(value);
 				uint32_t result = 0u;
 				for (uint32_t arm = 0; arm < inst->NumArgs(); ++arm) {
 					result = std::max(result, maximum(arm));
@@ -4545,6 +4552,9 @@ private:
 			case ValueOpcode::FindUMsb32:
 				return (!guard.IsEmpty() && ImpliesNonzero(guard, inst->Arg(0))) ||
 				               NonzeroOnEntry(inst->Arg(0), inst->Parent()) ? 31u : UINT32_MAX;
+			case ValueOpcode::UMax32: return std::max(maximum(0), maximum(1));
+			case ValueOpcode::BitwiseOr32:
+			case ValueOpcode::BitFieldInsert: return PossibleU32Bits(value);
 			case ValueOpcode::UMin32:
 			case ValueOpcode::BitwiseAnd32: return std::min(maximum(0), maximum(1));
 			case ValueOpcode::SMin32: {

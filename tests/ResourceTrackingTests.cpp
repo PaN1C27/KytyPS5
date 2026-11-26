@@ -6856,6 +6856,191 @@ void TestGuardedWaterfallBufferRecords() {
   }
 }
 
+void TestPredicatedWaterfallBufferRecords() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  namespace Prospero = Libs::Graphics::Prospero;
+  using Libs::Graphics::DstSel;
+  enum class Variant { Valid, PriorWaterfall, BitwiseOrPack, WiderMask, UnguardedEntry, CarriedMismatch };
+  const auto make = [](Variant variant) {
+    auto f = std::make_unique<Fixture>();
+    auto* entry = f->block;
+    auto* header = f->AddBlock();
+    auto* prior_wf = variant == Variant::PriorWaterfall ? f->AddBlock() : nullptr;
+    auto* wf_header = f->AddBlock();
+    auto* exit = f->AddBlock();
+
+    const auto lane = f->Emit(ValueOpcode::LaneId, {}, 0, entry);
+    const auto table = f->Buffer({f->UserData(0u), f->UserData(1u), f->UserData(2u), f->UserData(3u)});
+    const auto input = f->Buffer({f->UserData(4u), f->UserData(5u), f->UserData(6u), f->UserData(7u)});
+    entry->AddBranch(header);
+    entry->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = header};
+
+    // Outer loop carries an unbounded prior VGPR value (matching loop-carried float/index registers).
+    f->block = header;
+    auto& prior_phi = header->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+    prior_phi.AddPhiOperand(entry, Value(0u));
+    auto& iter_phi = header->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+    iter_phi.AddPhiOperand(entry, Value(0u));
+
+    const auto raw = f->Emit(ValueOpcode::LoadBufferU32,
+        {input, lane, Value(0u), Value(0u), Value(true)},
+        f->AddMemory({.kind = ResourceKind::Buffer, .idxen = true}, 0x200u), header);
+    const auto raw2 = f->Emit(ValueOpcode::LoadBufferU32,
+        {input, lane, Value(0u), Value(0u), Value(true)},
+        f->AddMemory({.kind = ResourceKind::Buffer, .offset = 4u, .idxen = true}, 0x204u), header);
+    const auto exec_mask = f->Emit(ValueOpcode::INotEqual32, {raw, Value(UINT32_MAX)}, 0, header);
+    const auto masked = variant == Variant::BitwiseOrPack
+        ? f->Emit(ValueOpcode::BitwiseOr32,
+                  {f->Emit(ValueOpcode::BitwiseAnd32, {raw, Value(0xff00u)}, 0, header),
+                   f->Emit(ValueOpcode::BitwiseAnd32, {raw2, Value(0x00ffu)}, 0, header)},
+                  0, header)
+        : f->Emit(ValueOpcode::BitwiseAnd32, {raw, Value(65535u)}, 0, header);
+    const auto pred_key = f->Emit(ValueOpcode::SelectU32, {exec_mask, masked, Value(&prior_phi)}, 0, header);
+    const auto v_key = variant == Variant::CarriedMismatch ? Value(&prior_phi) : pred_key;
+    const auto extra_filter = f->Emit(ValueOpcode::ULessThan32, {lane, Value(32u)}, 0, header);
+    const auto wf_entry = variant == Variant::WiderMask
+        ? extra_filter
+        : f->Emit(ValueOpcode::LogicalAnd, {exec_mask, extra_filter}, 0, header);
+
+    Block* post_branch = wf_header;
+    if (variant == Variant::PriorWaterfall) {
+      post_branch = prior_wf;
+      f->block = prior_wf;
+      prior_wf->AddBranch(prior_wf);
+      prior_wf->AddBranch(wf_header);
+      auto& first_active = prior_wf->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U1));
+      first_active.AddPhiOperand(header, wf_entry);
+      const auto first_key = f->Emit(ValueOpcode::ReadFirstLane, {v_key, Value(&first_active)}, 0, prior_wf);
+      const auto first_match = f->Emit(ValueOpcode::IEqual32, {first_key, v_key}, 0, prior_wf);
+      const auto first_rem = f->Emit(ValueOpcode::LogicalAnd,
+          {Value(&first_active), f->Emit(ValueOpcode::LogicalNot, {first_match}, 0, prior_wf)}, 0, prior_wf);
+      first_active.AddPhiOperand(prior_wf, first_rem);
+      prior_wf->condition = f->Emit(ValueOpcode::ConditionRef, {first_rem}, CFG::BranchCondition::ExecNonZero, prior_wf);
+      prior_wf->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch, .true_block = prior_wf, .false_block = wf_header};
+    }
+
+    header->AddBranch(post_branch);
+    if (variant == Variant::UnguardedEntry) {
+      header->AddBranch(header);
+      header->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = post_branch};
+    } else {
+      header->AddBranch(exit);
+      header->condition = f->Emit(ValueOpcode::ConditionRef, {wf_entry}, CFG::BranchCondition::ExecNonZero, header);
+      header->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch, .true_block = post_branch, .false_block = exit};
+    }
+
+    f->block = wf_header;
+    wf_header->AddBranch(wf_header);
+    wf_header->AddBranch(header);
+    auto& wf_active = wf_header->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U1));
+    wf_active.AddPhiOperand(variant == Variant::PriorWaterfall ? prior_wf : header, wf_entry);
+
+    const auto selected = f->Emit(ValueOpcode::ReadFirstLane, {v_key, Value(&wf_active)}, 0, wf_header);
+    const auto wf_match = f->Emit(ValueOpcode::IEqual32, {selected, v_key}, 0, wf_header);
+    const auto exec_step = f->Emit(ValueOpcode::LogicalAnd, {Value(&wf_active), wf_match}, 0, wf_header);
+    const auto wf_rem = f->Emit(ValueOpcode::LogicalAnd,
+        {Value(&wf_active), f->Emit(ValueOpcode::LogicalNot, {wf_match}, 0, wf_header)}, 0, wf_header);
+    wf_active.AddPhiOperand(wf_header, wf_rem);
+
+    const auto offset = f->Emit(ValueOpcode::IMul32, {selected, Value(56u)}, 0, wf_header);
+    std::array<Value, 4> words;
+    for (uint32_t word = 0; word < 4u; ++word) {
+      words[word] = f->Emit(ValueOpcode::ReadConstBuffer, {table, offset},
+          f->AddMemory({.kind = ResourceKind::ScalarBuffer, .offset = word * 4u,
+                        .component_index = word, .component_count = 4u}, 0x304u),
+          wf_header);
+    }
+    const auto handle = f->Buffer(words, 0x310u);
+    const auto loaded = f->Emit(ValueOpcode::LoadBufferU32x2,
+        {handle, lane, Value(0u), Value(0u), exec_step},
+        f->AddMemory({.kind = ResourceKind::Buffer, .data_dwords = 2u, .data_bits = 16u,
+                      .component_count = 4u, .formatted = true, .idxen = true}, 0x360u),
+        wf_header);
+    const auto extracted = f->Emit(ValueOpcode::CompositeExtractU32x2, {loaded, Value(0u)}, 0, wf_header);
+    f->Emit(ValueOpcode::ReferenceU32, {extracted}, 0, wf_header);
+
+    prior_phi.AddPhiOperand(wf_header, pred_key);
+    const auto next_iter = f->Emit(ValueOpcode::IAdd32, {Value(&iter_phi), Value(1u)}, 0, wf_header);
+    iter_phi.AddPhiOperand(wf_header, next_iter);
+    const auto loop_cont = f->Emit(ValueOpcode::ULessThan32, {next_iter, Value(4u)}, 0, wf_header);
+    const auto outer_cond = f->Emit(ValueOpcode::ConditionRef, {loop_cont}, CFG::BranchCondition::SccNonZero, wf_header);
+    wf_header->AddBranch(exit);
+    wf_header->condition = f->Emit(ValueOpcode::ConditionRef, {wf_rem}, CFG::BranchCondition::ExecNonZero, wf_header);
+    // In real shaders the waterfall backedge repeats until wf_rem == 0, then continues outer header.
+    // Connecting wf_header -> wf_header on wf_rem and wf_header -> header on exit preserves both loops.
+    wf_header->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch, .true_block = wf_header, .false_block = header};
+    (void)outer_cond;
+
+    f->block = exit;
+    exit->terminator = {.kind = CFG::TerminatorKind::Return};
+    f->PlanAndTrack();
+    return f;
+  };
+
+  LinearTestMemory memory;
+  constexpr uint32_t table_offset = 256u;
+  constexpr uint32_t rows = 4u;
+  for (uint32_t row = 0; row < rows; ++row) {
+    const auto base_word = (table_offset + row * 56u) / 4u;
+    memory.words[base_word + 0u] = 0x100000u + row * 0x1000u;
+    memory.words[base_word + 1u] = 8u << 16u;
+    memory.words[base_word + 2u] = 16u;
+    memory.words[base_word + 3u] =
+        (uint32_t(Prospero::BufferFormat::k16_16_16_16Float) << 12u) | DstSel(4, 5, 6, 7);
+    // Non-descriptor fields at +16 inside each 56-byte record: when probed with step=8 (unbounded),
+    // words at +16..+28 decode as a formatted buffer with unaligned stride, failing alignment.
+    memory.words[base_word + 4u] = 0x2000u;
+    memory.words[base_word + 5u] = 1u << 16u;
+    memory.words[base_word + 6u] = 1u;
+    memory.words[base_word + 7u] =
+        (uint32_t(Prospero::BufferFormat::k32Float) << 12u) | DstSel(4, 0, 0, 1);
+  }
+  std::array<uint32_t, 8> user_data{uint32_t(memory.base) + table_offset, 56u << 16u,
+      rows, 0x5204u, 0x9000u, 4u << 16u, 32u, 0x5204u};
+  SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
+      .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+
+  for (const auto variant : {Variant::Valid, Variant::PriorWaterfall, Variant::BitwiseOrPack,
+                             Variant::WiderMask, Variant::UnguardedEntry, Variant::CarriedMismatch}) {
+    auto fixture = make(variant);
+    const auto plan = ExtractResourcePlan(fixture->program);
+    const auto root = std::ranges::find_if(plan.info.buffers, [&](const auto& buffer) {
+      return plan.descriptor_sources[buffer.source].indirect_descriptor.has_value();
+    });
+    Check(root != plan.info.buffers.end(), "predicated waterfall buffer lost its indirect resource");
+    const auto& indirect = *plan.descriptor_sources[root->source].indirect_descriptor;
+    const bool expect_bounded = variant == Variant::Valid || variant == Variant::PriorWaterfall ||
+                                variant == Variant::BitwiseOrPack;
+    Check(indirect.table_scalar && indirect.table_stride == 56u && indirect.key_count.IsEmpty() &&
+              !indirect.selector && indirect.table_maximum == (expect_bounded ? std::optional{65535u} : std::nullopt),
+          "predicated waterfall table_maximum did not match proven ReadFirstLane guard");
+    memory.reads = 0u;
+    if (expect_bounded) {
+      Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+                memory.reads == rows && snapshot.buffers.size() == 2u + rows,
+            "bounded predicated waterfall probed unaligned +8 struct offsets or misread records");
+      bool checked_index = false;
+      for (const auto* block : fixture->program.blocks) {
+        for (const auto& inst : *block) {
+          if (inst.GetOpcode() == ValueOpcode::GetBufferResourceIndex) {
+            const auto* shift = inst.Arg(0).Resolve().TryInstruction();
+            Check(shift != nullptr && shift->GetOpcode() == ValueOpcode::ShiftLeftLogical32 &&
+                      shift->Arg(1) == Value(2u),
+                  "bounded predicated waterfall key did not encode exact record index");
+            checked_index = true;
+          }
+        }
+      }
+      Check(checked_index, "bounded predicated waterfall lost GetBufferResourceIndex");
+    } else {
+      Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+            "unproved predicated waterfall bypassed conservative congruence-class probing");
+    }
+  }
+}
+
 void TestGpuSelectedBufferRecords() {
   namespace Prospero = Libs::Graphics::Prospero;
   using Libs::Graphics::DstSel;
@@ -9678,6 +9863,7 @@ int main() {
     Run("GPU-selected formatted record store", TestGpuSelectedFormattedRecordStore);
     Run("finite buffer selection", TestFiniteBufferSelection);
     Run("guarded carried buffer key", TestGuardedCarriedBufferKey);
+    Run("predicated waterfall buffer records", TestPredicatedWaterfallBufferRecords);
     Run("packed scalar buffer selection", TestPackedScalarBufferSelection);
     Run("conditional sampler phi", TestConditionalSamplerPhi);
     Run("finite image phi cycle", TestFiniteImagePhiCycle);
