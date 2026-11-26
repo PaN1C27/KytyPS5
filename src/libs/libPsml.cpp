@@ -463,7 +463,6 @@ constexpr int      UNSUPPORTED_RENDER_SIZE   = static_cast<int>(0x8a8a000eu);
 constexpr int      NOT_AVAILABLE             = static_cast<int>(0x8a8a0012u);
 constexpr int      INVALID_SHARED_RESOURCES  = static_cast<int>(0x8a8a0014u);
 constexpr int      TOO_MANY_SHARED_RESOURCES = static_cast<int>(0x8a8a0015u);
-constexpr uint64_t SHARED_BLOCK_COUNT        = 123;
 constexpr uint32_t DISPATCH_DWORDS           = 0x800;
 
 struct SharedParameters {
@@ -551,6 +550,13 @@ int CheckContextParameters(const void* out, const ContextParameters* params) {
 	           : OK;
 }
 
+uint64_t SharedBlockCount(const SharedParameters& params) {
+	const uint64_t width  = (uint64_t {params.max_width} + 7u) & ~uint64_t {7};
+	const uint64_t height = (uint64_t {params.max_height} + 7u) & ~uint64_t {7};
+	const uint64_t bytes  = (uint64_t {15} * width * height) / 2 + 0x8b0000;
+	return (bytes + MEMORY_BLOCK_SIZE - 1) / MEMORY_BLOCK_SIZE;
+}
+
 uint64_t ContextBlockCount(const ContextParameters& params) {
 	const uint64_t bytes =
 	    uint64_t {8} * ((params.width + 7u) & ~7u) * ((params.height + 7u) & ~7u) + 0x7f00;
@@ -623,7 +629,7 @@ int KYTY_SYSV_ABI GetSharedRequirements(MemoryRequirements* out, const SharedPar
 	if (const int error = CheckSharedParameters(out, params); error != OK) {
 		return error;
 	}
-	*out = {MEMORY_BLOCK_SIZE, MEMORY_BLOCK_SIZE, SHARED_BLOCK_COUNT};
+	*out = {MEMORY_BLOCK_SIZE, MEMORY_BLOCK_SIZE, SharedBlockCount(*params)};
 	return OK;
 }
 
@@ -638,7 +644,10 @@ int KYTY_SYSV_ABI CreateSharedResources(void** out, const SharedParameters* para
 	if (const int error = CheckSharedParameters(out, params); error != OK) {
 		return error;
 	}
-	if (params->reserved != 0 || params->memory.block_count != SHARED_BLOCK_COUNT) {
+	if (params->memory.blocks == nullptr) {
+		return ARGUMENT_NULL;
+	}
+	if (params->reserved != 0 || params->memory.block_count != SharedBlockCount(*params)) {
 		return INVALID_PARAMETER;
 	}
 	g_shared = true;

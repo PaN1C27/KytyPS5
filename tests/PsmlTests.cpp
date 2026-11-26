@@ -586,11 +586,20 @@ protected:
 TEST_F(PsmlMfsr2Test, SharedRequirementsCoverMaximumsUpTo8K) {
   Mfsr2SharedParameters params;
   Requirements requirements;
-  ASSERT_EQ(Function<GetRequirements>("1ic5q-kdOsc")(&requirements, &params),
-            0);
-  EXPECT_EQ(requirements.size, 0x200000u);
-  EXPECT_EQ(requirements.alignment, 0x200000u);
-  EXPECT_EQ(requirements.count, 123u);
+  for (const auto [width, height, count] :
+       std::array<std::array<uint16_t, 3>, 5>{{{7680, 4320, 123},
+                                               {3840, 2160, 35},
+                                               {2560, 1440, 18},
+                                               {1920, 1080, 12},
+                                               {960, 540, 7}}}) {
+    params.max_width = width;
+    params.max_height = height;
+    ASSERT_EQ(Function<GetRequirements>("1ic5q-kdOsc")(&requirements, &params),
+              0);
+    EXPECT_EQ(requirements.size, 0x200000u);
+    EXPECT_EQ(requirements.alignment, 0x200000u);
+    EXPECT_EQ(requirements.count, count) << width << "x" << height;
+  }
   params.max_width = 959;
   EXPECT_EQ(Function<GetRequirements>("1ic5q-kdOsc")(&requirements, &params),
             MFSR2_INVALID_PARAMETER);
@@ -619,6 +628,18 @@ TEST_F(PsmlMfsr2Test, SharedResourcesAreSingleAndTakeTheRequiredBlocks) {
   EXPECT_EQ(Function<Create>("gMduXCLYrNg")(nullptr, &params),
             MFSR2_TOO_MANY_SHARED);
   EXPECT_EQ(Function<Release>("0GAw7SmkwII")(shared), 0);
+  ASSERT_EQ(Function<Create>("gMduXCLYrNg")(&shared, &params), 0);
+  EXPECT_EQ(Function<Release>("0GAw7SmkwII")(shared), 0);
+  params.max_width = 3840;
+  params.max_height = 2160;
+  params.block_count = 34;
+  EXPECT_EQ(Function<Create>("gMduXCLYrNg")(&shared, &params),
+            MFSR2_INVALID_PARAMETER);
+  params.block_count = 35;
+  params.blocks = nullptr;
+  EXPECT_EQ(Function<Create>("gMduXCLYrNg")(&shared, &params),
+            MFSR2_NULL_ARGUMENT);
+  params.blocks = blocks.data();
   ASSERT_EQ(Function<Create>("gMduXCLYrNg")(&shared, &params), 0);
   EXPECT_EQ(Function<Release>("0GAw7SmkwII")(shared), 0);
 }
