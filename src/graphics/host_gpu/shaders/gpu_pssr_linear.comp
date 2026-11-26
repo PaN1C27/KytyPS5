@@ -4,14 +4,17 @@
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(binding = 0) uniform texture2D source;
 layout(binding = 1) writeonly uniform image2D destination;
-layout(push_constant) uniform Parameters {
+layout(push_constant, std430) uniform Parameters {
+	uvec2 input_offset;
 	uvec2 input_size;
 	uvec2 output_size;
+	uvec2 reserved;
 	uvec4 output_channels;
 } parameters;
 
 vec4 fetch_color(ivec2 coordinate) {
-	return texelFetch(source, clamp(coordinate, ivec2(0), ivec2(parameters.input_size) - 1), 0);
+	ivec2 clamped = clamp(coordinate, ivec2(0), ivec2(parameters.input_size) - 1);
+	return texelFetch(source, ivec2(parameters.input_offset) + clamped, 0);
 }
 
 void main() {
@@ -25,7 +28,7 @@ void main() {
 	                 mix(fetch_color(lower + ivec2(0, 1)), fetch_color(lower + ivec2(1, 1)), weight.x),
 	                 weight.y);
 	vec4 stored = vec4(0.0);
-	for (uint channel = 0; channel < 3; ++channel) {
+	for (uint channel = 0; channel < 4; ++channel) {
 		uint selected = parameters.output_channels[channel];
 		if (selected < 4) stored[channel] = color[selected];
 	}

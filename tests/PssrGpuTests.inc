@@ -1,14 +1,14 @@
   void CheckPssr() {
     constexpr const char *name = "PssrLinear";
     constexpr uintptr_t base = 0x0000000206a00000ull;
-    constexpr uint64_t size = 0x100000;
+    constexpr uint64_t size = 0x200000;
     constexpr auto packed = Prospero::BufferFormat::k11_11_10Float;
     constexpr auto linear = Prospero::TileMode::kLinear;
     constexpr auto tiled = Prospero::TileMode::kStandard256B;
     constexpr u32 red = 0x000003c0, green = 0x001e0000, blue = 0x78000000;
     const auto descriptor = [](uint64_t address, u32 width, u32 height,
                                Prospero::BufferFormat format, Prospero::TileMode tile,
-                               u32 swizzle = DstSel(4, 5, 6, 7)) {
+                               u32 swizzle = DstSel(4, 5, 6, 7), u32 max_mip = 0) {
       ShaderTextureResource result{};
       result.fields[0] = static_cast<u32>(address >> 8);
       result.fields[1] = static_cast<u32>(address >> 40) |
@@ -16,7 +16,7 @@
       result.fields[2] = ((width - 1) >> 2) | ((height - 1) << 14);
       result.fields[3] = swizzle | (static_cast<u32>(tile) << 20) |
                          (static_cast<u32>(Prospero::ImageType::kColor2D) << 28);
-      result.fields[5] = 0x00700000;
+      result.fields[5] = 0x00700000 | (max_mip << 4);
       return result;
     };
     EnsureRuntimeContext();
@@ -69,12 +69,15 @@
         LibKernel::Memory::WriteBacking(texture.Base40(), words.data(), info.data.size);
       };
       const auto run = [&](const ShaderTextureResource &input,
-                            const ShaderTextureResource &output, u32 width, u32 height) {
+                            const ShaderTextureResource &output, u32 width, u32 height,
+                            u32 x = 0, u32 y = 0) {
         Pssr::Request request{};
         std::copy_n(input.fields, 8, request.input);
         std::copy_n(output.fields, 8, request.output);
         request.width = width;
         request.height = height;
+        request.x = x;
+        request.y = y;
         // The reserved packet includes trailing words that the parser must consume.
         constexpr u32 reserved_words = Pssr::RequestDwords + 9;
         std::vector<u32> packet(reserved_words, 0xdeadbeef);
@@ -216,6 +219,55 @@
       Require(name, "resolved source mip", run(input, output, 64, 32) ==
           std::vector<u32>(64 * 32, green),
           "upscaling read mip zero instead of the resolved mip");
+
+      input = descriptor(base + 0x100000, 2, 1, packed, linear);
+      output = descriptor(base + 0x120000, 2, 1,
+          Prospero::BufferFormat::k10_11_11Float, Prospero::TileMode::kStandard64KB,
+          DstSel(4, 5, 6, 1));
+      write_linear(input, std::array<u32, 2>{red, green});
+      Require(name, "k10_11_11Float storage mapping", run(input, output, 2, 1) ==
+          std::vector<u32>{blue, green},
+          "k10_11_11Float output lost ColorMappingBgra host-to-storage permutation");
+      auto roundtrip = descriptor(base + 0x140000, 2, 1, packed, tiled);
+      Require(name, "k10_11_11Float round-trip", run(output, roundtrip, 2, 1) ==
+          std::vector<u32>{red, green},
+          "k10_11_11Float output did not round-trip back to RGB");
+
+      input = descriptor(base + 0x160000, 2, 1,
+          Prospero::BufferFormat::k16_16_16_16Float, linear);
+      output = descriptor(base + 0x180000, 2, 1,
+          Prospero::BufferFormat::k16_16_16_16Float, Prospero::TileMode::kRenderTarget,
+          DstSel(4, 5, 6, 7));
+      write_linear(input, std::array<u32, 4>{0x00003c00u, 0x38000000u,
+                                            0x3c000000u, 0x3c000000u});
+      Require(name, "k16_16_16_16Float 4-channel store", run(input, output, 2, 1) ==
+          std::vector<u32>{0x00003c00u, 0x38000000u, 0x3c000000u, 0x3c000000u},
+          "4-channel float16 output dropped or corrupted alpha");
+      output.fields[3] = (output.fields[3] & ~0xfffu) | DstSel(4, 5, 6, 1);
+      Require(name, "k16_16_16_16Float unmapped alpha", run(input, output, 2, 1) ==
+          std::vector<u32>{0x00003c00u, 0x00000000u, 0x3c000000u, 0x00000000u},
+          "4-channel float16 output retained stale or wrong unmapped channel");
+
+      input = descriptor(mip_parent.info.data.address + mip_parent.info.mip_layout[1].offset,
+          64, 32, packed, tiled);
+      output = descriptor(base + 0x1a0000, 64, 32, packed, tiled,
+          DstSel(4, 5, 6, 7), 2);
+      const auto resolved_max_mip = resolve(output);
+      Require(name, "output max_mip allocation",
+          cache.GetImage(resolved_max_mip.image_id).backing.mip_levels == 3,
+          "output with MaxMip > 0 did not allocate full mip chain");
+      Require(name, "output max_mip store", run(input, output, 64, 32) ==
+          std::vector<u32>(64 * 32, green),
+          "output with MaxMip > 0 failed to write mip 0");
+
+      input = descriptor(base + 0x1c0000, 8, 4, packed, linear);
+      output = descriptor(base + 0x1e0000, 8, 4, packed, tiled);
+      std::vector<u32> subrect(32, red);
+      subrect[2 * 8 + 4] = subrect[2 * 8 + 5] = subrect[3 * 8 + 4] = subrect[3 * 8 + 5] = green;
+      write_linear(input, subrect);
+      Require(name, "sub-rectangle origin", run(input, output, 2, 2, 4, 2) ==
+          std::vector<u32>(32, green),
+          "sub-rectangle origin (x, y) offset or clamping failed");
       context.UnmapMemory(base, size);
       scheduler.Finish();
     });

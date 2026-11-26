@@ -4,6 +4,7 @@
 #include "graphics/guest_gpu/pssr.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/image/image.h"
+#include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -18,10 +19,13 @@ namespace Libs::Graphics {
 namespace {
 
 struct PssrParameters {
+	uint32_t input_offset[2];
 	uint32_t input_size[2];
 	uint32_t output_size[2];
+	uint32_t reserved[2];
 	uint32_t output_channels[4];
 };
+static_assert(sizeof(PssrParameters) == 48);
 
 // Upscalers read and write with stages and accesses of their own.
 void MemoryBarrier(vk::CommandBuffer command) {
@@ -101,23 +105,27 @@ void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& req
 	};
 	EXIT_IF(!is_2d(input_descriptor) || !is_2d(output_descriptor) ||
 	        !Pssr::IsColorFormat(input_descriptor.Format()) ||
-	        output_descriptor.Format() != Prospero::BufferFormat::k11_11_10Float ||
-	        output_descriptor.TileMode() != Prospero::TileMode::kStandard256B ||
+	        !Pssr::IsColorFormat(output_descriptor.Format()) ||
 	        output_descriptor.BaseLevel() != 0 || output_descriptor.LastLevel() != 0 ||
-	        output_descriptor.MaxMip() != 0 || output_descriptor.BaseArray5() != 0 ||
-	        output_descriptor.Depth() != 0 || request.width == 0 || request.height == 0);
+	        output_descriptor.BaseArray5() != 0 || output_descriptor.Depth() != 0 ||
+	        request.width == 0 || request.height == 0);
 	const auto input_width = std::max(1u, (input_descriptor.Width5() + 1u) >>
 	                                         input_descriptor.BaseLevel());
 	const auto input_height = std::max(1u, (input_descriptor.Height5() + 1u) >>
 	                                          input_descriptor.BaseLevel());
-	EXIT_IF(request.width > input_width || request.height > input_height);
-	PssrParameters parameters {{request.width, request.height},
+	EXIT_IF(request.x >= input_width || request.width > input_width - request.x ||
+	        request.y >= input_height || request.height > input_height - request.y);
+	const auto     output_surface = TextureGetSurfaceFormatInfo(output_descriptor.Format());
+	PssrParameters parameters {{request.x, request.y},
+	                           {request.width, request.height},
 	                           {output_descriptor.Width5() + 1u, output_descriptor.Height5() + 1u},
+	                           {},
 	                           {4, 4, 4, 4}};
-	for (uint32_t component = 0; component < 3; ++component) {
+	for (uint32_t host_component = 0; host_component < 4; ++host_component) {
+		const uint32_t guest_component = output_surface.host_to_storage.Map(host_component);
 		for (uint32_t source = 0; source < 4; ++source) {
-			if (GetDstSel(output_descriptor.DstSelXYZW(), source) == 4u + component) {
-				parameters.output_channels[component] = source;
+			if (GetDstSel(output_descriptor.DstSelXYZW(), source) == 4u + guest_component) {
+				parameters.output_channels[host_component] = source;
 				break;
 			}
 		}
@@ -149,8 +157,12 @@ void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& req
 	const std::array<const uint32_t*, 3>         dlss_words {request.depth, request.motion,
 	                                                         request.exposure};
 	std::array<std::optional<TextureBinding>, 3> dlss_bindings;
-	if (Upscaler::Enabled() && Dlss::Accepts(request) && parameters.output_channels[0] == 0 &&
-	    parameters.output_channels[1] == 1 && parameters.output_channels[2] == 2) {
+	const bool unswizzled_output =
+	    parameters.output_channels[0] == 0 && parameters.output_channels[1] == 1 &&
+	    parameters.output_channels[2] == 2 &&
+	    (output_descriptor.Format() != Prospero::BufferFormat::k16_16_16_16Float ||
+	     parameters.output_channels[3] >= 3);
+	if (Upscaler::Enabled() && Dlss::Accepts(request) && unswizzled_output) {
 		for (size_t i = 0; i < dlss_words.size(); ++i) {
 			ShaderTextureResource descriptor {};
 			std::copy_n(dlss_words[i], 8, descriptor.fields);
