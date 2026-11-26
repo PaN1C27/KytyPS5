@@ -11,9 +11,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fmt/format.h>
+#include <functional>
 #include <map>
 #include <numeric>
 #include <optional>
+#include <set>
 #include <span>
 #include <tuple>
 #include <unordered_map>
@@ -2628,6 +2630,664 @@ private:
 				// even an any-lane bound test limits it by the largest carried bound.
 				// Per-lane edges instead require the comparison on every executing lane.
 				fold(*compare, assumptions, header);
+			}
+		}
+		FoldInductiveSelectors();
+	}
+
+	void FoldInductiveSelectors() {
+		struct Range {
+			uint32_t low  = 0u;
+			uint32_t high = UINT32_MAX;
+
+			bool operator==(const Range&) const = default;
+		};
+		struct GuardState {
+			std::vector<const Inst*> pos;
+			std::vector<const Inst*> neg;
+			bool                     contradictory = false;
+
+			auto operator<=>(const GuardState&) const = default;
+		};
+
+		std::unordered_map<const Block*, size_t> block_index;
+		block_index.reserve(m_program.blocks.size());
+		for (size_t i = 0; i < m_program.blocks.size(); ++i) {
+			block_index.emplace(m_program.blocks[i], i);
+		}
+		std::unordered_map<const Inst*, uint32_t> inst_order;
+		uint32_t                                  next_order = 0u;
+		const auto                                order_of   = [&](const Inst* inst) -> uint32_t {
+			const auto [it, inserted] = inst_order.try_emplace(inst, next_order);
+			if (inserted) ++next_order;
+			return it->second;
+		};
+		const auto order_less = [&](const Inst* a, const Inst* b) {
+			return order_of(a) < order_of(b);
+		};
+		const auto is_selector_pred = [&](auto&& self, Value cond, uint32_t depth = 0u) -> bool {
+			if (depth > 8u) return false;
+			const auto* inst = cond.Resolve().TryInstruction();
+			if (inst == nullptr) return false;
+			order_of(inst);
+			const auto op = inst->GetOpcode();
+			if (op == ValueOpcode::LogicalAnd) {
+				return self(self, inst->Arg(0), depth + 1u) || self(self, inst->Arg(1), depth + 1u);
+			}
+			uint32_t imm = 0u;
+			if (op == ValueOpcode::IEqual32) {
+				return ImmediateU32(inst->Arg(0), imm) || ImmediateU32(inst->Arg(1), imm);
+			}
+			if (op == ValueOpcode::ULessThan32) {
+				return ImmediateU32(inst->Arg(0), imm);
+			}
+			return false;
+		};
+
+		std::vector<Inst*> candidate_selects;
+		for (auto* block: m_program.blocks) {
+			for (auto& inst: *block) {
+				order_of(&inst);
+				if (inst.GetOpcode() == ValueOpcode::SelectU32 &&
+				    is_selector_pred(is_selector_pred, inst.Arg(0))) {
+					candidate_selects.push_back(&inst);
+				}
+			}
+		}
+		if (candidate_selects.empty()) return;
+
+		// Precompute exact Dominates bitset matching Tracker::Dominates(def, use).
+		const size_t n_blocks = m_program.blocks.size();
+		const size_t words    = (n_blocks + 63u) / 64u;
+		std::vector<std::vector<uint64_t>> dom_bits(n_blocks, std::vector<uint64_t>(words, ~uint64_t {0}));
+		if (words > 0u) {
+			const uint32_t rem       = static_cast<uint32_t>(n_blocks % 64u);
+			const uint64_t last_mask = rem == 0u ? ~uint64_t {0} : (uint64_t {1} << rem) - 1u;
+			for (size_t i = 0; i < n_blocks; ++i) {
+				dom_bits[i].back() = last_mask;
+				if (m_program.blocks[i]->ImmPredecessors().empty()) {
+					std::ranges::fill(dom_bits[i], uint64_t {0});
+					dom_bits[i][i / 64u] = uint64_t {1} << (i % 64u);
+				}
+			}
+			bool dom_changed = true;
+			while (dom_changed) {
+				dom_changed = false;
+				for (size_t i = 0; i < n_blocks; ++i) {
+					const auto& preds = m_program.blocks[i]->ImmPredecessors();
+					if (preds.empty()) continue;
+					std::vector<uint64_t> next(words, ~uint64_t {0});
+					next.back() = last_mask;
+					for (const auto* pred: preds) {
+						const auto pit = block_index.find(pred);
+						if (pit == block_index.end()) continue;
+						for (size_t w = 0; w < words; ++w) next[w] &= dom_bits[pit->second][w];
+					}
+					next[i / 64u] |= uint64_t {1} << (i % 64u);
+					if (next != dom_bits[i]) {
+						dom_bits[i] = std::move(next);
+						dom_changed = true;
+					}
+				}
+			}
+		}
+		const auto dominates_fast = [&](const Block* def_blk, const Block* use_blk) {
+			if (def_blk == nullptr || use_blk == nullptr) return false;
+			if (def_blk == use_blk) return true;
+			const auto dit = block_index.find(def_blk);
+			const auto uit = block_index.find(use_blk);
+			if (dit == block_index.end() || uit == block_index.end()) return false;
+			return (dom_bits[uit->second][dit->second / 64u] &
+			        (uint64_t {1} << (dit->second % 64u))) != 0u;
+		};
+		const auto strictly_dominates = [&](const Block* def_blk, const Block* use_blk) {
+			return def_blk != use_blk && dominates_fast(def_blk, use_blk);
+		};
+
+		std::map<std::pair<const Inst*, const Inst*>, bool> equiv_cache;
+		const auto equiv = [&](auto&& self, Value a, Value b, uint32_t depth = 0u) -> bool {
+			a = a.Resolve();
+			b = b.Resolve();
+			if (a == b) return true;
+			if (depth > 4u) return false;
+			const auto* ia = a.TryInstruction();
+			const auto* ib = b.TryInstruction();
+			if (ia == nullptr || ib == nullptr) return false;
+			const auto key = ia < ib ? std::pair {ia, ib} : std::pair {ib, ia};
+			if (depth == 0u) {
+				if (const auto found = equiv_cache.find(key); found != equiv_cache.end())
+					return found->second;
+			}
+			bool ans = ia->GetOpcode() == ib->GetOpcode() && ia->NumArgs() == ib->NumArgs();
+			if (ans && ia->GetOpcode() == ValueOpcode::Phi) {
+				ans = ia->Parent() == ib->Parent() && ia->NumPhiBlocks() == ib->NumPhiBlocks();
+				for (size_t i = 0; ans && i < ia->NumPhiBlocks(); ++i) {
+					ans &= ia->PhiBlock(i) == ib->PhiBlock(i);
+				}
+			}
+			for (size_t i = 0; ans && i < ia->NumArgs(); ++i) {
+				ans &= self(self, ia->Arg(i), ib->Arg(i), depth + 1u);
+			}
+			if (depth == 0u) equiv_cache.emplace(key, ans);
+			return ans;
+		};
+
+		std::map<std::pair<const Inst*, const Inst*>, bool> implies_cache;
+		const auto implies_guard = [&](auto&& self, Value guard, Value req,
+		                               uint32_t depth = 0u) -> bool {
+			guard = guard.Resolve();
+			req   = req.Resolve();
+			if (req == Value(true) || equiv(equiv, guard, req)) return true;
+			const auto* g_inst = guard.TryInstruction();
+			const auto* r_inst = req.TryInstruction();
+			if (depth > 10u || g_inst == nullptr) return false;
+			const bool cacheable = depth == 0u && r_inst != nullptr;
+			if (cacheable) {
+				if (const auto found = implies_cache.find({g_inst, r_inst});
+				    found != implies_cache.end()) {
+					return found->second;
+				}
+			}
+			bool ans = false;
+			const auto op = g_inst->GetOpcode();
+			if (op == ValueOpcode::LogicalAnd) {
+				ans = self(self, g_inst->Arg(0), req, depth + 1u) ||
+				      self(self, g_inst->Arg(1), req, depth + 1u);
+			} else if (op == ValueOpcode::LogicalOr) {
+				ans = self(self, g_inst->Arg(0), req, depth + 1u) &&
+				      self(self, g_inst->Arg(1), req, depth + 1u);
+			} else if (op == ValueOpcode::Phi && g_inst->GetType() == Type::U1 &&
+			           g_inst->NumArgs() != 0u && g_inst->NumPhiBlocks() == g_inst->NumArgs()) {
+				const auto* phi_blk = g_inst->Parent();
+				bool        in_loop = false;
+				for (size_t i = 0; i < g_inst->NumPhiBlocks(); ++i) {
+					if (dominates_fast(phi_blk, g_inst->PhiBlock(i))) {
+						in_loop = true;
+						break;
+					}
+				}
+				if (!in_loop || (r_inst != nullptr && strictly_dominates(r_inst->Parent(), phi_blk))) {
+					bool non_self = false;
+					bool ok       = true;
+					for (size_t i = 0; i < g_inst->NumArgs(); ++i) {
+						const bool carried = dominates_fast(phi_blk, g_inst->PhiBlock(i));
+						if (carried && self(self, g_inst->Arg(i), guard, depth + 1u)) continue;
+						if (!self(self, g_inst->Arg(i), req, depth + 1u)) {
+							ok = false;
+							break;
+						}
+						non_self = true;
+					}
+					ans = ok && non_self;
+				}
+			}
+			if (cacheable) implies_cache.emplace(std::pair {g_inst, r_inst}, ans);
+			return ans;
+		};
+
+		std::map<std::pair<std::vector<const Inst*>, const Block*>, std::vector<const Inst*>>
+		    inv_cache;
+		const auto invariant_guards = [&](std::span<const Inst* const> pos,
+		                                  const Block* target_blk) -> std::vector<const Inst*> {
+			std::vector<const Inst*> key_vec(pos.begin(), pos.end());
+			const auto               key = std::pair {key_vec, target_blk};
+			if (const auto found = inv_cache.find(key); found != inv_cache.end()) {
+				return found->second;
+			}
+			std::vector<const Inst*>       cand;
+			std::unordered_set<const Inst*> seen;
+			const auto                     collect = [&](auto&& self, const Inst* g) -> void {
+				if (g == nullptr || !seen.insert(g).second) return;
+				if (strictly_dominates(g->Parent(), target_blk)) {
+					cand.push_back(g);
+					return;
+				}
+				const auto op = g->GetOpcode();
+				if (op == ValueOpcode::LogicalAnd) {
+					self(self, g->Arg(0).Resolve().TryInstruction());
+					self(self, g->Arg(1).Resolve().TryInstruction());
+				} else if (op == ValueOpcode::Phi && g->NumArgs() != 0u &&
+				           g->NumPhiBlocks() == g->NumArgs()) {
+					for (size_t i = 0; i < g->NumArgs(); ++i) {
+						if (dominates_fast(g->Parent(), g->PhiBlock(i))) continue;
+						std::vector<const Inst*>        sub;
+						std::unordered_set<const Inst*> sub_seen;
+						const auto sub_collect = [&](auto&& sub_self, const Inst* x) -> void {
+							if (x == nullptr || !sub_seen.insert(x).second) return;
+							if (strictly_dominates(x->Parent(), target_blk)) {
+								sub.push_back(x);
+								return;
+							}
+							const auto xop = x->GetOpcode();
+							if (xop == ValueOpcode::LogicalAnd) {
+								sub_self(sub_self, x->Arg(0).Resolve().TryInstruction());
+								sub_self(sub_self, x->Arg(1).Resolve().TryInstruction());
+							} else if (xop == ValueOpcode::Phi) {
+								for (size_t j = 0; j < x->NumArgs(); ++j) {
+									sub_self(sub_self, x->Arg(j).Resolve().TryInstruction());
+								}
+							}
+						};
+						sub_collect(sub_collect, g->Arg(i).Resolve().TryInstruction());
+						for (const auto* s: sub) {
+							if (implies_guard(implies_guard, Value(const_cast<Inst*>(g)),
+							                  Value(const_cast<Inst*>(s)))) {
+								cand.push_back(s);
+							}
+						}
+						break;
+					}
+				}
+			};
+			for (const auto* g: pos) collect(collect, g);
+			std::vector<const Inst*> out;
+			for (const auto* c: cand) {
+				const bool redundant = std::ranges::any_of(cand, [&](const Inst* o) {
+					return o != c && implies_guard(implies_guard, Value(const_cast<Inst*>(o)),
+					                               Value(const_cast<Inst*>(c)));
+				});
+				if (!redundant && std::ranges::find(out, c) == out.end()) out.push_back(c);
+			}
+			std::ranges::sort(out, order_less);
+			inv_cache.emplace(std::move(key), out);
+			return out;
+		};
+
+		std::map<std::pair<GuardState, std::pair<const Inst*, const Inst*>>, GuardState>
+		    expand_step_cache;
+		const auto expand_guards = [&](GuardState state) -> GuardState {
+			std::unordered_set<const Inst*> p_seen(state.pos.begin(), state.pos.end());
+			std::unordered_set<const Inst*> n_seen(state.neg.begin(), state.neg.end());
+			const auto add_pos = [&](Value v, bool& changed) {
+				v = v.Resolve();
+				if (v.IsImmediate()) {
+					if (v.GetType() == Type::U1 && !v.U1()) state.contradictory = true;
+					return;
+				}
+				if (const auto* i = v.TryInstruction(); i != nullptr && p_seen.insert(i).second) {
+					order_of(i);
+					state.pos.push_back(i);
+					if (n_seen.contains(i)) state.contradictory = true;
+					changed = true;
+				}
+			};
+			const auto add_neg = [&](Value v, bool& changed) {
+				v = v.Resolve();
+				if (v.IsImmediate()) {
+					if (v.GetType() == Type::U1 && v.U1()) state.contradictory = true;
+					return;
+				}
+				if (const auto* i = v.TryInstruction(); i != nullptr && n_seen.insert(i).second) {
+					order_of(i);
+					state.neg.push_back(i);
+					if (p_seen.contains(i)) state.contradictory = true;
+					changed = true;
+				}
+			};
+			bool changed = true;
+			while (changed && !state.contradictory) {
+				changed = false;
+				for (size_t idx = 0; idx < state.pos.size() && !state.contradictory; ++idx) {
+					const auto* g  = state.pos[idx];
+					const auto  op = g->GetOpcode();
+					if (op == ValueOpcode::LogicalAnd) {
+						add_pos(g->Arg(0), changed);
+						add_pos(g->Arg(1), changed);
+					} else if (op == ValueOpcode::LogicalNot) {
+						add_neg(g->Arg(0), changed);
+					} else if (op == ValueOpcode::Phi) {
+						for (const auto* c: invariant_guards(std::span(&g, 1u), g->Parent())) {
+							add_pos(Value(const_cast<Inst*>(c)), changed);
+						}
+					}
+				}
+				for (size_t idx = 0; idx < state.neg.size() && !state.contradictory; ++idx) {
+					const auto* g  = state.neg[idx];
+					const auto  op = g->GetOpcode();
+					if (op == ValueOpcode::LogicalOr) {
+						add_neg(g->Arg(0), changed);
+						add_neg(g->Arg(1), changed);
+					} else if (op == ValueOpcode::LogicalNot) {
+						add_pos(g->Arg(0), changed);
+					} else if (op == ValueOpcode::LogicalAnd) {
+						const auto pos_implies = [&](Value target) {
+							for (size_t pi = 0; pi < state.pos.size(); ++pi) {
+								if (implies_guard(implies_guard,
+								                  Value(const_cast<Inst*>(state.pos[pi])), target))
+									return true;
+							}
+							return false;
+						};
+						if (pos_implies(g->Arg(0))) add_neg(g->Arg(1), changed);
+						if (pos_implies(g->Arg(1))) add_neg(g->Arg(0), changed);
+					}
+				}
+			}
+			std::ranges::sort(state.pos, order_less);
+			std::ranges::sort(state.neg, order_less);
+			return state;
+		};
+		const auto add_guard = [&](const GuardState& base, Value pos_add,
+		                           Value neg_add) -> GuardState {
+			if (base.contradictory) return base;
+			pos_add = pos_add.Resolve();
+			neg_add = neg_add.Resolve();
+			const auto* pi = pos_add.TryInstruction();
+			const auto* ni = neg_add.TryInstruction();
+			if ((pos_add.IsImmediate() && pos_add.GetType() == Type::U1 && !pos_add.U1()) ||
+			    (neg_add.IsImmediate() && neg_add.GetType() == Type::U1 && neg_add.U1())) {
+				GuardState s;
+				s.contradictory = true;
+				return s;
+			}
+			const auto key = std::pair {base, std::pair {pi, ni}};
+			if (const auto found = expand_step_cache.find(key); found != expand_step_cache.end()) {
+				return found->second;
+			}
+			GuardState next = base;
+			if (pi != nullptr) next.pos.push_back(pi);
+			if (ni != nullptr) next.neg.push_back(ni);
+			next = expand_guards(std::move(next));
+			expand_step_cache.emplace(key, next);
+			return next;
+		};
+
+		using PhiKey = std::pair<const Inst*, std::vector<const Inst*>>;
+		std::map<PhiKey, std::optional<Range>>                      phi_ranges;
+		std::vector<PhiKey>                                         phi_order;
+		std::map<std::pair<const Inst*, GuardState>, std::optional<Range>> eval_memo;
+		std::set<std::pair<const Inst*, GuardState>>                visiting;
+
+		std::function<std::optional<Range>(Value, const GuardState&)> eval_range;
+		std::function<bool(Value, const GuardState&, bool)>           pred_false;
+
+		const auto pred_true = [&](Value cond, const GuardState& guards) {
+			cond = cond.Resolve();
+			if (cond.IsImmediate()) return cond.GetType() == Type::U1 && cond.U1();
+			for (const auto* p: guards.pos) {
+				if (implies_guard(implies_guard, Value(const_cast<Inst*>(p)), cond)) return true;
+			}
+			return false;
+		};
+
+		const auto refine_with_guards = [&](Value v, Range r,
+		                                    const GuardState& guards) -> std::optional<Range> {
+			if (guards.contradictory) return std::nullopt;
+			const auto tighten_lt = [&](Value bound, bool strict) -> bool {
+				const auto br = eval_range(bound, guards);
+				if (!br) return false;
+				if (strict) {
+					if (br->high == 0u) return true;
+					r.high = std::min(r.high, br->high - 1u);
+				} else {
+					r.high = std::min(r.high, br->high);
+				}
+				return false;
+			};
+			const auto tighten_gt = [&](Value bound, bool strict) -> bool {
+				const auto br = eval_range(bound, guards);
+				if (!br) return false;
+				if (strict) {
+					if (br->low == UINT32_MAX) return true;
+					r.low = std::max(r.low, br->low + 1u);
+				} else {
+					r.low = std::max(r.low, br->low);
+				}
+				return false;
+			};
+			for (const auto* g: guards.pos) {
+				const auto op = g->GetOpcode();
+				if (op == ValueOpcode::ULessThan32 || op == ValueOpcode::ULessThanEqual32) {
+					const bool strict = op == ValueOpcode::ULessThan32;
+					if (equiv(equiv, g->Arg(0), v) && tighten_lt(g->Arg(1), strict)) return std::nullopt;
+					if (equiv(equiv, g->Arg(1), v) && tighten_gt(g->Arg(0), strict)) return std::nullopt;
+				} else if (op == ValueOpcode::UGreaterThan32 ||
+				           op == ValueOpcode::UGreaterThanEqual32) {
+					const bool strict = op == ValueOpcode::UGreaterThan32;
+					if (equiv(equiv, g->Arg(1), v) && tighten_lt(g->Arg(0), strict)) return std::nullopt;
+					if (equiv(equiv, g->Arg(0), v) && tighten_gt(g->Arg(1), strict)) return std::nullopt;
+				} else if (op == ValueOpcode::INotEqual32) {
+					if ((g->Arg(0).Resolve() == Value(0u) && equiv(equiv, g->Arg(1), v)) ||
+					    (g->Arg(1).Resolve() == Value(0u) && equiv(equiv, g->Arg(0), v))) {
+						r.low = std::max(r.low, 1u);
+					}
+				}
+			}
+			for (const auto* g: guards.neg) {
+				const auto op = g->GetOpcode();
+				if (op == ValueOpcode::UGreaterThanEqual32 || op == ValueOpcode::UGreaterThan32) {
+					const bool strict = op == ValueOpcode::UGreaterThanEqual32;
+					if (equiv(equiv, g->Arg(0), v) && tighten_lt(g->Arg(1), strict)) return std::nullopt;
+					if (equiv(equiv, g->Arg(1), v) && tighten_gt(g->Arg(0), strict)) return std::nullopt;
+				} else if (op == ValueOpcode::ULessThanEqual32 || op == ValueOpcode::ULessThan32) {
+					const bool strict = op == ValueOpcode::ULessThanEqual32;
+					if (equiv(equiv, g->Arg(1), v) && tighten_lt(g->Arg(0), strict)) return std::nullopt;
+					if (equiv(equiv, g->Arg(0), v) && tighten_gt(g->Arg(1), strict)) return std::nullopt;
+				} else if (op == ValueOpcode::IEqual32) {
+					if ((g->Arg(0).Resolve() == Value(0u) && equiv(equiv, g->Arg(1), v)) ||
+					    (g->Arg(1).Resolve() == Value(0u) && equiv(equiv, g->Arg(0), v))) {
+						r.low = std::max(r.low, 1u);
+					}
+				}
+			}
+			if (r.low > r.high) return std::nullopt;
+			return r;
+		};
+
+		pred_false = [&](Value cond, const GuardState& guards, bool optimistic) -> bool {
+			if (guards.contradictory) return optimistic;
+			cond = cond.Resolve();
+			if (cond.IsImmediate()) return cond.GetType() == Type::U1 && !cond.U1();
+			for (const auto* n: guards.neg) {
+				if (equiv(equiv, cond, Value(const_cast<Inst*>(n)))) return true;
+			}
+			const auto* inst = cond.TryInstruction();
+			if (inst == nullptr) return false;
+			const auto op = inst->GetOpcode();
+			if (op == ValueOpcode::LogicalAnd) {
+				return pred_false(inst->Arg(0), add_guard(guards, inst->Arg(1), Value {}), optimistic) ||
+				       pred_false(inst->Arg(1), add_guard(guards, inst->Arg(0), Value {}), optimistic);
+			}
+			if (op == ValueOpcode::IEqual32) {
+				for (uint32_t i = 0; i < 2u; ++i) {
+					uint32_t target = 0u;
+					if (ImmediateU32(inst->Arg(i), target)) {
+						const auto r = eval_range(inst->Arg(i ^ 1u), guards);
+						if (!r) return optimistic;
+						return target < r->low || target > r->high;
+					}
+				}
+			}
+			uint32_t target = 0u;
+			if (op == ValueOpcode::ULessThan32 && ImmediateU32(inst->Arg(0), target)) {
+				const auto r = eval_range(inst->Arg(1), guards);
+				if (!r) return optimistic;
+				return r->high <= target;
+			}
+			return false;
+		};
+
+		eval_range = [&](Value v, const GuardState& guards) -> std::optional<Range> {
+			if (guards.contradictory) return std::nullopt;
+			v = v.Resolve();
+			uint32_t imm = 0u;
+			if (ImmediateU32(v, imm)) return refine_with_guards(v, Range {imm, imm}, guards);
+			const auto* inst = v.TryInstruction();
+			if (inst == nullptr) return refine_with_guards(v, Range {}, guards);
+			const auto mk = std::pair {inst, guards};
+			if (const auto found = eval_memo.find(mk); found != eval_memo.end()) return found->second;
+			if (!visiting.insert(mk).second) return Range {};
+
+			std::optional<Range> res = Range {};
+			switch (inst->GetOpcode()) {
+				case ValueOpcode::Phi: {
+					const auto   inv = invariant_guards(guards.pos, inst->Parent());
+					const PhiKey key {inst, inv};
+					const auto [it, inserted] = phi_ranges.try_emplace(key, std::nullopt);
+					if (inserted) phi_order.push_back(key);
+					res = it->second;
+					break;
+				}
+				case ValueOpcode::ReadFirstLane: {
+					if (inst->NumArgs() == 2u) {
+						const auto mask    = inst->Arg(1);
+						const bool implied = std::ranges::any_of(guards.pos, [&](const Inst* p) {
+							return implies_guard(implies_guard, Value(const_cast<Inst*>(p)), mask);
+						});
+						if (implied) {
+							res = eval_range(inst->Arg(0), add_guard(GuardState {}, mask, Value {}));
+						}
+					}
+					break;
+				}
+				case ValueOpcode::SelectU32: {
+					const auto cond = inst->Arg(0);
+					if (pred_true(cond, guards)) {
+						res = eval_range(inst->Arg(1), guards);
+					} else if (pred_false(cond, guards, true)) {
+						res = eval_range(inst->Arg(2), guards);
+					} else {
+						const auto rt = eval_range(inst->Arg(1), add_guard(guards, cond, Value {}));
+						const auto rf = eval_range(inst->Arg(2), add_guard(guards, Value {}, cond));
+						if (!rt && !rf) res = std::nullopt;
+						else if (!rt) res = rf;
+						else if (!rf) res = rt;
+						else res = Range {std::min(rt->low, rf->low), std::max(rt->high, rf->high)};
+					}
+					break;
+				}
+				case ValueOpcode::BitFieldUExtract: {
+					uint32_t width = 0u;
+					if (ImmediateU32(inst->Arg(2), width) && width < 32u) {
+						res = Range {0u, width == 0u ? 0u : (1u << width) - 1u};
+					}
+					break;
+				}
+				case ValueOpcode::UMin32: {
+					const auto r0 = eval_range(inst->Arg(0), guards);
+					const auto r1 = eval_range(inst->Arg(1), guards);
+					if (!r0 || !r1) res = std::nullopt;
+					else res = Range {std::min(r0->low, r1->low), std::min(r0->high, r1->high)};
+					break;
+				}
+				case ValueOpcode::BitwiseAnd32: {
+					const auto r0 = eval_range(inst->Arg(0), guards);
+					const auto r1 = eval_range(inst->Arg(1), guards);
+					if (!r0 && !r1) res = std::nullopt;
+					else if (!r0) res = Range {0u, r1->high};
+					else if (!r1) res = Range {0u, r0->high};
+					else res = Range {0u, std::min(r0->high, r1->high)};
+					break;
+				}
+				case ValueOpcode::IAdd32: {
+					const auto r0 = eval_range(inst->Arg(0), guards);
+					const auto r1 = eval_range(inst->Arg(1), guards);
+					if (!r0 || !r1) {
+						res = std::nullopt;
+					} else {
+						const uint64_t lo_sum = uint64_t {r0->low} + r1->low;
+						const uint64_t hi_sum = uint64_t {r0->high} + r1->high;
+						constexpr uint64_t wrap = uint64_t {1} << 32u;
+						if (hi_sum <= UINT32_MAX || (lo_sum >= wrap && hi_sum < (wrap << 1u))) {
+							res = Range {static_cast<uint32_t>(lo_sum), static_cast<uint32_t>(hi_sum)};
+						}
+					}
+					break;
+				}
+				case ValueOpcode::ShiftRightLogical32:
+				case ValueOpcode::ShiftLeftLogical32: {
+					uint32_t shift = 0u;
+					if (ImmediateU32(inst->Arg(1), shift) && shift < 32u) {
+						const auto r0 = eval_range(inst->Arg(0), guards);
+						if (!r0) {
+							res = std::nullopt;
+						} else if (inst->GetOpcode() == ValueOpcode::ShiftRightLogical32) {
+							res = Range {r0->low >> shift, r0->high >> shift};
+						} else if ((uint64_t {r0->high} << shift) <= UINT32_MAX) {
+							res = Range {r0->low << shift, r0->high << shift};
+						}
+					}
+					break;
+				}
+				default: break;
+			}
+			if (res) res = refine_with_guards(v, *res, guards);
+			visiting.erase(mk);
+			eval_memo.emplace(mk, res);
+			return res;
+		};
+
+		const GuardState empty_guards;
+		for (auto* select: candidate_selects) {
+			pred_false(select->Arg(0), empty_guards, true);
+		}
+
+		std::map<PhiKey, std::pair<uint32_t, uint32_t>> widen_counts;
+		bool                                           changed = true;
+		while (changed) {
+			eval_memo.clear();
+			changed = false;
+			for (size_t idx = 0; idx < phi_order.size(); ++idx) {
+				const auto               key    = phi_order[idx];
+				const auto*              phi    = key.first;
+				GuardState               guards;
+				guards.pos                      = key.second;
+				guards                          = expand_guards(std::move(guards));
+				std::optional<Range> joined;
+				for (size_t arm = 0; arm < phi->NumArgs(); ++arm) {
+					const auto arm_range = eval_range(phi->Arg(arm), guards);
+					if (!arm_range) continue;
+					if (!joined) joined = arm_range;
+					else {
+						joined->low  = std::min(joined->low, arm_range->low);
+						joined->high = std::max(joined->high, arm_range->high);
+					}
+				}
+				auto& slot = phi_ranges.at(key);
+				if (joined && slot) {
+					auto& [lo_widen, hi_widen] = widen_counts[key];
+					if (joined->low < slot->low && ++lo_widen > 8u) joined->low = 0u;
+					if (joined->high > slot->high && ++hi_widen > 8u) joined->high = UINT32_MAX;
+				}
+				if (joined != slot) {
+					slot    = joined;
+					changed = true;
+				}
+			}
+		}
+
+		eval_memo.clear();
+		bool folded_any = false;
+		for (auto* select: candidate_selects) {
+			if (pred_false(select->Arg(0), empty_guards, false)) {
+				select->ReplaceUsesWith(select->Arg(2).Resolve());
+				folded_any = true;
+			}
+		}
+		if (!folded_any) return;
+
+		bool phi_changed = true;
+		while (phi_changed) {
+			phi_changed = false;
+			for (auto* block: m_program.blocks) {
+				for (auto& inst: *block) {
+					if (inst.GetOpcode() != ValueOpcode::Phi || !inst.HasUses()) continue;
+					Value same;
+					bool  uniform = true;
+					for (size_t arm = 0; arm < inst.NumArgs(); ++arm) {
+						const auto arg = inst.Arg(arm).Resolve();
+						if (arg.TryInstruction() == &inst) continue;
+						if (same.IsEmpty()) same = arg;
+						else if (same != arg) {
+							uniform = false;
+							break;
+						}
+					}
+					if (uniform && !same.IsEmpty()) {
+						inst.ReplaceUsesWith(same);
+						phi_changed = true;
+					}
+				}
 			}
 		}
 	}

@@ -8746,6 +8746,149 @@ void TestBoundedRelativeRegisterReads() {
         "a loop bound on M0 left an impossible relative read");
 }
 
+void TestPartitionWaterfallRelativeRegisterWrites() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  for (const bool clobber : {false, true}) {
+    Fixture fixture;
+    auto *entry = fixture.block;
+    auto *loop_header = fixture.AddBlock();
+    auto *part_body = fixture.AddBlock();
+    auto *wf_header = fixture.AddBlock();
+    auto *wf_body = fixture.AddBlock();
+    auto *exit = fixture.AddBlock();
+    entry->AddBranch(loop_header);
+    loop_header->AddBranch(part_body);
+    loop_header->AddBranch(exit);
+    part_body->AddBranch(wf_header);
+    wf_header->AddBranch(wf_body);
+    wf_body->AddBranch(wf_header);
+    wf_body->AddBranch(loop_header);
+    entry->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = loop_header};
+    loop_header->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                               .true_block = part_body,
+                               .false_block = exit};
+    part_body->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = wf_header};
+    wf_header->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = wf_body};
+    wf_body->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                           .true_block = wf_header,
+                           .false_block = loop_header};
+    exit->terminator.kind = CFG::TerminatorKind::Return;
+
+    const auto lane = fixture.Emit(ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
+    const auto active = fixture.Emit(ValueOpcode::ULessThan32, {lane, Value(32u)}, 0, entry);
+    const auto count_idx = fixture.UserData(2u);
+    const auto in_handle = fixture.Buffer(
+        {fixture.UserData(0u), Value(16u << 16u), Value(8u), Value(0x16204u)}, 0x100u);
+    MemoryInfo read_mem;
+    read_mem.kind = ResourceKind::Buffer;
+    read_mem.data_dwords = 2u;
+    read_mem.idxen = true;
+    const auto loaded_pair = fixture.Emit(ValueOpcode::LoadBufferU32x2,
+        {in_handle, fixture.Emit(ValueOpcode::SelectU32, {active, count_idx, lane}, 0, entry),
+         Value(0u), Value(0u), active},
+        fixture.AddMemory(read_mem, 0x104u), entry);
+    const auto loaded_count = fixture.Emit(ValueOpcode::CompositeExtractU32x2,
+                                           {loaded_pair, Value(1u)}, 0, entry);
+    const auto bound_cond = fixture.Emit(ValueOpcode::ULessThan32, {lane, Value(4u)}, 0, entry);
+    const auto init_bound = fixture.Emit(ValueOpcode::SelectU32, {bound_cond, Value(8u), Value(4u)}, 0, entry);
+    const auto init_right = fixture.Emit(ValueOpcode::IAdd32, {init_bound, Value(UINT32_MAX)}, 0, entry);
+
+    auto &left_outer = loop_header->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+    auto &right_outer = loop_header->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+    auto &count_outer = loop_header->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+    auto &loop_exec = loop_header->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U1));
+    const auto continue_part = fixture.Emit(ValueOpcode::ULessThan32,
+        {Value(&left_outer), Value(&right_outer)}, 0, loop_header);
+    const auto body_exec = fixture.Emit(ValueOpcode::LogicalAnd, {Value(&loop_exec), continue_part},
+                                        0, loop_header);
+    loop_header->condition = fixture.Emit(ValueOpcode::ConditionRef, {body_exec},
+                                          CFG::BranchCondition::VccNonZero, loop_header);
+
+    const auto left_step = fixture.Emit(ValueOpcode::SelectU32,
+        {body_exec, fixture.Emit(ValueOpcode::IAdd32, {Value(&left_outer), Value(1u)}, 0, part_body),
+         Value(&left_outer)},
+        0, part_body);
+    const auto right_step = fixture.Emit(ValueOpcode::SelectU32,
+        {body_exec, fixture.Emit(ValueOpcode::IAdd32, {Value(&right_outer), Value(UINT32_MAX)}, 0, part_body),
+         Value(&right_outer)},
+        0, part_body);
+
+    auto &wf_left = wf_header->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+    auto &wf_right = wf_header->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+    auto &wf_count = wf_header->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+    auto &wf_exec = wf_header->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U1));
+
+    const auto m0 = fixture.Emit(ValueOpcode::ReadFirstLane, {Value(&wf_left), Value(&wf_exec)},
+                                 0, wf_body);
+    const auto lane_eq = fixture.Emit(ValueOpcode::LogicalAnd,
+        {Value(&wf_exec), fixture.Emit(ValueOpcode::IEqual32, {m0, Value(&wf_left)}, 0, wf_body)},
+        0, wf_body);
+    const auto rel_write = [&](Value old_val, uint32_t offset) {
+      const auto write_mask = fixture.Emit(ValueOpcode::LogicalAnd,
+          {lane_eq, fixture.Emit(ValueOpcode::IEqual32, {m0, Value(offset)}, 0, wf_body)},
+          0, wf_body);
+      return fixture.Emit(ValueOpcode::SelectU32, {write_mask, lane, old_val}, 0, wf_body);
+    };
+    const auto next_left = rel_write(Value(&wf_left), 12u);
+    const auto next_right = rel_write(Value(&wf_right), 11u);
+    const auto next_count = rel_write(Value(&wf_count), clobber ? 7u : 9u);
+    const auto next_wf_exec = fixture.Emit(ValueOpcode::LogicalAnd,
+        {Value(&wf_exec), fixture.Emit(ValueOpcode::LogicalNot, {lane_eq}, 0, wf_body)}, 0, wf_body);
+    wf_body->condition = fixture.Emit(ValueOpcode::ConditionRef, {next_wf_exec},
+                                      CFG::BranchCondition::VccNonZero, wf_body);
+
+    wf_left.AddPhiOperand(part_body, left_step);
+    wf_left.AddPhiOperand(wf_body, next_left);
+    wf_right.AddPhiOperand(part_body, right_step);
+    wf_right.AddPhiOperand(wf_body, next_right);
+    wf_count.AddPhiOperand(part_body, Value(&count_outer));
+    wf_count.AddPhiOperand(wf_body, next_count);
+    wf_exec.AddPhiOperand(part_body, body_exec);
+    wf_exec.AddPhiOperand(wf_body, next_wf_exec);
+
+    left_outer.AddPhiOperand(entry, Value(0u));
+    left_outer.AddPhiOperand(wf_body, next_left);
+    right_outer.AddPhiOperand(entry, init_right);
+    right_outer.AddPhiOperand(wf_body, next_right);
+    count_outer.AddPhiOperand(entry, loaded_count);
+    count_outer.AddPhiOperand(wf_body, next_count);
+    loop_exec.AddPhiOperand(entry, active);
+    loop_exec.AddPhiOperand(wf_body, body_exec);
+
+    const auto out_records = fixture.Emit(ValueOpcode::ReadFirstLane,
+                                          {Value(&count_outer), active}, 0, exit);
+    const auto out_handle = fixture.Emit(ValueOpcode::GetBufferResource,
+        {fixture.UserData(1u), Value(4u << 16u), out_records, Value(0x16204u)},
+        MemoryFlags{0, 0x3e8u}, exit);
+    MemoryInfo write_mem;
+    write_mem.kind = ResourceKind::Buffer;
+    fixture.Emit(ValueOpcode::StoreBufferU32,
+        {out_handle, Value(0u), Value(0u), Value(0u), Value(1u), active},
+        fixture.AddMemory(write_mem, 0x3e8u), exit);
+
+    if (clobber) {
+      CheckFatal([&] { fixture.PlanAndTrack(); }, "not a valid runtime value",
+                 "inductive selector proof folded a reachable relative write");
+      continue;
+    }
+    fixture.PlanAndTrack();
+    auto plan = ExtractResourcePlan(fixture.program);
+    const std::array<uint32_t, 3> user_data{0x1000u, 0x2000u, 1u};
+    FakeGuestMemory fake([](void *, uint64_t address, std::span<uint32_t> words) {
+      if (address != 0x1014u || words.size() != 1u) return false;
+      words[0] = 64u;
+      return true;
+    }, nullptr);
+    DescriptorValue descriptor;
+    const auto &bufs = fixture.program.info.buffers;
+    Check(bufs.size() == 2u &&
+              EvaluateSrtDescriptor(plan, {.user_data = user_data}, bufs[1].source, descriptor) &&
+              descriptor.dwords[2] == 64u,
+          "partition waterfall relative writes did not preserve runtime buffer capacity");
+  }
+}
+
 void TestDmaAddressMaterialization() {
   Fixture fixture;
   const auto based =
@@ -9550,6 +9693,7 @@ int main() {
 #endif
     Run("buffer store active value", TestBufferStoreUsesItsOwnActiveValue);
     Run("bounded relative register writes", TestBoundedRelativeRegisterWrites);
+    Run("partition waterfall relative writes", TestPartitionWaterfallRelativeRegisterWrites);
     Run("bounded relative register reads", TestBoundedRelativeRegisterReads);
     Run("DMA address materialization", TestDmaAddressMaterialization);
     Run("dynamic FLAT address", TestDynamicFlatAddressesUseDma);
