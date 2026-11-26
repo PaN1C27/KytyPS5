@@ -37677,7 +37677,10 @@ TestCase BufferStoreWorkgroupDescriptors(u32 groups, u32 components = 1u) {
 
 TestCase BufferLoadGpuSelectedDescriptors(u32 wave, ShaderOpcode load) {
   using O = ShaderOpcode;
-  const bool formatted = load == O::BUFFER_LOAD_FORMAT_X;
+  const bool d16_low = load == O::BUFFER_LOAD_FORMAT_D16_X;
+  const bool d16_hi = load == O::BUFFER_LOAD_FORMAT_D16_HI_X;
+  const bool d16 = d16_low || d16_hi;
+  const bool formatted = load == O::BUFFER_LOAD_FORMAT_X || d16;
   const bool byte = load == O::BUFFER_LOAD_UBYTE;
   using F = Prospero::BufferFormat;
   constexpr uint64_t GuestBase = 0x0000000110000000ull;
@@ -37690,7 +37693,33 @@ TestCase BufferLoadGpuSelectedDescriptors(u32 wave, ShaderOpcode load) {
     bool unmapped = false;
   };
   std::vector<DescriptorCase> cases;
-  if (formatted) {
+  if (d16) {
+    cases = {
+      {F::k8UInt, 4, 1, 4, 3, 1, 0, 0, false, 0x7f},
+      {F::k8UInt, 4, 0, 4, 3, 0, 3, 0, false, 0x80},
+      {F::k16UInt, 4, 2, 4, 0, 1, 0, 0, false, 0x80ff},
+      {F::k32UInt, 4, 4, 2, 0, 1, 0, 0, false, 0xffff},
+      {F::k32SInt, 4, 4, 2, 0, 1, 0, 0, false, 0x8000},
+      {F::k32SInt, 4, 0, 16, 3, 0, 12, 0, false, 0x7fff},
+      {F::k32_32_32_32Float, 7, 16, 1, 0, 0, 0, 0, false, 0x3e00},
+      {F::k8SInt, 4, 0, 16, 3, 0, 3, 0, false, 0xff80},
+      {F::k16SInt, 4, 0, 16, 3, 0, 2, 0, false, 0x80ff},
+      {F::k8UNorm, 4, 0, 16, 3, 0, 5, 0, false, 0x3c00},
+      {F::k8SNorm, 4, 0, 16, 3, 0, 3, 0, false, 0xbc00},
+      {F::k16Float, 4, 0, 16, 3, 0, 8, 0, false, 0x3c00},
+      {F::k16Float, 4, 0, 16, 3, 0, 10, 0, false, 0x4000},
+      {F::k32_32_32_32Float, 4, 8, 1, 0, 0, 0, 0, false, 0},
+      {F::k32_32_32_32Float, 1, 0, 16, 3, 0, 4, 0, false, 0x3c00},
+      {F::k32UInt, 1, 4, 0, 0, 0, 0, 0, false, 1},
+      {F::k32UInt, 0, 4, 1, 0, 0, 0, 0, false, 0},
+      {F::kInvalid, 1, 4, 1, 0, 0, 0, 0, false, 0},
+      {F::k32_32_32_32UInt, 4, 4, 1, 0, 0, 0, 0, false, 0, false, true},
+      {F::k32UInt, 0, 4, 1, 0, 0, 0, 0, false, 0, false, true},
+      {F::k32UInt, 1, 4, 1, 0, 0, 0, 0, false, 1, false, true},
+      {F::k32Float, 1, 4, 1, 0, 0, 0, 0, false, 0x3c00, false, true},
+      {static_cast<F>(127), 4, 4, 1, 0, 0, 0, 0, false, 0, false, true},
+    };
+  } else if (formatted) {
     cases = {
       {F::k8UInt, 4, 1, 4, 3, 1, 0, 0, false, 0x7f},
       {F::k8UInt, 4, 0, 4, 3, 0, 3, 0, false, 0x80},
@@ -37775,14 +37804,19 @@ TestCase BufferLoadGpuSelectedDescriptors(u32 wave, ShaderOpcode load) {
     const auto info = ShaderRecompiler::Format::GetFormatInfo(static_cast<F>(format));
     using T = ShaderRecompiler::Format::ComponentType;
     for (u32 selector = 0; selector < 8u; ++selector) {
-      const u32 one = info.type == T::Uint || info.type == T::Sint ? 1u : 0x3f800000u;
+      const u32 one = info.type == T::Uint || info.type == T::Sint ? 1u
+                                                                   : (d16 ? 0x3c00u : 0x3f800000u);
       cases.push_back({static_cast<F>(format), selector, 16, 1, 0, 0, 0, 0, false,
                        selector == 1u && info.type != T::Unknown ? one : 0u, true});
     }
   }
   TestCase test;
-  test.name = formatted ? (wave == 32 ? "BufferLoadFormatXGpuSelectedDescriptors32"
-                                      : "BufferLoadFormatXGpuSelectedDescriptors64")
+  test.name = d16_low ? (wave == 32 ? "BufferLoadFormatD16XGpuSelectedDescriptors32"
+                                    : "BufferLoadFormatD16XGpuSelectedDescriptors64")
+                      : d16_hi ? (wave == 32 ? "BufferLoadFormatD16HiXGpuSelectedDescriptors32"
+                                             : "BufferLoadFormatD16HiXGpuSelectedDescriptors64")
+                      : formatted ? (wave == 32 ? "BufferLoadFormatXGpuSelectedDescriptors32"
+                                                : "BufferLoadFormatXGpuSelectedDescriptors64")
                         : byte ? (wave == 32 ? "BufferLoadUbyteGpuSelectedDescriptors32"
                                               : "BufferLoadUbyteGpuSelectedDescriptors64")
                                : (wave == 32 ? "BufferLoadUshortGpuSelectedDescriptors32"
@@ -37808,7 +37842,10 @@ TestCase BufferLoadGpuSelectedDescriptors(u32 wave, ShaderOpcode load) {
       std::copy(payload.begin(), payload.end(), test.initial.begin() + data_offset / 4);
     // Read the selection on the GPU, as a descriptor waterfall does.
     test.initial[selection_base / 4u + i] = std::size(cases) - 1 - i;
-    test.expected.push_back(cases[std::size(cases) - 1 - i].expected);
+    const u32 raw_expected = cases[std::size(cases) - 1 - i].expected;
+    test.expected.push_back(d16_low ? (0xabcd0000u | (raw_expected & 0xffffu))
+                                    : d16_hi ? (0x00005678u | ((raw_expected & 0xffffu) << 16u))
+                                             : raw_expected);
   }
   auto &code = test.code;
   AppendSMovLiteral(&code, 28, 0);
@@ -37824,7 +37861,9 @@ TestCase BufferLoadGpuSelectedDescriptors(u32 wave, ShaderOpcode load) {
   code.push_back(EncodeSmem1(descriptor_base, 20));
   code.push_back(EncodeVop1(0x01, 21, 12));
   code.push_back(EncodeVop1(0x01, 22, 13));
-  code.push_back(EncodeMubuf0(formatted ? 0x00 : byte ? 0x08 : 0x0a, 0, true, true, !formatted));
+  if (d16) AppendVMovLiteral(&code, 4, 0xabcd5678u);
+  code.push_back(EncodeMubuf0(d16_low ? 0x80u : d16_hi ? 0x26u : formatted ? 0x00 : byte ? 0x08 : 0x0a,
+                              0, true, true, !formatted));
   code.push_back(EncodeMubuf1(4, 2, 21, 14));
   AppendBufferStoreDword(&code, 4, 30);
   code.push_back(EncodeSop2(0x00, 28, 28, InlineU32(1)));
@@ -37878,6 +37917,8 @@ void CheckSharedIndirectBufferLoads(VulkanHarness &vulkan) {
     for (const auto &test : {BufferLoadsGpuSelectedDescriptors(1u, wave),
                             BufferLoadsGpuSelectedDescriptors(1u, wave, true),
                             BufferLoadGpuSelectedDescriptors(wave, ShaderOpcode::BUFFER_LOAD_FORMAT_X),
+                            BufferLoadGpuSelectedDescriptors(wave, ShaderOpcode::BUFFER_LOAD_FORMAT_D16_X),
+                            BufferLoadGpuSelectedDescriptors(wave, ShaderOpcode::BUFFER_LOAD_FORMAT_D16_HI_X),
                             BufferLoadsGpuSelectedDescriptors(3u, wave),
                             BufferLoadsGpuSelectedDescriptors(4u, wave),
                             BufferLoadGpuSelectedDescriptors(wave, ShaderOpcode::BUFFER_LOAD_UBYTE),
@@ -58551,6 +58592,8 @@ int main(int argc, char **argv) {
     CheckSharedIndirectBufferLoads(vulkan);
     RunCase(&vulkan, BufferLoadFormatXGpuSelectedDescriptors());
     RunCase(&vulkan, BufferLoadFormatXGpuSelectedDescriptors64());
+    RunCase(&vulkan, BufferLoadGpuSelectedDescriptors(32u, ShaderOpcode::BUFFER_LOAD_FORMAT_D16_X));
+    RunCase(&vulkan, BufferLoadGpuSelectedDescriptors(64u, ShaderOpcode::BUFFER_LOAD_FORMAT_D16_HI_X));
     RunCase(&vulkan, BufferLoadFormatXRejectsPartialRecord());
     RunCase(&vulkan, BufferLoadFormatXyRejectsPartialRecord());
     RunCase(&vulkan, BufferLoadDwordx4SnapshotsOverlappingAddress());

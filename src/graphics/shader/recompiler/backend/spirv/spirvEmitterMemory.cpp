@@ -1028,7 +1028,7 @@ uint32_t LoadIndirectBuffer(ValueEmitContext& ctx, const IndirectBufferAccess& b
 	return ConstructU32Composite(state, components, values);
 }
 
-uint32_t LoadIndirectFormattedX(ValueEmitContext& ctx, const IndirectBufferAccess& buffer) {
+uint32_t LoadIndirectFormattedX(ValueEmitContext& ctx, const IndirectBufferAccess& buffer, bool d16) {
 	auto& state = ctx.state;
 	const auto geometry = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpFunctionCall, TypeU32Composite(state, 4), geometry,
@@ -1071,7 +1071,11 @@ uint32_t LoadIndirectFormattedX(ValueEmitContext& ctx, const IndirectBufferAcces
 	state.builder.AddFunction(spv::OpFunctionCall, TypeU32(state), result,
 	                          state.indirect_format_function, buffer.format, buffer.selector,
 	                          component, raw);
-	return result;
+	if (!d16) return result;
+	const auto packed = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpFunctionCall, TypeU32(state), packed,
+	                          state.indirect_format_d16_function, buffer.format, result);
+	return packed;
 }
 
 uint32_t LoadRawBuffer(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
@@ -1300,6 +1304,45 @@ void DefineIndirectBufferFormats(ValueEmitContext& ctx) {
 	state.builder.AddFunction(spv::OpFunctionEnd);
 }
 
+void DefineIndirectBufferD16(ValueEmitContext& ctx) {
+	auto& state = ctx.state;
+	const auto type = TypeU32(state);
+	constexpr auto format_count =
+	    static_cast<uint32_t>(Prospero::BufferFormat::k32_32_32_32Float) + 1u;
+	const auto function_type = state.builder.Type(spv::OpTypeFunction, type, type, type);
+	state.indirect_format_d16_function = state.builder.AllocateId();
+	const auto format = state.builder.AllocateId();
+	const auto value = state.builder.AllocateId();
+	state.builder.AddName(state.indirect_format_d16_function, "pack_indirect_buffer_d16");
+	state.builder.AddFunction(spv::OpFunction, type, state.indirect_format_d16_function,
+	                          spv::FunctionControlMaskNone, function_type);
+	state.builder.AddFunction(spv::OpFunctionParameter, type, format);
+	state.builder.AddFunction(spv::OpFunctionParameter, type, value);
+	EmitLabel(state, state.builder.AllocateId());
+	const auto kind = EmitIndexSwitch(state, format, format_count, type, [&](uint32_t candidate) {
+		const auto component_type =
+		    Format::GetFormatComponentType(static_cast<Prospero::BufferFormat>(candidate));
+		if (component_type == Format::ComponentType::Uint) return ConstantU32(state, 1u);
+		if (component_type == Format::ComponentType::Sint) return ConstantU32(state, 2u);
+		return ConstantU32(state, 0u);
+	});
+	const auto result = EmitIndexSwitch(state, kind, 3u, type, [&](uint32_t category) {
+		if (category == 1u) return EmitUMin32(state, value, ConstantU32(state, 0xffffu));
+		if (category == 2u) {
+			const auto clamped =
+			    EmitSMin32(state, EmitSMax32(state, value, ConstantU32(state, 0xffff8000u)),
+			               ConstantU32(state, 0x7fffu));
+			return Binary(state, spv::OpBitwiseAnd, type, clamped, ConstantU32(state, 0xffffu));
+		}
+		const auto pair = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 2), pair,
+		                          EmitBitCastF32U32(state, value), ConstantF32(state, 0));
+		return EmitPackHalf2x16(state, pair);
+	});
+	state.builder.AddFunction(spv::OpReturnValue, result);
+	state.builder.AddFunction(spv::OpFunctionEnd);
+}
+
 } // namespace
 
 uint32_t GetBdaPointer(EmitterState& state, uint32_t address) {
@@ -1325,6 +1368,10 @@ void DefineIndirectBufferLoads(ValueEmitContext& ctx) {
 			if (memory.formatted && state.indirect_format_function == 0u) {
 				DefineIndirectBufferFormats(ctx);
 			}
+			if (memory.formatted && memory.data_bits == 16u &&
+			    state.indirect_format_d16_function == 0u) {
+				DefineIndirectBufferD16(ctx);
+			}
 			const auto function = entry->second = state.builder.AllocateId();
 			const auto type = TypeU32(state);
 			const auto result_type = TypeU32Composite(state, components);
@@ -1343,7 +1390,8 @@ void DefineIndirectBufferLoads(ValueEmitContext& ctx) {
 			}
 			EmitLabel(state, state.builder.AllocateId());
 			const auto buffer = PrepareIndirectBuffer(state, args, memory.formatted);
-			const auto result = memory.formatted ? LoadIndirectFormattedX(ctx, buffer)
+			const auto result = memory.formatted
+			    ? LoadIndirectFormattedX(ctx, buffer, memory.data_bits == 16u)
 			    : LoadIndirectBuffer(ctx, buffer, memory.data_bits, components, memory.coherent);
 			state.builder.AddFunction(spv::OpReturnValue, result);
 			state.builder.AddFunction(spv::OpFunctionEnd);
