@@ -9893,6 +9893,136 @@ void TestU64RegisterPairRoundTrip() {
         "modified SGPR pair incorrectly reused an unrelated native U64 value");
 }
 
+void TestU64HalfExtractSimplification() {
+  using namespace ShaderRecompiler::IR;
+
+  {
+    Program program;
+    program.block_storage.push_back(std::make_unique<Block>());
+    program.blocks.push_back(program.block_storage.back().get());
+    IREmitter ir(program.blocks.front());
+    const auto user =
+        ir.Emit(ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(0))});
+    const auto lane = ir.Emit(ValueOpcode::LaneId);
+    const auto pair = ir.Emit(ValueOpcode::CompositeConstructU64, {user, lane});
+    const auto shl = ir.Emit(ValueOpcode::ShiftLeftLogical64, {pair, Value(5u)});
+    ir.Emit(ValueOpcode::CompositeExtractU64, {shl, Value(1u)}); // dead high half
+    const auto low = ir.Emit(ValueOpcode::CompositeExtractU64, {shl, Value(0u)});
+    const auto out = ir.Emit(ValueOpcode::IAdd32, {low, Value(4u)});
+    const auto shl32 =
+        ir.Emit(ValueOpcode::ShiftLeftLogical64, {pair, Value(32u)});
+    const auto low32 =
+        ir.Emit(ValueOpcode::CompositeExtractU64, {shl32, Value(0u)});
+    const auto shl37 =
+        ir.Emit(ValueOpcode::ShiftLeftLogical64, {pair, Value(37u)});
+    const auto high37 =
+        ir.Emit(ValueOpcode::CompositeExtractU64, {shl37, Value(1u)});
+
+    const auto rev_pair =
+        ir.Emit(ValueOpcode::CompositeConstructU64, {lane, user});
+    const auto lsr32 =
+        ir.Emit(ValueOpcode::ShiftRightLogical64, {rev_pair, Value(32u)});
+    const auto lsr32_hi =
+        ir.Emit(ValueOpcode::CompositeExtractU64, {lsr32, Value(1u)});
+    const auto lsr5 =
+        ir.Emit(ValueOpcode::ShiftRightLogical64, {rev_pair, Value(5u)});
+    const auto lsr5_hi =
+        ir.Emit(ValueOpcode::CompositeExtractU64, {lsr5, Value(1u)});
+    const auto lsr37 =
+        ir.Emit(ValueOpcode::ShiftRightLogical64, {rev_pair, Value(37u)});
+    const auto lsr37_lo =
+        ir.Emit(ValueOpcode::CompositeExtractU64, {lsr37, Value(0u)});
+    const auto asr37 =
+        ir.Emit(ValueOpcode::ShiftRightArithmetic64, {rev_pair, Value(37u)});
+    const auto asr37_lo =
+        ir.Emit(ValueOpcode::CompositeExtractU64, {asr37, Value(0u)});
+
+    const auto added = ir.Emit(
+        ValueOpcode::IAdd64,
+        {pair, ir.Emit(ValueOpcode::CompositeConstructU64, {Value(3u), lane})});
+    const auto masked = ir.Emit(
+        ValueOpcode::BitwiseAnd64,
+        {added, Value(uint64_t{0x00000000000000ffull})});
+    const auto chained_shl =
+        ir.Emit(ValueOpcode::ShiftLeftLogical64, {masked, Value(5u)});
+    const auto chained_low =
+        ir.Emit(ValueOpcode::CompositeExtractU64, {chained_shl, Value(0u)});
+    const auto chained_out =
+        ir.Emit(ValueOpcode::IAdd32, {chained_low, Value(1u)});
+    ir.Emit(ValueOpcode::Reference, {out});
+    ir.Emit(ValueOpcode::Reference, {chained_out});
+
+    ConstantPropagationPass(program.blocks);
+
+    const auto *low_inst = low.Resolve().TryInstruction();
+    Check(low_inst != nullptr &&
+              low_inst->GetOpcode() == ValueOpcode::ShiftLeftLogical32 &&
+              low_inst->Arg(0).Resolve() == user.Resolve() &&
+              low_inst->Arg(1).Resolve() == Value(5u),
+          "S_LSHL_B64 low half extract did not fold away dead high half");
+    Check(low32.Resolve() == Value(0u) && lsr32_hi.Resolve() == Value(0u),
+          "64-bit shift >=32 did not fold discarded half to zero");
+    const auto *h37 = high37.Resolve().TryInstruction();
+    Check(h37 != nullptr &&
+              h37->GetOpcode() == ValueOpcode::ShiftLeftLogical32 &&
+              h37->Arg(0).Resolve() == user.Resolve() &&
+              h37->Arg(1).Resolve() == Value(5u),
+          "S_LSHL_B64 cross-half high extract did not fold to ShiftLeftLogical32");
+    const auto *lsr5_inst = lsr5_hi.Resolve().TryInstruction();
+    Check(lsr5_inst != nullptr &&
+              lsr5_inst->GetOpcode() == ValueOpcode::ShiftRightLogical32 &&
+              lsr5_inst->Arg(0).Resolve() == user.Resolve() &&
+              lsr5_inst->Arg(1).Resolve() == Value(5u),
+          "S_LSHR_B64 high half extract did not fold to ShiftRightLogical32");
+    const auto *lsr37_inst = lsr37_lo.Resolve().TryInstruction();
+    Check(lsr37_inst != nullptr &&
+              lsr37_inst->GetOpcode() == ValueOpcode::ShiftRightLogical32 &&
+              lsr37_inst->Arg(0).Resolve() == user.Resolve() &&
+              lsr37_inst->Arg(1).Resolve() == Value(5u),
+          "S_LSHR_B64 cross-half low extract did not fold to ShiftRightLogical32");
+    const auto *asr37_inst = asr37_lo.Resolve().TryInstruction();
+    Check(asr37_inst != nullptr &&
+              asr37_inst->GetOpcode() == ValueOpcode::ShiftRightArithmetic32 &&
+              asr37_inst->Arg(0).Resolve() == user.Resolve() &&
+              asr37_inst->Arg(1).Resolve() == Value(5u),
+          "S_ASHR_I64 cross-half low extract did not fold to ShiftRightArithmetic32");
+    Check(chained_low.Resolve().TryInstruction() != nullptr &&
+              !chained_low.Resolve().Instruction()->Arg(0).IsEmpty(),
+          "chained U64 low extract lost its folded value");
+
+    RemoveIdentities(program);
+    EliminateDeadCode(program.blocks);
+
+    Check(out.Instruction()->Arg(0).TryInstruction() == low_inst,
+          "out did not directly reference folded ShiftLeftLogical32");
+    for (const auto &inst : *program.blocks.front()) {
+      Check(inst.GetOpcode() != ValueOpcode::LaneId &&
+                inst.GetOpcode() != ValueOpcode::ShiftLeftLogical64 &&
+                inst.GetOpcode() != ValueOpcode::IAdd64,
+            "dead U64 high half or wide op remained after DCE");
+    }
+  }
+
+  {
+    const uint32_t shader[] = {
+        EncodeSop2(0x0bu, 6u, 126u, 128u),  // s_cselect_b64 s[6:7], exec_lo, 0
+        EncodeSMovB32(6u, 4u),              // s_mov_b32 s6, s4 (s7 retains exec_hi)
+        EncodeSop2(0x1fu, 8u, 6u, 128u + 5u), // s_lshl_b64 s[8:9], s[6:7], 5
+        EncodeSMovB32(2u, 8u),              // s_mov_b32 s2, s8 (s9 dead)
+        EncodeMubuf0(0x1cu, 0u, false),
+        EncodeMubuf1(0u, 0u, 0u),           // buffer_store_dword v0, off, s[0:3], 0
+        EncodeSopp(0x01u),                  // s_endpgm
+    };
+    const std::array<uint32_t, 5> userdata{0u, 0u, 0u, 0x00016204u, 16u};
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    options.user_data = userdata;
+    const auto result = RecompileForTest(shader, options);
+    CheckSpirvBinaryValidates(result.spirv);
+    Check(result.program.info.buffers.size() == 1u,
+          "end-to-end U64 half-extract shader did not track one buffer");
+  }
+}
+
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 void TestNativeWideValueValidation() {
   using namespace ShaderRecompiler::IR;
@@ -13745,6 +13875,7 @@ int main() {
   TestMaskedShiftConstantPropagation();
   TestU64ShiftConstantPropagation();
   TestU64RegisterPairRoundTrip();
+  TestU64HalfExtractSimplification();
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   TestNativeWideValueValidation();
 #endif

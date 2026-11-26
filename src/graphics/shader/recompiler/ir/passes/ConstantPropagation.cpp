@@ -201,6 +201,31 @@ bool FoldBitCast(Inst& inst, ValueOpcode reverse) {
 	return false;
 }
 
+bool IsRepackedPairHalf(const Inst& extract) {
+	return std::ranges::any_of(extract.Uses(), [](const Use& use) {
+		return use.user->GetOpcode() == ValueOpcode::CompositeConstructU64;
+	});
+}
+
+bool IsDeadUser(const Inst& user, uint32_t depth = 0u) {
+	if (user.GetOpcode() == ValueOpcode::Identity) {
+		return true;
+	}
+	if (user.MayHaveSideEffects() || depth >= 8u) {
+		return false;
+	}
+	return std::ranges::all_of(user.Uses(), [depth](const Use& use) {
+		return IsDeadUser(*use.user, depth + 1u);
+	});
+}
+
+bool HasSingleLiveUse(const Inst& producer, const Inst& active_user) {
+	return std::ranges::all_of(producer.Uses(), [&](const Use& use) {
+		const auto& user = *use.user;
+		return &user == &active_user || IsDeadUser(user);
+	});
+}
+
 bool FoldCompositeExtract(Inst& inst, ValueOpcode construct, size_t components) {
 	const auto composite = Arg(inst, 0);
 	const auto index     = Arg(inst, 1);
@@ -218,6 +243,127 @@ bool FoldCompositeExtract(Inst& inst, ValueOpcode construct, size_t components) 
 		return true;
 	}
 	return false;
+}
+
+void FoldCompositeExtractU64(Block& block, Block::iterator instruction, FoldWorklist& worklist) {
+	auto& inst = *instruction;
+	if (FoldCompositeExtract(inst, ValueOpcode::CompositeConstructU64, 2)) {
+		return;
+	}
+	const auto index = Arg(inst, 1);
+	if (!IsImmediate(index, Type::U32) || index.U32() >= 2u) {
+		return;
+	}
+	const uint32_t component = index.U32();
+	const auto*    producer  = Arg(inst, 0).TryInstruction();
+	if (producer == nullptr) {
+		return;
+	}
+	const bool repacked    = IsRepackedPairHalf(inst);
+	const bool single_live = !repacked && HasSingleLiveUse(*producer, inst);
+	const auto extract_half = [&](Value wide, uint32_t half) {
+		return Value(&*worklist.Prepend(block, instruction, ValueOpcode::CompositeExtractU64,
+		                                {wide, Value(half)}));
+	};
+	switch (producer->GetOpcode()) {
+		case ValueOpcode::ShiftLeftLogical64: {
+			const auto shift_arg = Arg(*producer, 1);
+			if (!IsImmediate(shift_arg, Type::U32)) return;
+			const uint32_t shift = shift_arg.U32() & 63u;
+			if (component == 0u) {
+				if (shift >= 32u) {
+					if (single_live || !repacked) Replace(inst, Value(0u));
+				} else if (single_live) {
+					const auto low = extract_half(Arg(*producer, 0), 0u);
+					Replace(inst, shift == 0u
+					                  ? low
+					                  : Value(&*worklist.Prepend(block, instruction,
+					                                             ValueOpcode::ShiftLeftLogical32,
+					                                             {low, Value(shift)})));
+				}
+			} else if (shift >= 32u && (single_live || !repacked)) {
+				const auto     low    = extract_half(Arg(*producer, 0), 0u);
+				const uint32_t amount = shift - 32u;
+				Replace(inst, amount == 0u
+				                  ? low
+				                  : Value(&*worklist.Prepend(block, instruction,
+				                                             ValueOpcode::ShiftLeftLogical32,
+				                                             {low, Value(amount)})));
+			}
+			return;
+		}
+		case ValueOpcode::ShiftRightLogical64: {
+			const auto shift_arg = Arg(*producer, 1);
+			if (!IsImmediate(shift_arg, Type::U32)) return;
+			const uint32_t shift = shift_arg.U32() & 63u;
+			if (component == 1u) {
+				if (shift >= 32u) {
+					if (single_live || !repacked) Replace(inst, Value(0u));
+				} else if (single_live) {
+					const auto high = extract_half(Arg(*producer, 0), 1u);
+					Replace(inst, shift == 0u
+					                  ? high
+					                  : Value(&*worklist.Prepend(block, instruction,
+					                                             ValueOpcode::ShiftRightLogical32,
+					                                             {high, Value(shift)})));
+				}
+			} else if (shift >= 32u && (single_live || !repacked)) {
+				const auto     high   = extract_half(Arg(*producer, 0), 1u);
+				const uint32_t amount = shift - 32u;
+				Replace(inst, amount == 0u
+				                  ? high
+				                  : Value(&*worklist.Prepend(block, instruction,
+				                                             ValueOpcode::ShiftRightLogical32,
+				                                             {high, Value(amount)})));
+			}
+			return;
+		}
+		case ValueOpcode::ShiftRightArithmetic64: {
+			const auto shift_arg = Arg(*producer, 1);
+			if (!IsImmediate(shift_arg, Type::U32)) return;
+			const uint32_t shift = shift_arg.U32() & 63u;
+			if ((component == 1u || shift >= 32u) && single_live) {
+				const auto     high   = extract_half(Arg(*producer, 0), 1u);
+				const uint32_t amount = component == 1u ? std::min(shift, 31u) : shift - 32u;
+				Replace(inst, amount == 0u
+				                  ? high
+				                  : Value(&*worklist.Prepend(block, instruction,
+				                                             ValueOpcode::ShiftRightArithmetic32,
+				                                             {high, Value(amount)})));
+			}
+			return;
+		}
+		case ValueOpcode::BitwiseAnd64: {
+			for (uint32_t arm = 0; arm < 2u; ++arm) {
+				const auto mask = Arg(*producer, arm);
+				if (IsImmediate(mask, Type::U64) &&
+				    static_cast<uint32_t>(mask.U64() >> (component * 32u)) == 0u) {
+					if (single_live || !repacked) Replace(inst, Value(0u));
+					return;
+				}
+			}
+			if (single_live) {
+				const auto lhs = extract_half(Arg(*producer, 0), component);
+				const auto rhs = extract_half(Arg(*producer, 1), component);
+				Replace(inst, Value(&*worklist.Prepend(block, instruction,
+				                                       ValueOpcode::BitwiseAnd32, {lhs, rhs})));
+			}
+			return;
+		}
+		case ValueOpcode::IAdd64:
+		case ValueOpcode::ISub64: {
+			if (component == 0u && single_live) {
+				const auto lhs  = extract_half(Arg(*producer, 0), 0u);
+				const auto rhs  = extract_half(Arg(*producer, 1), 0u);
+				const auto op32 = producer->GetOpcode() == ValueOpcode::IAdd64
+				                      ? ValueOpcode::IAdd32
+				                      : ValueOpcode::ISub32;
+				Replace(inst, Value(&*worklist.Prepend(block, instruction, op32, {lhs, rhs})));
+			}
+			return;
+		}
+		default: return;
+	}
 }
 
 void FoldZeroComparison(Block& block, Block::iterator instruction, FoldWorklist& worklist) {
@@ -407,7 +553,7 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			return;
 		}
 		case ValueOpcode::CompositeExtractU64:
-			FoldCompositeExtract(inst, ValueOpcode::CompositeConstructU64, 2);
+			FoldCompositeExtractU64(block, instruction, worklist);
 			return;
 		case ValueOpcode::CompositeExtractU32x2:
 			FoldCompositeExtract(inst, ValueOpcode::CompositeConstructU32x2, 2);
