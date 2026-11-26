@@ -34,10 +34,61 @@ bool SrtReadCapture::Read(void* userdata, uint64_t address, std::span<uint32_t> 
 
 namespace {
 
+uint32_t VectorBufferReadDwords(ValueOpcode op) {
+	switch (op) {
+		case ValueOpcode::LoadBufferU32: return 1u;
+		case ValueOpcode::LoadBufferU32x2: return 2u;
+		case ValueOpcode::LoadBufferU32x3: return 3u;
+		case ValueOpcode::LoadBufferU32x4: return 4u;
+		default: return 0u;
+	}
+}
+
+uint32_t CompositeExtractDwords(ValueOpcode op) {
+	switch (op) {
+		case ValueOpcode::CompositeExtractU32x2: return 2u;
+		case ValueOpcode::CompositeExtractU32x3: return 3u;
+		case ValueOpcode::CompositeExtractU32x4: return 4u;
+		default: return 0u;
+	}
+}
+
+ValueOpcode CompositeConstructForDwords(uint32_t dwords) {
+	switch (dwords) {
+		case 2u: return ValueOpcode::CompositeConstructU32x2;
+		case 3u: return ValueOpcode::CompositeConstructU32x3;
+		case 4u: return ValueOpcode::CompositeConstructU32x4;
+		default: return ValueOpcode::Void;
+	}
+}
+
+bool UnpackReadNode(const Inst& node_inst, const Inst*& read_inst, uint32_t& component) {
+	const auto op = node_inst.GetOpcode();
+	if (op == ValueOpcode::LoadAddressU32 || op == ValueOpcode::ReadConstBuffer ||
+	    op == ValueOpcode::LoadBufferU32) {
+		read_inst = &node_inst;
+		component = 0u;
+		return true;
+	}
+	const auto dwords = CompositeExtractDwords(op);
+	if (dwords == 0u || node_inst.NumArgs() != 2u) {
+		return false;
+	}
+	const auto* src = node_inst.Arg(0).Resolve().TryInstruction();
+	const auto  idx = node_inst.Arg(1).Resolve();
+	if (src == nullptr || VectorBufferReadDwords(src->GetOpcode()) != dwords ||
+	    !idx.IsImmediate() || idx.GetType() != Type::U32 || idx.U32() >= dwords) {
+		return false;
+	}
+	read_inst = src;
+	component = idx.U32();
+	return true;
+}
+
 bool IsRawRead(const ResourcePlan& values, const Inst& inst) {
-	const auto op = inst.GetOpcode();
-	if (op != ValueOpcode::LoadAddressU32 && op != ValueOpcode::ReadConstBuffer &&
-	    op != ValueOpcode::LoadBufferU32) {
+	const auto op     = inst.GetOpcode();
+	const auto dwords = VectorBufferReadDwords(op);
+	if (op != ValueOpcode::LoadAddressU32 && op != ValueOpcode::ReadConstBuffer && dwords == 0u) {
 		return false;
 	}
 	const auto index = inst.Flags<MemoryFlags>().index;
@@ -45,20 +96,15 @@ bool IsRawRead(const ResourcePlan& values, const Inst& inst) {
 		return false;
 	}
 	const auto& memory = values.memory_info[index];
-	if (op != ValueOpcode::LoadBufferU32) {
+	if (dwords == 0u) {
 		return (op == ValueOpcode::LoadAddressU32 && memory.kind == ResourceKind::ScalarAddress) ||
 		       (op == ValueOpcode::ReadConstBuffer && memory.kind == ResourceKind::ScalarBuffer);
 	}
-	if (inst.NumArgs() != 5u || memory.kind != ResourceKind::Buffer || memory.typed ||
-	    memory.formatted || memory.coherent || memory.data_bits != 32u ||
-	    memory.data_dwords != 1u || memory.idxen || memory.offen || memory.offset != 0u ||
-	    inst.Arg(4).GetType() != Type::U1) {
-		return false;
-	}
-	for (uint32_t arg = 1; arg <= 3; ++arg) {
-		if (inst.Arg(arg).Resolve() != Value(0u)) return false;
-	}
-	return true;
+	return values.stage == ShaderType::Compute && inst.NumArgs() == 5u &&
+	       memory.kind == ResourceKind::Buffer && !memory.typed && !memory.formatted &&
+	       !memory.coherent && memory.data_bits == 32u && memory.data_dwords == dwords &&
+	       !memory.offen && inst.Arg(2).Resolve() == Value(0u) &&
+	       static_cast<int32_t>(memory.offset) >= 0 && inst.Arg(4).GetType() == Type::U1;
 }
 
 bool IsDescriptorHandle(ValueOpcode opcode) {
@@ -88,6 +134,10 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::CompositeExtractU64:
 		case ValueOpcode::CompositeConstructU32x2:
 		case ValueOpcode::CompositeExtractU32x2:
+		case ValueOpcode::CompositeConstructU32x3:
+		case ValueOpcode::CompositeExtractU32x3:
+		case ValueOpcode::CompositeConstructU32x4:
+		case ValueOpcode::CompositeExtractU32x4:
 		case ValueOpcode::BitFieldInsert:
 		case ValueOpcode::BitFieldUExtract:
 		case ValueOpcode::BitFieldSExtract:
@@ -313,19 +363,21 @@ private:
 			}
 			return finish(true);
 		}
+		const auto vector_dwords = VectorBufferReadDwords(op);
 		if (op == ValueOpcode::LoadAddressU32 || op == ValueOpcode::ReadConstBuffer ||
-		    op == ValueOpcode::LoadBufferU32) {
+		    vector_dwords != 0u) {
 			const auto  expected = op == ValueOpcode::LoadAddressU32
 			                           ? ValueOpcode::GetAddressResource
 			                           : ValueOpcode::GetBufferResource;
-			const auto* handle = inst->NumArgs() != 0 ? inst->Arg(0).ResolveInstruction() : nullptr;
+			const auto* handle = inst->NumArgs() != 0 ? inst->Arg(0).Resolve().TryInstruction() : nullptr;
 			if (!IsRawRead(m_program, *inst) || handle == nullptr ||
 			    handle->GetOpcode() != expected) {
 				return finish(false);
 			}
-			if (op == ValueOpcode::LoadBufferU32) {
+			if (vector_dwords != 0u) {
 				const auto guard = inst->Arg(4).Resolve();
-				return finish(Validate(inst->Arg(0)) &&
+				return finish(Validate(inst->Arg(0)) && Validate(inst->Arg(1)) &&
+				              Validate(inst->Arg(2)) && Validate(inst->Arg(3)) &&
 				              ((!m_active_mask.IsEmpty() && guard == m_active_mask) || Validate(guard)));
 			}
 		} else if (op == ValueOpcode::CompositeExtractU64) {
@@ -333,11 +385,13 @@ private:
 			if (!index.IsImmediate() || index.GetType() != Type::U32 || index.U32() >= 2u) {
 				return finish(false);
 			}
-		} else if (op == ValueOpcode::CompositeExtractU32x2) {
-			const auto* source = inst->NumArgs() == 2 ? inst->Arg(0).ResolveInstruction() : nullptr;
+		} else if (const auto dwords = CompositeExtractDwords(op); dwords != 0u) {
+			const auto* source = inst->NumArgs() == 2 ? inst->Arg(0).Resolve().TryInstruction() : nullptr;
 			const auto  index  = inst->NumArgs() == 2 ? inst->Arg(1).Resolve() : Value {};
 			if (source == nullptr || !index.IsImmediate() || index.GetType() != Type::U32 ||
-			    index.U32() >= 2u || source->GetOpcode() != ValueOpcode::CompositeConstructU32x2) {
+			    index.U32() >= dwords ||
+			    (source->GetOpcode() != CompositeConstructForDwords(dwords) &&
+			     VectorBufferReadDwords(source->GetOpcode()) != dwords)) {
 				return finish(false);
 			}
 		}
@@ -541,12 +595,23 @@ WalkerCompiler::Ref WalkerCompiler::Evaluate(Value value, uint32_t context) {
 		case ValueOpcode::BitCastU32F32:
 		case ValueOpcode::BitCastF32U32:
 		case ValueOpcode::ConditionRef: return Evaluate(inst->Arg(0), context);
-		case ValueOpcode::CompositeExtractU32x2: {
-			const auto* source = inst->Arg(0).ResolveInstruction();
-			const auto  index  = inst->Arg(1).Resolve();
-			if (source == nullptr || source->GetOpcode() != ValueOpcode::CompositeConstructU32x2 ||
-			    !index.IsImmediate() || index.GetType() != Type::U32 || index.U32() >= 2u) return {};
-			return Evaluate(source->Arg(index.U32()), context);
+		case ValueOpcode::CompositeExtractU32x2:
+		case ValueOpcode::CompositeExtractU32x3:
+		case ValueOpcode::CompositeExtractU32x4: {
+			const auto  dwords = CompositeExtractDwords(op);
+			const auto* source = inst->NumArgs() == 2 ? inst->Arg(0).Resolve().TryInstruction() : nullptr;
+			const auto  index  = inst->NumArgs() == 2 ? inst->Arg(1).Resolve() : Value {};
+			if (source == nullptr || !index.IsImmediate() || index.GetType() != Type::U32 ||
+			    index.U32() >= dwords) {
+				return {};
+			}
+			if (source->GetOpcode() == CompositeConstructForDwords(dwords)) {
+				return Evaluate(source->Arg(index.U32()), context);
+			}
+			if (VectorBufferReadDwords(source->GetOpcode()) == dwords) {
+				break;
+			}
+			return {};
 		}
 		case ValueOpcode::ReadFirstLane:
 			// The lane read does not depend on the EXEC mask it is read under.
@@ -607,7 +672,10 @@ WalkerCompiler::Operand WalkerCompiler::Analyze(uint32_t index) {
 		}
 		case ValueOpcode::LoadAddressU32:
 		case ValueOpcode::ReadConstBuffer:
-		case ValueOpcode::LoadBufferU32: return AnalyzeRead(node, arg, self);
+		case ValueOpcode::LoadBufferU32:
+		case ValueOpcode::CompositeExtractU32x2:
+		case ValueOpcode::CompositeExtractU32x3:
+		case ValueOpcode::CompositeExtractU32x4: return AnalyzeRead(node, arg, self);
 		case ValueOpcode::SelectU1:
 		case ValueOpcode::SelectU32:
 		case ValueOpcode::SelectF32: {
@@ -660,8 +728,11 @@ WalkerCompiler::Operand WalkerCompiler::Analyze(uint32_t index) {
 			[[fallthrough]];
 		}
 		default:
-			// The other runtime-uniform ops are strict; a U32x2 pair is only read through its extracts.
-			if (!IsRuntimeUniformOp(inst.GetOpcode()) || inst.GetOpcode() == ValueOpcode::CompositeConstructU32x2)
+			// The other runtime-uniform ops are strict; composite pairs/vectors are only read through their extracts.
+			if (!IsRuntimeUniformOp(inst.GetOpcode()) ||
+			    inst.GetOpcode() == ValueOpcode::CompositeConstructU32x2 ||
+			    inst.GetOpcode() == ValueOpcode::CompositeConstructU32x3 ||
+			    inst.GetOpcode() == ValueOpcode::CompositeConstructU32x4)
 				return {};
 			for (size_t i = 0; i < inst.NumArgs(); ++i) {
 				node.args.push_back(arg(inst.Arg(i)));
@@ -672,26 +743,37 @@ WalkerCompiler::Operand WalkerCompiler::Analyze(uint32_t index) {
 }
 
 WalkerCompiler::Operand WalkerCompiler::AnalyzeRead(Node& node, const auto& arg, Operand self) {
-	const auto& inst = *node.inst;
-	const auto* handle = inst.Arg(0).ResolveInstruction();
-	if (!IsRawRead(m_plan, inst) || handle == nullptr) return {};
-	const bool vector = inst.GetOpcode() == ValueOpcode::LoadBufferU32;
+	const Inst* read_inst = nullptr;
+	uint32_t    component = 0u;
+	if (!UnpackReadNode(*node.inst, read_inst, component)) return {};
+	const auto* handle = read_inst->Arg(0).Resolve().TryInstruction();
+	if (!IsRawRead(m_plan, *read_inst) || handle == nullptr) return {};
+	const bool vector = VectorBufferReadDwords(read_inst->GetOpcode()) != 0u;
 	if (vector) {
-		const auto guard = arg(inst.Arg(4));
+		const auto guard = arg(read_inst->Arg(4));
 		if (guard.kind == Kind::Unknown) return {};
 		if (guard.kind == Kind::Constant && guard.value == 0u) return {Kind::Constant, 0u};
 		node.args.push_back(guard);
 	}
-	const bool buffer = inst.GetOpcode() != ValueOpcode::LoadAddressU32;
-	const auto offset = static_cast<int32_t>(m_plan.memory_info[inst.Flags<MemoryFlags>().index].offset);
+	const bool buffer = read_inst->GetOpcode() != ValueOpcode::LoadAddressU32;
+	const auto offset =
+	    static_cast<int32_t>(m_plan.memory_info[read_inst->Flags<MemoryFlags>().index].offset);
 	bool failed = buffer && (handle->NumArgs() != 4u || offset < 0);
-	for (const auto& word: {handle->Arg(0), handle->Arg(1), inst.Arg(1)}) {
-		node.args.push_back(arg(word));
-		failed |= node.args.back().kind == Kind::Unknown;
-	}
-	for (uint32_t word = 2; buffer && !failed && word < 4u; ++word) {
-		node.args.push_back(arg(handle->Arg(word)));
-		failed |= node.args.back().kind == Kind::Unknown;
+	if (vector) {
+		for (const auto& word: {handle->Arg(0), handle->Arg(1), handle->Arg(2), handle->Arg(3),
+		                        read_inst->Arg(1), read_inst->Arg(2), read_inst->Arg(3)}) {
+			node.args.push_back(arg(word));
+			failed |= node.args.back().kind == Kind::Unknown;
+		}
+	} else {
+		for (const auto& word: {handle->Arg(0), handle->Arg(1), read_inst->Arg(1)}) {
+			node.args.push_back(arg(word));
+			failed |= node.args.back().kind == Kind::Unknown;
+		}
+		for (uint32_t word = 2; buffer && !failed && word < 4u; ++word) {
+			node.args.push_back(arg(handle->Arg(word)));
+			failed |= node.args.back().kind == Kind::Unknown;
+		}
 	}
 	if (!failed) return self;
 	// A disabled vector lane still reads zero.
@@ -709,14 +791,11 @@ void WalkerCompiler::Layout() {
 		auto& node = m_nodes[index];
 		node.slot  = offset;
 		offset += 8u;
-		// EmitRead forms a read's base from the two operands after LoadBufferU32's leading test.
-		const auto   op   = node.inst->GetOpcode();
-		const size_t skip = op == ValueOpcode::LoadBufferU32 ? 1u : 0u;
-		const bool read = op == ValueOpcode::LoadAddressU32 || op == ValueOpcode::ReadConstBuffer ||
-		                  op == ValueOpcode::LoadBufferU32;
-		if (read && node.result == Operand {Kind::Node, index} && node.args.size() > skip + 2u &&
-		    node.args[skip].kind == Kind::UserData && node.args[skip + 1].kind == Kind::UserData) {
-			m_bases.try_emplace({node.args[skip].value, node.args[skip + 1].value}, 0u);
+		const auto op   = node.inst->GetOpcode();
+		const bool read = op == ValueOpcode::LoadAddressU32 || op == ValueOpcode::ReadConstBuffer;
+		if (read && node.result == Operand {Kind::Node, index} && node.args.size() > 2u &&
+		    node.args[0].kind == Kind::UserData && node.args[1].kind == Kind::UserData) {
+			m_bases.try_emplace({node.args[0].value, node.args[1].value}, 0u);
 		}
 	}
 	m_reach = offset;
@@ -876,7 +955,10 @@ void WalkerCompiler::EmitNode(uint32_t index) {
 		}
 		case ValueOpcode::LoadAddressU32:
 		case ValueOpcode::ReadConstBuffer:
-		case ValueOpcode::LoadBufferU32: EmitRead(node); return;
+		case ValueOpcode::LoadBufferU32:
+		case ValueOpcode::CompositeExtractU32x2:
+		case ValueOpcode::CompositeExtractU32x3:
+		case ValueOpcode::CompositeExtractU32x4: EmitRead(node); return;
 		case ValueOpcode::SelectU1:
 		case ValueOpcode::SelectU32:
 		case ValueOpcode::SelectF32: {
@@ -956,11 +1038,13 @@ void WalkerCompiler::EmitNode(uint32_t index) {
 
 // Raw scalar and uniform DWORD buffer loads; out-of-bounds reads are zero.
 void WalkerCompiler::EmitRead(const Node& node) {
-	auto&      c    = m_code;
-	const auto& inst = *node.inst;
-	const auto op = inst.GetOpcode();
-	const bool vector = op == ValueOpcode::LoadBufferU32;
-	auto args = std::span(node.args);
+	auto&       c         = m_code;
+	const Inst* read_inst = nullptr;
+	uint32_t    component = 0u;
+	EXIT_IF(!UnpackReadNode(*node.inst, read_inst, component));
+	const auto  op     = read_inst->GetOpcode();
+	const bool  vector = VectorBufferReadDwords(op) != 0u;
+	auto        args   = std::span(node.args);
 	Xbyak::Label zero;
 	if (vector) {
 		Fetch(args[0], m_ret);
@@ -971,57 +1055,122 @@ void WalkerCompiler::EmitRead(const Node& node) {
 	}
 	if (!args.empty()) {
 		for (const auto& arg: args) Branch(arg, m_ret);
-		const auto immediate =
-		    static_cast<int64_t>(static_cast<int32_t>(m_plan.memory_info[inst.Flags<MemoryFlags>().index].offset)) &
-		    ~int64_t {3};
-		// A constant offset folds into the displacement; r10 = the address.
-		const auto constant = int64_t {static_cast<uint32_t>(args[2].value) & ~3u} + immediate;
-		const bool folded   = args[2].kind == Kind::Constant && constant + 4 <= INT32_MAX;
-		const auto offset   = folded ? Xbyak::RegExp(static_cast<size_t>(constant))
-		                             : c.r9 + static_cast<size_t>(immediate);
-		if (args[0].kind == Kind::UserData && args[1].kind == Kind::UserData) {
-			c.mov(c.rax, c.qword[At(m_bases.at({args[0].value, args[1].value}))]);
-		} else {
-			Base(args[0], args[1]);
-		}
-		if (!folded) {
-			Load(c.r9, args[2]);
-			c.and_(c.r9d, ~3u);
-		}
-		c.lea(c.r10, c.ptr[c.rax + offset]);
-		if (op == ValueOpcode::LoadAddressU32) {
+		const auto mem_offset = m_plan.memory_info[read_inst->Flags<MemoryFlags>().index].offset;
+		if (vector) {
+			// args: [0]=word0, [1]=word1, [2]=records, [3]=word3, [4]=index, [5]=voffset, [6]=soffset
+			Load(c.r11, args[1]);
+			c.shr(c.r11d, 16);
+			c.mov(c.r9d, c.r11d);
+			c.and_(c.r11d, 0x3fffu); // stride
+			Xbyak::Label unswizzled;
+			c.test(c.r11d, c.r11d);
+			c.jz(unswizzled, Near);
+			c.test(c.r9d, 1u << 15u);
+			c.jnz(m_ret, Near);
+			c.L(unswizzled);
+
+			Load(c.rcx, args[3]);
+			c.test(c.ecx, 1u << 23u); // ADD_TID_ENABLE
+			c.jnz(m_ret, Near);
+			c.test(c.ecx, 0xc0000000u); // TYPE != 0
+			c.jnz(zero, Near);
+			c.test(c.ecx, 0x7fu << 12u); // data_format == 0
+			c.jz(zero, Near);
+
+			Load(c.r9, args[5]); // voffset
+			if (mem_offset != 0u) c.add(c.r9d, mem_offset);
+			c.mov(c.r10d, c.r9d);
+			if (component != 0u) c.add(c.r10d, component * 4u);
+
+			c.shr(c.ecx, 28); // OOB_SELECT (bits 30..31 are 0)
+			Load(c.rax, args[2]); // NumRecords
+			Xbyak::Label check_idx, check_mode2, check_mode3, in_bounds;
+			c.cmp(c.ecx, 2);
+			c.je(check_mode2, Near);
+			c.ja(check_mode3, Near);
+			// mode 0 or 1
+			c.test(c.ecx, c.ecx);
+			c.jnz(check_idx, Near);
+			c.cmp(c.r10d, c.r11d);
+			c.jae(zero, Near);
+			c.L(check_idx);
+			Load(c.rcx, args[4]);
+			c.cmp(c.ecx, c.eax);
+			c.jae(zero, Near);
+			c.jmp(in_bounds, Near);
+			c.L(check_mode2);
+			c.test(c.eax, c.eax);
+			c.jz(zero, Near);
+			c.jmp(in_bounds, Near);
+			c.L(check_mode3);
+			Load(c.rcx, args[6]);
+			c.cmp(c.ecx, c.eax);
+			c.ja(zero, Near);
+			c.sub(c.eax, c.ecx);
+			c.cmp(c.eax, 4);
+			c.jb(zero, Near);
+			c.sub(c.eax, 4);
+			c.cmp(c.r10d, c.eax);
+			c.ja(zero, Near);
+			c.L(in_bounds);
+
+			Load(c.rax, args[4]);
+			c.imul(c.eax, c.r11d);
+			c.add(c.r9d, c.eax);
+			Load(c.rcx, args[6]);
+			c.add(c.r9d, c.ecx); // zero-extends 32-bit byte offset to r9
+
+			Load(c.rax, args[1]);
+			c.movzx(c.eax, c.ax);
+			c.shl(c.rax, 32);
+			Load(c.rcx, args[0]);
+			c.mov(c.ecx, c.ecx);
+			c.or_(c.rax, c.rcx);
+			c.add(c.rax, c.r9);
+			c.and_(c.rax, ~int32_t {3});
+			if (component != 0u) {
+				c.lea(c.r10, c.ptr[c.rax + component * 4u]);
+			} else {
+				c.mov(c.r10, c.rax);
+			}
 			c.mov(c.rcx, c.r10);
 			c.shr(c.rcx, 48);
 			c.jnz(m_ret, Near);
 		} else {
-			Load(c.r11, args[1]);
-			c.shr(c.r11d, 16);
-			if (vector) {
-				// Only the uniform, unswizzled structured DWORD address is evaluated on the host.
-				c.test(c.r11d, 1u << 15u);
-				c.jnz(m_ret, Near);
-				Load(c.rcx, args[4]);
-				c.test(c.ecx, (1u << 23u) | 0xf0000000u);
-				c.jnz(m_ret, Near);
-				c.test(c.r11d, 0x3fffu);
-				c.jz(zero, Near);
-				c.test(c.ecx, 0x7fu << 12u);
-				c.jz(zero, Near);
+			const auto immediate = static_cast<int64_t>(static_cast<int32_t>(mem_offset)) & ~int64_t {3};
+			// A constant offset folds into the displacement; r10 = the address.
+			const auto constant = int64_t {static_cast<uint32_t>(args[2].value) & ~3u} + immediate;
+			const bool folded   = args[2].kind == Kind::Constant && constant + 4 <= INT32_MAX;
+			const auto offset   = folded ? Xbyak::RegExp(static_cast<size_t>(constant))
+			                             : c.r9 + static_cast<size_t>(immediate);
+			if (args[0].kind == Kind::UserData && args[1].kind == Kind::UserData) {
+				c.mov(c.rax, c.qword[At(m_bases.at({args[0].value, args[1].value}))]);
+			} else {
+				Base(args[0], args[1]);
 			}
-			c.and_(c.r11d, 0x3fffu);
-			Load(c.rcx, args[3]);
-			if (vector) {
-				c.test(c.ecx, c.ecx);
-				c.jz(zero, Near);
+			if (!folded) {
+				Load(c.r9, args[2]);
+				c.and_(c.r9d, ~3u);
 			}
-			Xbyak::Label sized;
-			c.test(c.r11d, c.r11d);
-			c.jz(sized, Near);
-			c.imul(c.rcx, c.r11);
-			c.L(sized);
-			c.lea(c.r11, c.ptr[offset + 4u]);
-			c.cmp(c.r11, c.rcx);
-			c.ja(zero, Near);
+			c.lea(c.r10, c.ptr[c.rax + offset]);
+			if (op == ValueOpcode::LoadAddressU32) {
+				c.mov(c.rcx, c.r10);
+				c.shr(c.rcx, 48);
+				c.jnz(m_ret, Near);
+			} else {
+				Load(c.r11, args[1]);
+				c.shr(c.r11d, 16);
+				c.and_(c.r11d, 0x3fffu);
+				Load(c.rcx, args[3]);
+				Xbyak::Label sized;
+				c.test(c.r11d, c.r11d);
+				c.jz(sized, Near);
+				c.imul(c.rcx, c.r11);
+				c.L(sized);
+				c.lea(c.r11, c.ptr[offset + 4u]);
+				c.cmp(c.r11, c.rcx);
+				c.ja(zero, Near);
+			}
 		}
 		// Every guest load is mov eax, [r10] (41 8b 02), which the fault handler completes.
 		c.mov(c.eax, c.dword[c.r10]);

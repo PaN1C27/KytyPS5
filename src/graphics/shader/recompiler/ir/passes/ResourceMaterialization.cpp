@@ -1461,12 +1461,16 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		if (const auto found = cloned.find(source); found != cloned.end()) {
 			return Value(found->second);
 		}
-		if (source->GetOpcode() == ValueOpcode::LoadBufferU32) plan.capture_specialization_reads = true;
+		const auto op = source->GetOpcode();
+		const bool vector_buffer_read = op == ValueOpcode::LoadBufferU32 ||
+		                                op == ValueOpcode::LoadBufferU32x2 ||
+		                                op == ValueOpcode::LoadBufferU32x3 ||
+		                                op == ValueOpcode::LoadBufferU32x4;
+		if (vector_buffer_read) plan.capture_specialization_reads = true;
 		auto& target =
-		    plan.value_storage.emplace_back(source->GetOpcode(), source->Flags<uint64_t>());
-		if (source->GetOpcode() == ValueOpcode::LoadAddressU32 ||
-		    source->GetOpcode() == ValueOpcode::ReadConstBuffer ||
-		    source->GetOpcode() == ValueOpcode::LoadBufferU32) {
+		    plan.value_storage.emplace_back(op, source->Flags<uint64_t>());
+		if (op == ValueOpcode::LoadAddressU32 || op == ValueOpcode::ReadConstBuffer ||
+		    vector_buffer_read) {
 			target.SetFlags(MemoryFlags {.index = source->Flags<MemoryFlags>().index});
 		}
 		cloned.emplace(source, &target);

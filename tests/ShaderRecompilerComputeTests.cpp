@@ -44884,6 +44884,71 @@ void CheckRuntimeBufferRecords(VulkanHarness &vulkan) {
   std::printf("[compute] %-32s ok\n", test.name);
 }
 
+void CheckRuntimeIndexedBufferX2AndWaterfall(VulkanHarness &vulkan) {
+  using namespace ShaderRecompiler::IR;
+  TestCase test;
+  test.name = "RuntimeIndexedBufferX2AndWaterfall";
+  // Load a 2-dword indexed structured buffer at uniform index s12 into v[9:10]
+  // using s[4:7], run a bounded V_MOVRELD_B32 v1, v13 (v15 = min(1, tid), so only
+  // v1..v2 can be modified), then feed v10 via V_READFIRSTLANE_B32 as NumRecords
+  // of output V# s[8:11] and store 1 dword per thread.
+  test.code = {
+    0x7e060300u,                           // v_mov_b32 v3, v0
+    EncodeVop2(0x13, 15, InlineU32(1), 0), // v_min_u32 v15, 1, v0
+    0x7e00020cu,                           // v_mov_b32 v0, s12
+    0xe0342000u, 0x80010900u,              // buffer_load_dwordx2 v[9:10], v0, s[4:7], 0 idxen
+    0xbf8c3f70u,                           // s_waitcnt vmcnt(0)
+    0x7e1a02ffu, 0x55667788u,              // v_mov_b32 v13, 0x55667788
+    0x7e1c050fu,                           // v_readfirstlane_b32 s14, v15
+    0xbefc030eu,                           // s_mov_b32 m0, s14
+    0x7e02850du,                           // v_movreld_b32 v1, v13
+    0x7e14050au,                           // v_readfirstlane_b32 s10, v10
+    0xe0702000u, 0x80020d03u,              // buffer_store_dword v13, v3, s[8:11], 0 idxen
+    0xbf810000u,                           // s_endpgm
+  };
+  test.user_data[4] = 0u;
+  test.user_data[5] = 8u << 16u;
+  test.user_data[6] = 4u;
+  test.user_data[7] = 0x00016204u;
+  test.user_data[8] = 64u;
+  test.user_data[9] = 4u << 16u;
+  test.user_data[10] = 0u;
+  test.user_data[11] = 0x00016204u;
+  test.user_data[12] = 2u;
+  test.has_user_data = true;
+  test.initial.assign(24u, 0xdeadbeefu);
+  test.initial[4] = 0x11111111u;
+  test.initial[5] = 2u;
+  test.expected = test.initial;
+  test.expected[16] = 0x55667788u;
+  test.expected[17] = 0x55667788u;
+  test.has_compute_info = true;
+  test.compute_info.threads_num[0] = 4u;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+  test.compute_info.lds_size_dwords = 0u;
+  test.compute_info.wave_size = 64u;
+  test.compute_info.float_mode = 0xc0u;
+  test.compute_info.thread_ids_num = 1u;
+  const auto compiled = CompileCase(test, vulkan.SubgroupSize());
+  Require(test.name, "indexed x2 runtime buffer capacity",
+          compiled.program.info.buffers.size() == 2 &&
+              compiled.resources.buffers[1].dwords[2] == 2u &&
+              compiled.resources.specialization_reads ==
+                  std::vector<std::pair<uint64_t, uint64_t>>{{20u, 4u}},
+          "failed to evaluate indexed x2 buffer read and waterfall capacity");
+  for (const auto &value : compiled.resources.buffers) {
+    ShaderBufferResource descriptor{};
+    std::copy_n(value.dwords.begin(), 4u, descriptor.fields);
+    test.storage_buffer_ranges.emplace_back(descriptor.Base48(), u32(descriptor.GetSize()));
+  }
+  auto output = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
+  vulkan.Dispatch(test, compiled, output);
+  const auto actual = vulkan.ReadBuffer(test.name, output, test.expected.size());
+  vulkan.DestroyBuffer(&output);
+  CompareWords(test, "indexed x2 + waterfall runtime capacity", test.expected, actual);
+  std::printf("[compute] %-32s ok\n", test.name);
+}
+
 void CheckBoundedFormattedBufferCopy(VulkanHarness &vulkan) {
   using namespace ShaderRecompiler::IR;
   constexpr std::array<u32, 8> lengths{16, 1, 4, 32, 48, 4, 32, 48};
@@ -59188,6 +59253,14 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, VectorReadlaneSelectsTwoKeysWithinWave());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--runtime-buffer-only") == 0) {
+    VulkanHarness vulkan;
+    CheckRuntimeBufferRecords(vulkan);
+    CheckRuntimeIndexedBufferX2AndWaterfall(vulkan);
+    RunCase(&vulkan, Vop1MoveRelSourceRuntimeIndex());
+    RunCase(&vulkan, Vop1MoveRelDestination());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--standard-tile-rt-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckRenderExecutorColorStandardTileDiscovery();
@@ -59357,6 +59430,7 @@ int main(int argc, char **argv) {
   CheckFiniteBufferSelection(vulkan);
   CheckStorageBufferBindingOver2GiB(vulkan);
   CheckRuntimeBufferRecords(vulkan);
+  CheckRuntimeIndexedBufferX2AndWaterfall(vulkan);
   CheckSharedIndirectBufferLoads(vulkan);
   CheckComputeThreadDimensions(vulkan);
   CheckCountedRowImageSelector(vulkan);

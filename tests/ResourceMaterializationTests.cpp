@@ -457,6 +457,88 @@ void TestUniformVectorDescriptorRead() {
         "varying vector address was treated as a uniform descriptor read");
 }
 
+void TestUniformWideIndexedDescriptorRead() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  for (const uint32_t mode : {0u, 1u, 2u, 3u}) {
+    Program program;
+    program.stage = Libs::Graphics::ShaderType::Compute;
+    program.user_data_count = 4;
+    program.srt_plan_complete = program.resource_tracking_complete = true;
+    auto &block = AddValueBlock(program);
+    auto &idx = block.AppendNewInst(ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(0))});
+    auto &records = block.AppendNewInst(ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(1))});
+    auto &soffset = block.AppendNewInst(ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(2))});
+    auto &lane = block.AppendNewInst(ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
+    auto &active = block.AppendNewInst(ValueOpcode::INotEqual32, {Value(&lane), Value(999u)});
+    auto &masked_idx = block.AppendNewInst(ValueOpcode::SelectU32, {Value(&active), Value(&idx), Value(&lane)});
+    const uint32_t stride = mode == 3u ? 0u : 16u;
+    auto &handle = block.AppendNewInst(ValueOpcode::GetBufferResource,
+        {Value(0x2000u), Value(stride << 16u), Value(&records), Value((mode << 28u) | 0x16204u)});
+    program.memory_info.push_back(
+        {.kind = ResourceKind::Buffer, .offset = 4u, .data_dwords = 2u, .idxen = true});
+    auto &pair = block.AppendNewInst(ValueOpcode::LoadBufferU32x2,
+        {Value(&handle), Value(&masked_idx), Value(0u), Value(&soffset), Value(&active)});
+    pair.SetFlags(MemoryFlags{.index = 0});
+    auto &comp1 = block.AppendNewInst(ValueOpcode::CompositeExtractU32x2, {Value(&pair), Value(1u)});
+    auto &selected = block.AppendNewInst(ValueOpcode::SelectU32, {Value(&active), Value(&comp1), Value(&lane)});
+    auto &first = block.AppendNewInst(ValueOpcode::ReadFirstLane, {Value(&selected), Value(&active)});
+    DescriptorSource source;
+    source.dword_count = 4;
+    source.dwords = {Value(0x3000u), Value(4u << 16u), Value(&first), Value(0x16204u)};
+    program.descriptor_sources.push_back(source);
+    program.info.buffers.push_back({.source = 0, .written = true});
+    Check(ValidateRuntimeValue(program, Value(&first)),
+          "uniform LoadBufferU32x2 + idxen component was rejected");
+
+    auto plan = Extract(program);
+    Check(plan.capture_specialization_reads,
+          "LoadBufferU32x2 runtime read did not enable specialization read capture");
+    struct Reads { uint64_t expected_addr = 0; uint32_t count = 0; } reads;
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    const auto run = [&](uint32_t i, uint32_t rec, uint32_t soff, uint64_t expected_addr) {
+      reads = {.expected_addr = expected_addr, .count = 0};
+      FakeGuestMemory fake([](void *data, uint64_t address, std::span<uint32_t> words) {
+        auto &r = *static_cast<Reads *>(data);
+        ++r.count;
+        if (address != r.expected_addr || words.size() != 1u) return false;
+        words[0] = 0x1234u;
+        return true;
+      }, &reads);
+      const std::array<uint32_t, 4> ud{i, rec, soff, 0u};
+      return MaterializeResources(plan, {.user_data = ud}, snapshot, specialization);
+    };
+
+    if (mode == 0u) {
+      // i=2, stride=16, voffset+mem.offset=4, component=1(+4) => addr = 0x2000 + 32 + 8 = 0x2028
+      Check(run(2u, 4u, 0u, 0x2028u) && snapshot.buffers[0].dwords[2] == 0x1234u &&
+                reads.count == 1u &&
+                snapshot.specialization_reads ==
+                    std::vector<std::pair<uint64_t, uint64_t>>{{0x2028u, 4u}},
+            "mode 0 indexed LoadBufferU32x2 failed to read and capture");
+      Check(run(4u, 4u, 0u, 0u) && snapshot.buffers[0].dwords[2] == 0u && reads.count == 0u,
+            "mode 0 out-of-bounds index read guest memory");
+    } else if (mode == 1u) {
+      Check(run(1u, 2u, 0u, 0x2018u) && snapshot.buffers[0].dwords[2] == 0x1234u && reads.count == 1u,
+            "mode 1 indexed LoadBufferU32x2 failed");
+      Check(run(2u, 2u, 0u, 0u) && snapshot.buffers[0].dwords[2] == 0u && reads.count == 0u,
+            "mode 1 OOB index read guest memory");
+    } else if (mode == 2u) {
+      Check(run(3u, 1u, 0u, 0x2038u) && snapshot.buffers[0].dwords[2] == 0x1234u && reads.count == 1u,
+            "mode 2 indexed LoadBufferU32x2 failed");
+      Check(run(3u, 0u, 0u, 0u) && snapshot.buffers[0].dwords[2] == 0u && reads.count == 0u,
+            "mode 2 zero-records read guest memory");
+    } else {
+      // mode 3 raw: stride=0, soff=8, rec=20 => rem=12; comp_offset=8 <= 12-4 => in bounds at 0x2010
+      Check(run(0u, 20u, 8u, 0x2010u) && snapshot.buffers[0].dwords[2] == 0x1234u && reads.count == 1u,
+            "mode 3 raw LoadBufferU32x2 in-bounds failed");
+      Check(run(0u, 19u, 8u, 0u) && snapshot.buffers[0].dwords[2] == 0u && reads.count == 0u,
+            "mode 3 raw LoadBufferU32x2 out-of-bounds read guest memory");
+    }
+  }
+}
+
 void TestExactReciprocalDescriptorArithmetic() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   Program program;
@@ -490,6 +572,7 @@ void TestUnbasedFlatCacheHitMaterializes() {
   Check(snapshot.buffers.empty() && snapshot.images.empty(),
         "unbased FLAT plan produced unexpected descriptors");
 }
+
 
 void TestWrittenDescriptorPredicateReads(bool memory_condition) {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
@@ -1514,6 +1597,7 @@ int main() {
   TestIntegerRuntimeValueFollowsSrtReads();
   TestSrtAliasesShareReads();
   TestUniformVectorDescriptorRead();
+  TestUniformWideIndexedDescriptorRead();
   TestExactReciprocalDescriptorArithmetic();
   TestUnbasedFlatCacheHitMaterializes();
   for (const bool memory_condition : {false, true})
