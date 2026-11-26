@@ -170,6 +170,7 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::IEqual32:
 		case ValueOpcode::IEqual64:
 		case ValueOpcode::UGreaterThan32:
+		case ValueOpcode::UGreaterThanEqual32:
 		case ValueOpcode::SGreaterThanEqual32:
 		case ValueOpcode::INotEqual32:
 		case ValueOpcode::INotEqual64:
@@ -220,6 +221,22 @@ const uint8_t* Scratch(const ResourcePlan& plan) {
 
 thread_local const Xbyak::CodeGenerator* t_running_walker = nullptr;
 
+bool MaskImplies(Value mask, Value target) {
+	target = target.Resolve();
+	if (mask.IsEmpty() || target.IsEmpty() || target.IsImmediate()) return false;
+	mask = mask.Resolve();
+	if (mask == target) return true;
+	const auto* inst = mask.TryInstruction();
+	if (inst == nullptr) return false;
+	if (inst->GetOpcode() == ValueOpcode::ConditionRef && inst->NumArgs() == 1u) {
+		return MaskImplies(inst->Arg(0), target);
+	}
+	if (inst->GetOpcode() == ValueOpcode::LogicalAnd && inst->NumArgs() == 2u) {
+		return MaskImplies(inst->Arg(0), target) || MaskImplies(inst->Arg(1), target);
+	}
+	return false;
+}
+
 class RuntimeValidator {
 public:
 	explicit RuntimeValidator(const ResourcePlan& program, RuntimeValueType type,
@@ -256,7 +273,7 @@ private:
 				default: return false;
 			}
 		}
-		if (require_uniform && !m_active_mask.IsEmpty() && value == m_active_mask) return true;
+		if (require_uniform && MaskImplies(m_active_mask, value)) return true;
 		auto& validated = require_uniform ? m_validated_uniform : m_validated_dependencies;
 		const bool cacheable = !require_uniform || m_active_mask.IsEmpty();
 		if (cacheable && validated.contains(inst)) return true;
@@ -299,7 +316,9 @@ private:
 		}
 		if (!require_uniform) return finish(ValidateArguments(*inst, false));
 		if (!m_active_mask.IsEmpty() && IsRuntimeSelect(op) && inst->NumArgs() == 3 &&
-		    inst->Arg(0).Resolve() == m_active_mask) {
+		    MaskImplies(m_active_mask, inst->Arg(0)) &&
+		    (inst->Arg(0).Resolve() == m_active_mask ||
+		     !RuntimeValidator(m_program, RuntimeValueType::Any).Run(inst->Arg(0)))) {
 			// Empty EXEC reads lane zero, so ignored operands still require integer types.
 			if (m_type != RuntimeValueType::Any && !Validate(inst->Arg(2), false)) {
 				return finish(false);
@@ -585,10 +604,19 @@ WalkerCompiler::Ref WalkerCompiler::Evaluate(Value value, uint32_t context) {
 	}
 	const auto mask = m_masks[context];
 	if (context != 0 && value == mask) return {{Kind::Constant, 1u}, true};
+	if (context != 0 && MaskImplies(mask, value)) {
+		if (const auto unmasked = Evaluate(value, 0); unmasked.operand.kind != Kind::Unknown) {
+			return unmasked;
+		}
+		return {{Kind::Constant, 1u}, true};
+	}
 	const auto* inst = value.TryInstruction();
 	if (inst == nullptr) return {};
 	const auto op = inst->GetOpcode();
-	if (context != 0 && IsRuntimeSelect(op) && inst->NumArgs() == 3 && inst->Arg(0).Resolve() == mask) {
+	if (context != 0 && IsRuntimeSelect(op) && inst->NumArgs() == 3 &&
+	    MaskImplies(mask, inst->Arg(0)) &&
+	    (inst->Arg(0).Resolve() == mask ||
+	     Evaluate(inst->Arg(0), 0).operand.kind == Kind::Unknown)) {
 		return {Evaluate(inst->Arg(1), context).operand, true};
 	}
 	switch (op) {
@@ -686,14 +714,17 @@ WalkerCompiler::Operand WalkerCompiler::Analyze(uint32_t index) {
 			return node.args[1].kind == Kind::Unknown && node.args[2].kind == Kind::Unknown ? Operand {} : self;
 		}
 		case ValueOpcode::ULessThan32:
-		case ValueOpcode::ULessThanEqual32: {
+		case ValueOpcode::ULessThanEqual32:
+		case ValueOpcode::UGreaterThanEqual32: {
 			// No U32 is below zero and every U32 is at least zero, including an unknown loop-carried
 			// or varying lane value. args[0] is that zero-tested bound.
-			const bool less  = inst.GetOpcode() == ValueOpcode::ULessThan32;
-			const auto bound = arg(inst.Arg(less ? 1 : 0));
+			const auto op          = inst.GetOpcode();
+			const bool less        = op == ValueOpcode::ULessThan32;
+			const bool bound_right = less || op == ValueOpcode::UGreaterThanEqual32;
+			const auto bound       = arg(inst.Arg(bound_right ? 1 : 0));
 			if (bound.kind == Kind::Unknown) return {};
 			if (bound.kind == Kind::Constant && static_cast<uint32_t>(bound.value) == 0u) return constant(!less);
-			node.args = {bound, arg(inst.Arg(less ? 0 : 1))};
+			node.args = {bound, arg(inst.Arg(bound_right ? 0 : 1))};
 			return node.args[1].kind == Kind::Unknown && bound.kind == Kind::Constant ? Operand {} : self;
 		}
 		case ValueOpcode::LogicalOr:
@@ -974,7 +1005,8 @@ void WalkerCompiler::EmitNode(uint32_t index) {
 			return;
 		}
 		case ValueOpcode::ULessThan32:
-		case ValueOpcode::ULessThanEqual32: {
+		case ValueOpcode::ULessThanEqual32:
+		case ValueOpcode::UGreaterThanEqual32: {
 			const bool less = node.inst->GetOpcode() == ValueOpcode::ULessThan32;
 			Xbyak::Label bound_zero;
 			Fetch(args[0], m_ret);
@@ -983,7 +1015,7 @@ void WalkerCompiler::EmitNode(uint32_t index) {
 			Branch(args[1], m_ret);
 			Load(c.rax, args[0]);
 			Load(c.rcx, args[1]);
-			// ULT tests other < bound, ULE bound <= other.
+			// ULT tests other < bound; ULE (bound <= other) and UGE (other >= bound) share setae.
 			c.cmp(c.ecx, c.eax);
 			Set(less ? &Xbyak::CodeGenerator::setb : &Xbyak::CodeGenerator::setae);
 			Store(node);

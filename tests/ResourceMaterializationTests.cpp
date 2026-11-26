@@ -573,6 +573,87 @@ void TestUnbasedFlatCacheHitMaterializes() {
         "unbased FLAT plan produced unexpected descriptors");
 }
 
+void TestNarrowedExecConjunctDescriptorRead() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.user_data_count = 1;
+  program.srt_plan_complete = program.resource_tracking_complete = true;
+  auto &entry = AddValueBlock(program);
+  auto &work = AddValueBlock(program);
+  auto &exit_blk = AddValueBlock(program);
+  const auto emit = [](Block &block, ValueOpcode op, std::initializer_list<Value> args) {
+    return Value(&block.AppendNewInst(op, args));
+  };
+  const auto bound = emit(entry, ValueOpcode::GetUserData, {Value(ScalarReg(0))});
+  const auto tid = emit(entry, ValueOpcode::GetBuiltin,
+      {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
+  const auto outer = emit(entry, ValueOpcode::ULessThan32, {tid, Value(32u)});
+  auto &handle = entry.AppendNewInst(ValueOpcode::GetBufferResource,
+      {Value(0x1000u), Value(8u << 16u), Value(1u), Value(0x16204u)});
+  program.memory_info.push_back(
+      {.kind = ResourceKind::Buffer, .data_dwords = 2u, .planning_only = true});
+  auto &pair = entry.AppendNewInst(ValueOpcode::LoadBufferU32x2,
+      {Value(&handle), Value(0u), Value(0u), Value(0u), outer});
+  pair.SetFlags(MemoryFlags{.index = 0});
+  const auto lo = emit(entry, ValueOpcode::CompositeExtractU32x2, {Value(&pair), Value(0u)});
+  const auto hi = emit(entry, ValueOpcode::CompositeExtractU32x2, {Value(&pair), Value(1u)});
+  const auto masked_lo = emit(entry, ValueOpcode::SelectU32, {outer, lo, tid});
+  const auto masked_hi = emit(entry, ValueOpcode::SelectU32, {outer, hi, Value(0u)});
+  const auto out_of_range = emit(entry, ValueOpcode::UGreaterThanEqual32, {tid, bound});
+  const auto active = emit(entry, ValueOpcode::LogicalAnd,
+      {emit(entry, ValueOpcode::LogicalNot, {out_of_range}), outer});
+  const auto cond = emit(entry, ValueOpcode::ConditionRef, {active});
+  program.blocks[0]->condition = cond;
+  program.blocks[0]->terminator.kind = TerminatorKind::ConditionalBranch;
+  program.blocks[0]->terminator.true_block = &work;
+  program.blocks[0]->terminator.false_block = &exit_blk;
+  program.blocks[1]->id = 1;
+  program.blocks[1]->terminator.kind = TerminatorKind::Return;
+  program.blocks[2]->id = 2;
+  program.blocks[2]->terminator.kind = TerminatorKind::Return;
+
+  const auto base_lo = emit(work, ValueOpcode::ReadFirstLane, {masked_lo, active});
+  const auto base_hi = emit(work, ValueOpcode::ReadFirstLane, {masked_hi, active});
+  DescriptorSource source;
+  source.dwords = {base_lo, base_hi, Value(4u), Value(0x16204u)};
+  source.dword_count = 4;
+  program.descriptor_sources.push_back(source);
+  program.info.buffers.push_back({.source = 0});
+  program.memory_info.push_back({.kind = ResourceKind::Buffer, .resource = 0});
+  auto &output = work.AppendNewInst(ValueOpcode::GetBufferResource,
+      {base_lo, base_hi, Value(4u), Value(0x16204u)});
+  work.AppendNewInst(ValueOpcode::LoadBufferU32,
+      {Value(&output), Value(0u), Value(0u), Value(0u), active})
+      .SetFlags(MemoryFlags{.index = 1});
+
+  auto plan = Extract(program);
+  Check(plan.capture_specialization_reads && !plan.control_flow.empty(),
+        "narrowed EXEC conjunct plan lost its capture or control flow");
+  {
+    uint32_t reads = 0;
+    FakeGuestMemory fake(+[](void *data, uint64_t address, std::span<uint32_t> words) {
+      ++*static_cast<uint32_t *>(data);
+      if (address == 0x1000u) { words[0] = 0x4000u; return true; }
+      if (address == 0x1004u) { words[0] = 0x10u; return true; }
+      return false;
+    }, &reads);
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    const std::array<uint32_t, 1> zero_bound{0u};
+    Check(MaterializeResources(plan, {.user_data = zero_bound}, snapshot, specialization) &&
+              reads == 0u && snapshot.buffers[0].dwords[0] == 0u,
+          "zero-bound narrowed EXEC block stayed active");
+    const std::array<uint32_t, 1> active_bound{8u};
+    Check(MaterializeResources(plan, {.user_data = active_bound}, snapshot, specialization) &&
+              reads == 2u && snapshot.buffers[0].dwords[0] == 0x4000u &&
+              snapshot.buffers[0].dwords[1] == 0x10u &&
+              snapshot.specialization_reads ==
+                  std::vector<std::pair<uint64_t, uint64_t>>{{0x1000u, 4u}, {0x1004u, 4u}},
+          "narrowed EXEC conjunct descriptor did not resolve outer masked reads");
+  }
+}
 
 void TestWrittenDescriptorPredicateReads(bool memory_condition) {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
@@ -1598,6 +1679,7 @@ int main() {
   TestSrtAliasesShareReads();
   TestUniformVectorDescriptorRead();
   TestUniformWideIndexedDescriptorRead();
+  TestNarrowedExecConjunctDescriptorRead();
   TestExactReciprocalDescriptorArithmetic();
   TestUnbasedFlatCacheHitMaterializes();
   for (const bool memory_condition : {false, true})
