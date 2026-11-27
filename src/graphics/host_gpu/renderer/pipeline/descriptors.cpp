@@ -799,9 +799,12 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 			const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[resource]);
 			const auto address = descriptor.Type() == 0u ? descriptor.Base48() : 0u;
 			auto size = descriptor.Type() == 0u ? descriptor.GetSize() : 0u;
+			const bool untyped_formatted_only = metadata.formatted && !metadata.raw_or_typed;
 			if (!metadata.scalar &&
-			    (descriptor.Format() == Prospero::BufferFormat::kInvalid ||
-			     (descriptor.OutOfBounds() == 0u && descriptor.Stride() == 0u))) {
+			    ((untyped_formatted_only &&
+			      descriptor.Format() == Prospero::BufferFormat::kInvalid) ||
+			     (!metadata.written && descriptor.OutOfBounds() == 0u &&
+			      descriptor.Stride() == 0u))) {
 				size = 0u;
 			}
 			if (size != 0 && descriptor.Stride() == 0 && descriptor.OutOfBounds() == 2 &&

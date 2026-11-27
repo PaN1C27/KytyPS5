@@ -217,6 +217,7 @@ struct DirectBufferUsage {
 	bool has_scalar_use            = false;
 	bool has_vector_use            = false;
 	bool has_untyped_formatted_use = false;
+	bool has_raw_or_typed_use      = false;
 };
 
 DirectBufferUsage ClassifyDirectBufferUsage(
@@ -230,6 +231,8 @@ DirectBufferUsage ClassifyDirectBufferUsage(
 			usage.has_vector_use = true;
 			if (m.formatted && !m.typed) {
 				usage.has_untyped_formatted_use = true;
+			} else {
+				usage.has_raw_or_typed_use = true;
 			}
 		}
 	}
@@ -261,7 +264,10 @@ ShaderRecompiler::IR::ResourceSpecialization CanonicalizeModuleSpecialization(
 		}
 		canonical.buffers[i].packed_stride &= ~0x3fffu;
 		canonical.buffers[i].scalar_empty = false;
-		if (usage.has_scalar_use) continue;
+		if (usage.has_scalar_use ||
+		    (usage.has_untyped_formatted_use && usage.has_raw_or_typed_use)) {
+			continue;
+		}
 		if (usage.has_untyped_formatted_use &&
 		    canonical.buffers[i].descriptor_format == Prospero::BufferFormat::kInvalid) {
 			for (const auto& existing : std::views::reverse(existing_modules)) {
@@ -332,6 +338,7 @@ bool IsCompatibleModuleSpecialization(
 				continue;
 			}
 			if (usage.has_untyped_formatted_use && !usage.has_scalar_use &&
+			    !usage.has_raw_or_typed_use &&
 			    cand_buf.descriptor_format == Prospero::BufferFormat::kInvalid) {
 				if (spec_buf.descriptor_format != Prospero::BufferFormat::kInvalid) return false;
 				continue;
@@ -344,13 +351,15 @@ bool IsCompatibleModuleSpecialization(
 			}
 			if (!layout.dynamic_buffer_strides) return false;
 			if (usage.has_untyped_formatted_use && !usage.has_scalar_use &&
+			    !usage.has_raw_or_typed_use &&
 			    spec_buf.descriptor_format == Prospero::BufferFormat::kInvalid) {
 				continue;
 			}
 			if ((cand_buf.packed_stride & ~0x3fffu) != (spec_buf.packed_stride & ~0x3fffu)) {
 				return false;
 			}
-			if (usage.has_scalar_use &&
+			if ((usage.has_scalar_use ||
+			     (usage.has_untyped_formatted_use && usage.has_raw_or_typed_use)) &&
 			    (cand_buf.zero_stride_oob != spec_buf.zero_stride_oob ||
 			     (cand_buf.descriptor_format == Prospero::BufferFormat::kInvalid) !=
 			         (spec_buf.descriptor_format == Prospero::BufferFormat::kInvalid))) {

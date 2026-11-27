@@ -6422,9 +6422,12 @@ private:
 		resource.read            = resource.read || !write || atomic;
 		resource.written         = resource.written || write;
 		resource.atomic          = resource.atomic || atomic;
-		resource.formatted       = resource.formatted || memory.formatted;
-		resource.scalar          = resource.scalar || op == ValueOpcode::ReadConstBuffer ||
+		const bool scalar        = op == ValueOpcode::ReadConstBuffer ||
 		                           memory.kind == ResourceKind::ScalarBuffer;
+		resource.formatted       = resource.formatted || memory.formatted;
+		resource.raw_or_typed    = resource.raw_or_typed ||
+		                           (!scalar && (!memory.formatted || memory.typed));
+		resource.scalar          = resource.scalar || scalar;
 	}
 
 	uint32_t AddImage(uint32_t source, const MemoryInfo& memory, ValueOpcode op, uint32_t pc) {

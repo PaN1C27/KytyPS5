@@ -129,6 +129,7 @@ struct BufferResource {
 	bool                   written            = false;
 	bool                   atomic             = false;
 	bool                   formatted          = false;
+	bool                   raw_or_typed       = false;
 	bool                   scalar             = false;
 	bool                   live               = false;
 	uint32_t               indirect_root              = NoIndirectBuffer;

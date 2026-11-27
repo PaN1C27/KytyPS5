@@ -52491,6 +52491,7 @@ void CheckDirectBufferSpecializationReuse(VulkanHarness &vulkan) {
     u32 write_stride;
     std::array<u32, 7> expected_log;
     std::array<u32, 5> expected_write;
+    bool verify_zero_stride_write = false;
   };
 
   const uint64_t scalar_addr = base + scalar_offset;
@@ -52511,7 +52512,8 @@ void CheckDirectBufferSpecializationReuse(VulkanHarness &vulkan) {
     words[(fmt_a_offset + 8u) / 4u] = 0x40000000u; // index 1 for k32_32Float stride 8 (2.0f)
     words[(fmt_a_offset + 16u) / 4u] = 0x40400000u; // index 1 for stride 16 (3.0f)
     words[(fmt_b_offset + 4u) / 4u] = 0x0000ffffu; // index 1 for k16_16UNorm stride 4 (1.0f, 0.0f)
-    if (spec.write_stride != 0u) {
+    const bool check_write = spec.write_stride != 0u || spec.verify_zero_stride_write;
+    if (check_write) {
       words[(write_offset + spec.write_stride) / 4u] = 0xaabbccdd;
       words[(write_offset + spec.write_stride + 16u) / 4u] = 7u;
     }
@@ -52535,13 +52537,13 @@ void CheckDirectBufferSpecializationReuse(VulkanHarness &vulkan) {
       context.MapMemory(base, allocation_size);
       processor.DispatchDirect(1, 1, 1, 0x41u);
       context.GetBufferCache().ReadMemory(log_addr, 32u);
-      if (spec.write_stride != 0u) {
+      if (check_write) {
         context.GetBufferCache().ReadMemory(write_addr + spec.write_stride, 20u);
       }
       std::array<u32, 8> actual_log{};
       std::array<u32, 5> actual_write{};
       (void)LibKernel::Memory::TryReadBacking(log_addr, actual_log.data(), sizeof(actual_log));
-      if (spec.write_stride != 0u) {
+      if (check_write) {
         (void)LibKernel::Memory::TryReadBacking(write_addr + spec.write_stride,
                                                 actual_write.data(), sizeof(actual_write));
       }
@@ -52551,7 +52553,7 @@ void CheckDirectBufferSpecializationReuse(VulkanHarness &vulkan) {
                 fmt::format("log[{}] expected {:#x}, got {:#x}",
                             i, spec.expected_log[i], actual_log[i]));
       }
-      if (spec.write_stride != 0u) {
+      if (check_write) {
         for (size_t i = 0; i < spec.expected_write.size(); ++i) {
           Require(name, "write output", actual_write[i] == spec.expected_write[i],
                   fmt::format("write[{}] expected {:#x}, got {:#x}",
@@ -52622,6 +52624,19 @@ void CheckDirectBufferSpecializationReuse(VulkanHarness &vulkan) {
       .expected_log = {0u, 0u, 0x40400000u, 0x3f800000u, 0x3f800000u, 0x3f800000u, 7u},
       .expected_write = {0u, 0u, 0x40400000u, 0x3f800000u, 12u},
   };
+  // Batch 6 (reuse superset #2): written zero-stride raw storage buffer with kInvalid format.
+  const DispatchSpec d6{
+      .scalar = make_desc(scalar_addr, 4u, 1u),
+      .unfmt  = make_desc(unfmt_addr, 8u, 4u),
+      .fmt_a  = make_desc(fmt_a_addr, 16u, 4u, F::k32_32Float, fmt_swz),
+      .fmt_b  = make_desc(fmt_b_addr, 4u, 4u, F::k16_16UNorm, fmt_swz),
+      .write  = make_desc(write_addr, 0u, 64u, F::kInvalid),
+      .unfmt_stride = 8u,
+      .write_stride = 0u,
+      .expected_log = {0x12345678u, 0x11110008u, 0x40400000u, 0x3f800000u, 0x3f800000u, 0x3f800000u, 7u},
+      .expected_write = {0x12345678u, 0x11110008u, 0x40400000u, 0x3f800000u, 12u},
+      .verify_zero_stride_write = true,
+  };
 
   const auto cs_index = static_cast<size_t>(ShaderType::Compute);
   {
@@ -52641,8 +52656,9 @@ void CheckDirectBufferSpecializationReuse(VulkanHarness &vulkan) {
             PipelineCacheTestAccess::Compiled(pipelines)[cs_index] == 2u,
             "first concrete format on second formatted buffer should compile superset");
     run_dispatch(context, d5);
+    run_dispatch(context, d6);
     Require(name, "superset reuse", PipelineCacheTestAccess::Compiled(pipelines)[cs_index] == 2u,
-            "superset module was not reused for both formatted buffers populated");
+            "superset module was not reused for both formatted buffers and zero-stride raw write");
     context.ShutdownGpu();
     LibKernel::Memory::InstallGpuResources(nullptr);
   }
@@ -52651,7 +52667,7 @@ void CheckDirectBufferSpecializationReuse(VulkanHarness &vulkan) {
     context.InitializeGpu(nullptr);
     LibKernel::Memory::InstallGpuResources(&context);
     auto &pipelines = context.GetPipelineCache();
-    for (const auto *spec : {&d1, &d2, &d3, &d4, &d5}) {
+    for (const auto *spec : {&d1, &d2, &d3, &d4, &d5, &d6}) {
       run_dispatch(context, *spec);
     }
     Require(name, "warm store reuse", PipelineCacheTestAccess::Compiled(pipelines)[cs_index] == 0u,
@@ -60472,6 +60488,7 @@ int main(int argc, char **argv) {
     CheckStableProgramIds(vulkan);
     CheckStreamingIndirectBufferReuse(vulkan);
     CheckDirectBufferSpecializationReuse(vulkan);
+    CheckShaderStore(vulkan);
     vulkan.CheckZeroStrideBufferBinding();
     return 0;
   }
