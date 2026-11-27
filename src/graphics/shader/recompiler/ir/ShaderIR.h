@@ -545,6 +545,8 @@ struct IndirectBufferRoot {
 	bool operator==(const IndirectBufferRoot&) const = default;
 };
 
+inline constexpr uint32_t DynamicBufferInvalidFormatBit = 1u << 31u;
+
 struct Bindings {
 	std::array<uint32_t, static_cast<size_t>(DescriptorBindingKind::Count)> descriptor_counts {};
 	uint64_t descriptor_mask = 0;
@@ -554,6 +556,7 @@ struct Bindings {
 	uint32_t memory_offset_dword = 0;
 	uint32_t base_buffer_count = 0;
 	uint32_t live_base_buffer_count = 0;
+	bool dynamic_buffer_strides = false;
 	bool dynamic_indirect_buffers = false;
 	std::vector<IndirectBufferRoot> indirect_buffer_roots;
 	std::vector<uint32_t> indirect_root_mappings;
@@ -572,7 +575,7 @@ struct Bindings {
 	}
 	[[nodiscard]] uint32_t IndirectRootMappingDword() const {
 		return MemoryStrideDword() +
-		       (dynamic_indirect_buffers
+		       ((dynamic_buffer_strides || dynamic_indirect_buffers)
 		            ? descriptor_counts[static_cast<size_t>(DescriptorBindingKind::Buffers)]
 		            : 0u);
 	}

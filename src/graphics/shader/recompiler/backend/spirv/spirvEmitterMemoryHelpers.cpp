@@ -332,6 +332,13 @@ void PlanIndirectResourceMaps(EmitterState& state) {
 		        return b.live && b.indirect_root != IR::BufferResource::NoIndirectBuffer &&
 		               !b.indirect_resources.empty();
 	        });
+	bindings.dynamic_buffer_strides =
+	    bindings.dynamic_indirect_buffers ||
+	    (state.profile.dynamic_indirect_buffers &&
+	     std::ranges::any_of(state.program.memory_info, [&](const IR::MemoryInfo& m) {
+		     return !m.planning_only && m.kind == IR::ResourceKind::Buffer &&
+		            m.resource < bindings.base_buffer_count && info.buffers[m.resource].live;
+	     }));
 	if (bindings.dynamic_indirect_buffers) {
 		auto& buffer_count =
 		    bindings.descriptor_counts[static_cast<size_t>(IR::DescriptorBindingKind::Buffers)];
@@ -538,6 +545,8 @@ void EmitMemoryBindings(EmitterState& state) {
 	                        : bindings.descriptor_counts[static_cast<size_t>(IR::DescriptorBindingKind::Buffers)];
 	state.memory_byte_offsets.resize(count);
 	state.memory_byte_sizes.resize(count);
+	state.memory_strides.assign(count, 0u);
+	state.memory_invalid_formats.assign(count, 0u);
 	std::vector<bool> dynamic_offsets(count);
 	if (!bindings.dynamic_indirect_buffers) {
 		for (uint32_t resource = 0; resource < state.program.info.buffers.size(); ++resource) {
@@ -559,6 +568,38 @@ void EmitMemoryBindings(EmitterState& state) {
 			    state, word, ConstantU32(state, lane * 8u), ConstantU32(state, 8u));
 			state.memory_byte_sizes[i + lane] =
 			    EmitShaderDataDwordLoad(state, bindings.MemorySizeDword() + i + lane);
+		}
+	}
+	if (bindings.dynamic_buffer_strides) {
+		for (uint32_t r = 0; r < bindings.base_buffer_count; ++r) {
+			const auto& buf = state.program.info.buffers[r];
+			if (!buf.live || buf.indirect_root == r) continue;
+			bool has_vector_use            = false;
+			bool has_untyped_formatted_use = false;
+			for (const auto& m : state.program.memory_info) {
+				if (m.planning_only || m.kind != IR::ResourceKind::Buffer || m.resource != r) {
+					continue;
+				}
+				has_vector_use = true;
+				if (m.formatted && !m.typed) {
+					has_untyped_formatted_use = true;
+				}
+			}
+			if (!has_vector_use) continue;
+			const uint32_t slot = buf.descriptor_index;
+			EXIT_IF(slot >= count);
+			const auto raw = EmitShaderDataDwordLoad(state, bindings.MemoryStrideDword() + slot);
+			state.memory_strides[slot] =
+			    buf.formatted
+			        ? Binary(state, spv::OpBitwiseAnd, TypeU32(state), raw, ConstantU32(state, 0x3fffu))
+			        : raw;
+			if (has_untyped_formatted_use) {
+				state.memory_invalid_formats[slot] = Binary(
+				    state, spv::OpINotEqual, TypeBool(state),
+				    Binary(state, spv::OpBitwiseAnd, TypeU32(state), raw,
+				           ConstantU32(state, IR::DynamicBufferInvalidFormatBit)),
+				    ConstantU32(state, 0u));
+			}
 		}
 	}
 }
@@ -654,14 +695,20 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 		    state, word, shift, ConstantU32(state, 8));
 		access.length = EmitShaderDataDwordLoadAt(state, EmitAddU32(
 		    state, ConstantU32(state, bindings.MemorySizeDword() + data_start), array_index));
-		if (bindings.dynamic_indirect_buffers) {
-			access.stride = EmitShaderDataDwordLoadDynamic(state, bindings.MemoryStrideDword(),
-			                                               array_index);
+		if (bindings.dynamic_buffer_strides) {
+			const auto raw_stride =
+			    EmitShaderDataDwordLoadDynamic(state, bindings.MemoryStrideDword(), array_index);
+			access.stride = state.program.info.buffers.at(mem.resource).formatted
+			                    ? Binary(state, spv::OpBitwiseAnd, TypeU32(state), raw_stride,
+			                             ConstantU32(state, 0x3fffu))
+			                    : raw_stride;
 		}
 	} else {
 		EXIT_IF(static_index >= state.memory_byte_offsets.size());
-		access.byte_offset = state.memory_byte_offsets[static_index];
-		access.length      = state.memory_byte_sizes[static_index];
+		access.byte_offset    = state.memory_byte_offsets[static_index];
+		access.length         = state.memory_byte_sizes[static_index];
+		access.stride         = state.memory_strides[static_index];
+		access.invalid_format = state.memory_invalid_formats[static_index];
 	}
 	// storage_buffers[i] views the binding as 1 << i byte elements.
 	const auto shift = static_cast<uint32_t>(&buffer - state.storage_buffers.data());

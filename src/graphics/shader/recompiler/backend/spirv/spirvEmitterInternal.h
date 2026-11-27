@@ -138,6 +138,8 @@ struct EmitterState {
 	std::array<BufferDefinition, 4>                  storage_buffers {};
 	std::vector<uint32_t>                           memory_byte_offsets;
 	std::vector<uint32_t>                           memory_byte_sizes;
+	std::vector<uint32_t>                           memory_strides;
+	std::vector<uint32_t>                           memory_invalid_formats;
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         bda_pointer_function    = 0;
@@ -454,6 +456,7 @@ struct MemoryResourceAccess {
 	uint32_t              length           = 0;
 	uint32_t              byte_offset      = 0;
 	uint32_t              stride           = 0;
+	uint32_t              invalid_format   = 0;
 	uint32_t              element_bits     = 32;
 	bool                  non_uniform      = false;
 	spv::MemoryAccessMask memory_access    = spv::MemoryAccessMaskNone;

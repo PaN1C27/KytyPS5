@@ -51860,9 +51860,10 @@ void CheckStableProgramIds(VulkanHarness &vulkan) {
     ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
         {.type = Prospero::ShaderBinaryType::kCs,
          .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
-  // The first two share code and differ only in the buffer stride specialization.
-  struct Case { u32 code, stride; };
-  constexpr std::array<Case, 3> cases{{{0, 4}, {0, 8}, {1, 4}}};
+  // The first two share code and differ only in linear stride, which reuses one module;
+  // toggling buffer swizzle or code produces distinct modules.
+  struct Case { u32 code, stride; bool swizzle; };
+  constexpr std::array<Case, 4> cases{{{0, 4, false}, {0, 8, false}, {0, 4, true}, {1, 4, false}}};
   const auto compile = [&](PipelineCache &cache, const Case &test) {
     HW::ComputeShaderInfo regs{};
     regs.cs_regs.data_addr = reinterpret_cast<uint64_t>(codes[test.code].data());
@@ -51871,20 +51872,21 @@ void CheckStableProgramIds(VulkanHarness &vulkan) {
     regs.cs_regs.num_thread_z = 1;
     regs.cs_regs.wave_size = 32;
     regs.cs_regs.user_sgpr = 4;
-    const ShaderBufferResource buffer{{0x10000u, test.stride << 16u, 64,
+    const ShaderBufferResource buffer{{0x10000u,
+        (test.stride << 16u) | (test.swizzle ? (1u << 31u) : 0u), 64,
         DstSel(4, 5, 6, 7) | (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u)}};
     std::copy_n(buffer.fields, 4, regs.cs_user_sgpr.value);
     ShaderComputeInputInfo input{};
     return cache.GetComputeProgram(regs, input)->id;
   };
-  std::array<uint64_t, 3> forward{}, reverse{};
+  std::array<uint64_t, 4> forward{}, reverse{};
   {
     PipelineCache cache(vulkan.RuntimeContext(), nullptr);
     for (size_t i = 0; i < cases.size(); i++) forward[i] = compile(cache, cases[i]);
-    // One compute module per case and nothing else.
+    // Linear stride reuses case 0's module; swizzle and code still compile separate modules.
     auto expected = PipelineCacheTestAccess::Compiled(cache);
     expected.fill(0);
-    expected[static_cast<size_t>(ShaderType::Compute)] = static_cast<uint32_t>(cases.size());
+    expected[static_cast<size_t>(ShaderType::Compute)] = 3u;
     Require(name, "compiled modules", PipelineCacheTestAccess::Compiled(cache) == expected,
             "the per-stage compile counts missed or added a module");
   }
@@ -51894,9 +51896,11 @@ void CheckStableProgramIds(VulkanHarness &vulkan) {
   }
   Require(name, "order independence", forward == reverse,
           "a program's module id depended on the order it was compiled in");
-  const std::set<uint64_t> ids(forward.begin(), forward.end());
-  Require(name, "distinct modules", ids.size() == forward.size(),
-          "different code or specialization shared a module id");
+  Require(name, "stride reuse", forward[0] == forward[1],
+          "changing linear buffer stride recompiled a separate module");
+  const std::set<uint64_t> ids{forward[0], forward[2], forward[3]};
+  Require(name, "distinct modules", ids.size() == 3u,
+          "different code or swizzle specialization shared a module id");
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
@@ -52387,6 +52391,271 @@ void CheckStreamingIndirectBufferReuse(VulkanHarness &vulkan) {
     Require(name, "warm store reuse",
             PipelineCacheTestAccess::Compiled(pipelines)[cs_index] == 0u,
             "warm shader store recompiled indirect buffer modules on streaming dispatches");
+    context.ShutdownGpu();
+    LibKernel::Memory::InstallGpuResources(nullptr);
+  }
+  std::filesystem::remove_all(store.parent_path());
+  Require(name, "release",
+          LibKernel::Memory::KernelMunmap(base, allocation_size) == 0 &&
+              LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
+          "memory release failed");
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+void CheckDirectBufferSpecializationReuse(VulkanHarness &vulkan) {
+  constexpr const char *name = "DirectBufferSpecializationReuse";
+  constexpr uintptr_t base = 0x0000000207000000ull;
+  constexpr uint64_t allocation_size = 0x40000;
+  constexpr u32 scalar_offset = 0x0100u;
+  constexpr u32 unfmt_offset  = 0x1000u;
+  constexpr u32 fmt_a_offset  = 0x2000u;
+  constexpr u32 fmt_b_offset  = 0x3000u;
+  constexpr u32 write_offset  = 0x4000u;
+  constexpr u32 log_offset    = 0x5000u;
+
+  // s[0:3]=ScalarBuffer, s[4:7]=UnformattedRead, s[8:11]=FormattedA,
+  // s[12:15]=FormattedB, s[16:19]=UnformattedWrite+Atomic, s[20:23]=OutputLog
+  std::vector<u32> compute{
+      EncodeVop1(0x01u, 20u, InlineU32(1u)),
+      EncodeVop1(0x01u, 22u, InlineU32(0u)),
+      EncodeSmem0(0x08u, 24u, 0u), EncodeSmem1(0u, 125u),
+      EncodeSopp(0x0cu, 0u),
+      EncodeVop1(0x01u, 1u, 24u),
+      EncodeMubuf0(0x0cu, 0u, true, false), EncodeMubuf1(2u, 1u, 20u),
+      EncodeSopp(0x0cu, 0u),
+      EncodeMubuf0(0x03u, 0u, true, false), EncodeMubuf1(3u, 2u, 20u),
+      EncodeSopp(0x0cu, 0u),
+      EncodeMubuf0(0x03u, 0u, true, false), EncodeMubuf1(7u, 3u, 20u),
+      EncodeSopp(0x0cu, 0u),
+      EncodeVop1(0x01u, 15u, Vgpr(1u)),
+      EncodeVop1(0x01u, 16u, Vgpr(2u)),
+      EncodeVop1(0x01u, 17u, Vgpr(3u)),
+      EncodeVop1(0x01u, 18u, Vgpr(6u)),
+      EncodeMubuf0(0x1eu, 0u, true, false), EncodeMubuf1(15u, 4u, 20u),
+      EncodeVop1(0x01u, 19u, InlineU32(5u)),
+      EncodeMubuf0(0x32u, 16u, true, false, true), EncodeMubuf1(19u, 4u, 20u),
+      EncodeSopp(0x0cu, 0u),
+      EncodeVop1(0x01u, 24u, Vgpr(1u)),
+      EncodeVop1(0x01u, 25u, Vgpr(2u)),
+      EncodeVop1(0x01u, 26u, Vgpr(3u)),
+      EncodeVop1(0x01u, 27u, Vgpr(6u)),
+      EncodeMubuf0(0x1eu, 0u, true, false), EncodeMubuf1(24u, 5u, 22u),
+      EncodeVop1(0x01u, 28u, Vgpr(7u)),
+      EncodeVop1(0x01u, 29u, Vgpr(10u)),
+      EncodeVop1(0x01u, 30u, Vgpr(19u)),
+      EncodeVop1(0x01u, 31u, InlineU32(0u)),
+      EncodeMubuf0(0x1eu, 0u, true, false), EncodeMubuf1(28u, 5u, 20u),
+      EncodeSopp(0x0cu, 0u),
+  };
+  AppendEnd(&compute);
+  ShaderMapUserData(reinterpret_cast<uint64_t>(compute.data()),
+                    {.type = Prospero::ShaderBinaryType::kCs,
+                     .code_size_bytes = static_cast<u32>(compute.size() * sizeof(u32))});
+
+  int64_t direct_offset = -1;
+  void *mapped = reinterpret_cast<void *>(base);
+  Require(name, "memory allocation",
+          LibKernel::Memory::KernelAllocateDirectMemory(
+              0, LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size, 0x10000, 0,
+              &direct_offset) == 0 &&
+              LibKernel::Memory::KernelMapDirectMemory(&mapped, allocation_size, 0x3, 0x10,
+                                                       direct_offset, 0x10000) == 0,
+          "memory allocation or mapping failed");
+
+  const auto store = std::filesystem::temp_directory_path() /
+                     fmt::format("kyty_direct_buffer_reuse_{}",
+                                 std::chrono::steady_clock::now().time_since_epoch().count()) /
+                     "TEST00002.shaders";
+
+  using F = Prospero::BufferFormat;
+  const auto make_desc = [](uint64_t addr, u32 stride, u32 records,
+                            F fmt = F::k32UInt, u32 swizzle = DstSel(4, 5, 6, 7),
+                            u32 oob = 0u) {
+    ShaderBufferResource desc{};
+    if (addr != 0u) {
+      desc.UpdateAddress48(addr);
+      desc.fields[1] |= (stride & 0x3fffu) << 16u;
+      desc.fields[2] = records;
+      desc.fields[3] = swizzle | (static_cast<u32>(fmt) << 12u) | ((oob & 3u) << 28u);
+    }
+    return desc;
+  };
+
+  struct DispatchSpec {
+    ShaderBufferResource scalar;
+    ShaderBufferResource unfmt;
+    ShaderBufferResource fmt_a;
+    ShaderBufferResource fmt_b;
+    ShaderBufferResource write;
+    u32 unfmt_stride;
+    u32 write_stride;
+    std::array<u32, 7> expected_log;
+    std::array<u32, 5> expected_write;
+  };
+
+  const uint64_t scalar_addr = base + scalar_offset;
+  const uint64_t unfmt_addr  = base + unfmt_offset;
+  const uint64_t fmt_a_addr  = base + fmt_a_offset;
+  const uint64_t fmt_b_addr  = base + fmt_b_offset;
+  const uint64_t write_addr  = base + write_offset;
+  const uint64_t log_addr    = base + log_offset;
+
+  const auto run_dispatch = [&](RenderContext &context, const DispatchSpec &spec) {
+    auto *words = static_cast<u32 *>(mapped);
+    std::memset(words, 0, allocation_size);
+    words[scalar_offset / 4u] = 0x12345678u;
+    words[unfmt_offset / 4u] = 0xdead0000u;
+    if (spec.unfmt_stride != 0u) {
+      words[(unfmt_offset + spec.unfmt_stride) / 4u] = 0x11110000u + spec.unfmt_stride;
+    }
+    words[(fmt_a_offset + 8u) / 4u] = 0x40000000u; // index 1 for k32_32Float stride 8 (2.0f)
+    words[(fmt_a_offset + 16u) / 4u] = 0x40400000u; // index 1 for stride 16 (3.0f)
+    words[(fmt_b_offset + 4u) / 4u] = 0x0000ffffu; // index 1 for k16_16UNorm stride 4 (1.0f, 0.0f)
+    if (spec.write_stride != 0u) {
+      words[(write_offset + spec.write_stride) / 4u] = 0xaabbccdd;
+      words[(write_offset + spec.write_stride + 16u) / 4u] = 7u;
+    }
+
+    const ShaderBufferResource log_desc = make_desc(log_addr, 16u, 2u, F::k32_32_32_32UInt);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      auto &shaders = processor.GetShCtx();
+      shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(compute.data()),
+                           .num_thread_x = 1, .num_thread_y = 1, .num_thread_z = 1,
+                           .wave_size = 64, .user_sgpr = 24});
+      for (u32 i = 0; i < 4u; ++i) {
+        shaders.SetCsUserSgpr(0u + i, spec.scalar.fields[i]);
+        shaders.SetCsUserSgpr(4u + i, spec.unfmt.fields[i]);
+        shaders.SetCsUserSgpr(8u + i, spec.fmt_a.fields[i]);
+        shaders.SetCsUserSgpr(12u + i, spec.fmt_b.fields[i]);
+        shaders.SetCsUserSgpr(16u + i, spec.write.fields[i]);
+        shaders.SetCsUserSgpr(20u + i, log_desc.fields[i]);
+      }
+      context.MapMemory(base, allocation_size);
+      processor.DispatchDirect(1, 1, 1, 0x41u);
+      context.GetBufferCache().ReadMemory(log_addr, 32u);
+      if (spec.write_stride != 0u) {
+        context.GetBufferCache().ReadMemory(write_addr + spec.write_stride, 20u);
+      }
+      std::array<u32, 8> actual_log{};
+      std::array<u32, 5> actual_write{};
+      (void)LibKernel::Memory::TryReadBacking(log_addr, actual_log.data(), sizeof(actual_log));
+      if (spec.write_stride != 0u) {
+        (void)LibKernel::Memory::TryReadBacking(write_addr + spec.write_stride,
+                                                actual_write.data(), sizeof(actual_write));
+      }
+      context.UnmapMemory(base, allocation_size);
+      for (size_t i = 0; i < spec.expected_log.size(); ++i) {
+        Require(name, "log output", actual_log[i] == spec.expected_log[i],
+                fmt::format("log[{}] expected {:#x}, got {:#x}",
+                            i, spec.expected_log[i], actual_log[i]));
+      }
+      if (spec.write_stride != 0u) {
+        for (size_t i = 0; i < spec.expected_write.size(); ++i) {
+          Require(name, "write output", actual_write[i] == spec.expected_write[i],
+                  fmt::format("write[{}] expected {:#x}, got {:#x}",
+                              i, spec.expected_write[i], actual_write[i]));
+        }
+      }
+    });
+  };
+
+  constexpr u32 fmt_swz = DstSel(4, 5, 0, 1);
+  // Batch 1 (compile #1): fmt_a=k32_32Float populated, fmt_b=null.
+  const DispatchSpec d1{
+      .scalar = make_desc(scalar_addr, 4u, 1u),
+      .unfmt  = make_desc(unfmt_addr, 8u, 4u),
+      .fmt_a  = make_desc(fmt_a_addr, 8u, 4u, F::k32_32Float, fmt_swz),
+      .fmt_b  = {},
+      .write  = make_desc(write_addr, 32u, 4u),
+      .unfmt_stride = 8u,
+      .write_stride = 32u,
+      .expected_log = {0x12345678u, 0x11110008u, 0x40000000u, 0x3f800000u, 0u, 0u, 7u},
+      .expected_write = {0x12345678u, 0x11110008u, 0x40000000u, 0x3f800000u, 12u},
+  };
+  // Batch 2 (reuse #1): change ScalarBuffer->null, UnformattedRead stride 8->16, Write stride 32->24.
+  const DispatchSpec d2{
+      .scalar = {},
+      .unfmt  = make_desc(unfmt_addr, 16u, 4u),
+      .fmt_a  = {},
+      .fmt_b  = {},
+      .write  = make_desc(write_addr, 24u, 4u),
+      .unfmt_stride = 16u,
+      .write_stride = 24u,
+      .expected_log = {0u, 0x11110010u, 0u, 0u, 0u, 0u, 7u},
+      .expected_write = {0u, 0x11110010u, 0u, 0u, 12u},
+  };
+  // Batch 3 (reuse #1): zero-stride OOB on unfmt, valid format OOB on fmt_a -> (0, 0x3f800000), write=null.
+  const DispatchSpec d3{
+      .scalar = make_desc(scalar_addr, 4u, 1u),
+      .unfmt  = make_desc(unfmt_addr, 0u, 4u),
+      .fmt_a  = make_desc(fmt_a_addr, 0u, 4u, F::k32_32Float, fmt_swz),
+      .fmt_b  = {},
+      .write  = make_desc(write_addr, 0u, 4u),
+      .unfmt_stride = 8u,
+      .write_stride = 0u,
+      .expected_log = {0x12345678u, 0u, 0u, 0x3f800000u, 0u, 0u, 0u},
+      .expected_write = {},
+  };
+  // Batch 4 (compile #2, superset with fmt_b=k16_16UNorm + fmt_a=null).
+  const DispatchSpec d4{
+      .scalar = make_desc(scalar_addr, 8u, 1u),
+      .unfmt  = make_desc(unfmt_addr, 12u, 4u),
+      .fmt_a  = {},
+      .fmt_b  = make_desc(fmt_b_addr, 4u, 4u, F::k16_16UNorm, fmt_swz),
+      .write  = make_desc(write_addr, 24u, 4u),
+      .unfmt_stride = 12u,
+      .write_stride = 24u,
+      .expected_log = {0x12345678u, 0x1111000cu, 0u, 0u, 0x3f800000u, 0x3f800000u, 7u},
+      .expected_write = {0x12345678u, 0x1111000cu, 0u, 0u, 12u},
+  };
+  // Batch 5 (reuse superset #2): both fmt_a (stride 16) and fmt_b populated.
+  const DispatchSpec d5{
+      .scalar = {},
+      .unfmt  = {},
+      .fmt_a  = make_desc(fmt_a_addr, 16u, 4u, F::k32_32Float, fmt_swz),
+      .fmt_b  = make_desc(fmt_b_addr, 4u, 4u, F::k16_16UNorm, fmt_swz),
+      .write  = make_desc(write_addr, 24u, 4u),
+      .unfmt_stride = 8u,
+      .write_stride = 24u,
+      .expected_log = {0u, 0u, 0x40400000u, 0x3f800000u, 0x3f800000u, 0x3f800000u, 7u},
+      .expected_write = {0u, 0u, 0x40400000u, 0x3f800000u, 12u},
+  };
+
+  const auto cs_index = static_cast<size_t>(ShaderType::Compute);
+  {
+    RenderContext context(vulkan.RuntimeContext(), store);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    auto &pipelines = context.GetPipelineCache();
+    run_dispatch(context, d1);
+    Require(name, "initial compile", PipelineCacheTestAccess::Compiled(pipelines)[cs_index] == 1u,
+            "initial dispatch compiled unexpected module count");
+    run_dispatch(context, d2);
+    run_dispatch(context, d3);
+    Require(name, "direct reuse", PipelineCacheTestAccess::Compiled(pipelines)[cs_index] == 1u,
+            "toggling scalar/unformatted/formatted-null direct buffers recompiled");
+    run_dispatch(context, d4);
+    Require(name, "superset formatted compile",
+            PipelineCacheTestAccess::Compiled(pipelines)[cs_index] == 2u,
+            "first concrete format on second formatted buffer should compile superset");
+    run_dispatch(context, d5);
+    Require(name, "superset reuse", PipelineCacheTestAccess::Compiled(pipelines)[cs_index] == 2u,
+            "superset module was not reused for both formatted buffers populated");
+    context.ShutdownGpu();
+    LibKernel::Memory::InstallGpuResources(nullptr);
+  }
+  {
+    RenderContext context(vulkan.RuntimeContext(), store);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    auto &pipelines = context.GetPipelineCache();
+    for (const auto *spec : {&d1, &d2, &d3, &d4, &d5}) {
+      run_dispatch(context, *spec);
+    }
+    Require(name, "warm store reuse", PipelineCacheTestAccess::Compiled(pipelines)[cs_index] == 0u,
+            "warm shader store recompiled direct buffer modules");
     context.ShutdownGpu();
     LibKernel::Memory::InstallGpuResources(nullptr);
   }
@@ -60198,6 +60467,14 @@ int main(int argc, char **argv) {
     vulkan.CheckOrderedDispatch();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--direct-buffer-reuse-only") == 0) {
+    VulkanHarness vulkan;
+    CheckStableProgramIds(vulkan);
+    CheckStreamingIndirectBufferReuse(vulkan);
+    CheckDirectBufferSpecializationReuse(vulkan);
+    vulkan.CheckZeroStrideBufferBinding();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--zero-stride-binding-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckZeroStrideBufferBinding();
@@ -60518,6 +60795,7 @@ int main(int argc, char **argv) {
   CheckVertexFormatModules(vulkan);
   CheckShaderStore(vulkan);
   CheckStreamingIndirectBufferReuse(vulkan);
+  CheckDirectBufferSpecializationReuse(vulkan);
   vulkan.CheckOrderedDispatch();
   vulkan.CheckZeroStrideBufferBinding();
   vulkan.CheckNullStorageBufferDescriptor();

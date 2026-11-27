@@ -90,7 +90,7 @@ uint32_t BufferByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR
 	if ((packed & (1u << 20u)) != 0u) {
 		index = Binary(state, spv::OpIAdd, TypeU32(state), index, BufferLane(state));
 	}
-	const bool swizzle   = stride != 0u && (packed & (1u << 14u)) != 0u;
+	const bool swizzle   = (dynamic_stride != 0u || stride != 0u) && (packed & (1u << 14u)) != 0u;
 	const auto stride_id = dynamic_stride != 0u ? dynamic_stride : ConstantU32(state, stride);
 	return CalculateBufferAddress(state, index, ctx.Arg(inst, 2), ctx.Arg(inst, 3), mem.offset,
 	                              stride_id,
@@ -729,13 +729,13 @@ template <typename Fn>
 uint32_t EmitAtomicAccess(ValueEmitContext& ctx, const IR::Inst& inst,
                           const IR::MemoryInfo& mem, Fn&& operation) {
 	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
-		auto index = DwordIndex(ctx, inst, mem);
+		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
+		auto index = DwordIndex(ctx, inst, mem, resource.byte_offset, resource.stride);
 		if (mem.kind == IR::ResourceKind::Lds || mem.kind == IR::ResourceKind::Gds) {
 			// Keep region-address truncation local to DS atomics.
 			index = Binary(ctx.state, spv::OpBitwiseAnd, TypeU32(ctx.state), index,
 			               ConstantU32(ctx.state, 0x3fffu));
 		}
-		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
 		return EmitValueOrZeroIfCondition(
 		    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index), [&]() {
 			    return operation(EmitMemoryElementPointer(ctx.state, resource, index));
@@ -840,6 +840,12 @@ uint32_t FormattedOutOfBoundsValue(ValueEmitContext& ctx, const IR::MemoryInfo& 
 	for (uint32_t component = 0; component < components; component++) {
 		const auto source = ResolveFormattedSource(ctx, mem, plan.info, component);
 		values[component] = FormattedConstant(ctx, plan.info, source.kind);
+		if (!mem.typed && source.kind == FormattedSourceKind::One &&
+		    plan.resource.invalid_format != 0u) {
+			values[component] = Select(ctx.state, TypeU32(ctx.state),
+			                           plan.resource.invalid_format,
+			                           ConstantU32(ctx.state, 0u), values[component]);
+		}
 	}
 	return ConstructU32Composite(ctx.state, components, values);
 }
@@ -1932,7 +1938,8 @@ uint32_t EmitBufferAtomic64(ValueEmitContext& ctx, const IR::Inst& inst) {
 	    state, ctx.Arg(inst, inst.NumArgs() - 1), TypeU64(state), ConstantU64(state, 0), [&]() {
 		    const auto resource =
 		        PrepareStorageBufferResourceAccess(state, mem, state.storage_buffers[3]);
-		    const auto byte_address = ByteAddress(ctx, inst, mem);
+		    const auto byte_address =
+		        ByteAddress(ctx, inst, mem, resource.byte_offset, resource.stride);
 		    const auto index = Binary(state, spv::OpShiftRightLogical, TypeU32(state), byte_address,
 		                              ConstantU32(state, 3u));
 		    return EmitValueOrDefaultIfCondition(

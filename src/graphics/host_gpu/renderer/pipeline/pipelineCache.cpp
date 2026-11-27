@@ -213,19 +213,101 @@ bool PipelineCache::Program::RefreshCallSource(const ShaderRecompiler::IR::SrtRu
 
 namespace {
 
+struct DirectBufferUsage {
+	bool has_scalar_use            = false;
+	bool has_vector_use            = false;
+	bool has_untyped_formatted_use = false;
+};
+
+DirectBufferUsage ClassifyDirectBufferUsage(
+    const ShaderRecompiler::IR::ResourcePlan& resource_plan, uint32_t resource) {
+	DirectBufferUsage usage;
+	for (const auto& m : resource_plan.memory_info) {
+		if (m.planning_only || m.resource != resource) continue;
+		if (m.kind == ShaderRecompiler::IR::ResourceKind::ScalarBuffer) {
+			usage.has_scalar_use = true;
+		} else if (m.kind == ShaderRecompiler::IR::ResourceKind::Buffer) {
+			usage.has_vector_use = true;
+			if (m.formatted && !m.typed) {
+				usage.has_untyped_formatted_use = true;
+			}
+		}
+	}
+	return usage;
+}
+
+ShaderRecompiler::IR::ResourceSpecialization CanonicalizeModuleSpecialization(
+    const ShaderRecompiler::IR::ResourcePlan& resource_plan,
+    std::span<const ShaderModule> existing_modules,
+    const ShaderRecompiler::IR::ResourceSpecialization& specialization, bool dynamic_buffers) {
+	auto canonical = specialization;
+	if (!dynamic_buffers) return canonical;
+	const size_t base_count =
+	    std::min(resource_plan.info.buffers.size(), canonical.buffers.size());
+	for (uint32_t i = 0; i < base_count; ++i) {
+		const auto& base_info = resource_plan.info.buffers[i];
+		const bool  has_indirect =
+		    base_info.source < resource_plan.descriptor_sources.size() &&
+		    resource_plan.descriptor_sources[base_info.source].indirect_descriptor.has_value();
+		if (has_indirect ||
+		    canonical.buffers[i].indirect_root !=
+		        ShaderRecompiler::IR::BufferResource::NoIndirectBuffer) {
+			continue;
+		}
+		const auto usage = ClassifyDirectBufferUsage(resource_plan, i);
+		if (!usage.has_vector_use) {
+			canonical.buffers[i] = {};
+			continue;
+		}
+		canonical.buffers[i].packed_stride &= ~0x3fffu;
+		canonical.buffers[i].scalar_empty = false;
+		if (usage.has_scalar_use) continue;
+		if (usage.has_untyped_formatted_use &&
+		    canonical.buffers[i].descriptor_format == Prospero::BufferFormat::kInvalid) {
+			for (const auto& existing : std::views::reverse(existing_modules)) {
+				if (i >= existing.specialization.buffers.size()) continue;
+				const auto& prev = existing.specialization.buffers[i];
+				if (prev.indirect_root == ShaderRecompiler::IR::BufferResource::NoIndirectBuffer &&
+				    prev.descriptor_format != Prospero::BufferFormat::kInvalid) {
+					canonical.buffers[i].packed_stride      = prev.packed_stride & ~0x3fffu;
+					canonical.buffers[i].descriptor_format  = prev.descriptor_format;
+					canonical.buffers[i].descriptor_swizzle = prev.descriptor_swizzle;
+					break;
+				}
+			}
+		}
+		if (!usage.has_untyped_formatted_use) {
+			canonical.buffers[i].descriptor_format  = Prospero::BufferFormat::kInvalid;
+			canonical.buffers[i].descriptor_swizzle = DstSel(4, 5, 6, 7);
+			canonical.buffers[i].zero_stride_oob    = false;
+		} else if (canonical.buffers[i].descriptor_format != Prospero::BufferFormat::kInvalid) {
+			canonical.buffers[i].zero_stride_oob = false;
+		} else {
+			canonical.buffers[i].packed_stride      = 0u;
+			canonical.buffers[i].descriptor_swizzle = 0u;
+			canonical.buffers[i].zero_stride_oob    = true;
+		}
+	}
+	return canonical;
+}
+
 bool IsCompatibleModuleSpecialization(
     const ShaderRecompiler::IR::ResourcePlan& resource_plan, const ShaderModule& candidate,
     const ShaderRecompiler::IR::ResourceSpecialization& specialization) {
 	if (candidate.specialization == specialization) return true;
 	const auto& layout = candidate.info.bindings;
-	if (!layout.dynamic_indirect_buffers) return false;
 	if (candidate.specialization.images != specialization.images ||
 	    candidate.specialization.samplers != specialization.samplers) {
 		return false;
 	}
-	const uint32_t base_count = layout.base_buffer_count;
+	const uint32_t base_count = layout.dynamic_indirect_buffers
+	                                ? layout.base_buffer_count
+	                                : static_cast<uint32_t>(candidate.info.info.buffers.size());
 	if (base_count != resource_plan.info.buffers.size() ||
 	    specialization.buffers.size() < base_count) {
+		return false;
+	}
+	if (!layout.dynamic_indirect_buffers && specialization.buffers.size() != base_count) {
 		return false;
 	}
 	for (uint32_t i = 0; i < base_count; ++i) {
@@ -234,11 +316,63 @@ bool IsCompatibleModuleSpecialization(
 		    base_info.source < resource_plan.descriptor_sources.size() &&
 		    resource_plan.descriptor_sources[base_info.source].indirect_descriptor.has_value();
 		if (!has_indirect) {
-			if (candidate.specialization.buffers[i] != specialization.buffers[i]) return false;
+			const auto& cand_buf = candidate.specialization.buffers[i];
+			const auto& spec_buf = specialization.buffers[i];
+			if (cand_buf == spec_buf) continue;
+			if (cand_buf.indirect_root != ShaderRecompiler::IR::BufferResource::NoIndirectBuffer ||
+			    spec_buf.indirect_root != ShaderRecompiler::IR::BufferResource::NoIndirectBuffer) {
+				return false;
+			}
+			const auto usage = ClassifyDirectBufferUsage(resource_plan, i);
+			if (!usage.has_vector_use) {
+				if (usage.has_scalar_use && !base_info.live && cand_buf.scalar_empty &&
+				    !spec_buf.scalar_empty) {
+					return false;
+				}
+				continue;
+			}
+			if (usage.has_untyped_formatted_use && !usage.has_scalar_use &&
+			    cand_buf.descriptor_format == Prospero::BufferFormat::kInvalid) {
+				if (spec_buf.descriptor_format != Prospero::BufferFormat::kInvalid) return false;
+				continue;
+			}
+			if (!base_info.live) {
+				if (cand_buf.zero_stride_oob || (usage.has_scalar_use && cand_buf.scalar_empty)) {
+					return false;
+				}
+				continue;
+			}
+			if (!layout.dynamic_buffer_strides) return false;
+			if (usage.has_untyped_formatted_use && !usage.has_scalar_use &&
+			    spec_buf.descriptor_format == Prospero::BufferFormat::kInvalid) {
+				continue;
+			}
+			if ((cand_buf.packed_stride & ~0x3fffu) != (spec_buf.packed_stride & ~0x3fffu)) {
+				return false;
+			}
+			if (usage.has_scalar_use &&
+			    (cand_buf.zero_stride_oob != spec_buf.zero_stride_oob ||
+			     (cand_buf.descriptor_format == Prospero::BufferFormat::kInvalid) !=
+			         (spec_buf.descriptor_format == Prospero::BufferFormat::kInvalid))) {
+				return false;
+			}
+			if (usage.has_untyped_formatted_use) {
+				if (spec_buf.descriptor_format != cand_buf.descriptor_format ||
+				    spec_buf.descriptor_swizzle != cand_buf.descriptor_swizzle) {
+					return false;
+				}
+			}
 			continue;
 		}
 		const bool cand_active = candidate.specialization.buffers[i].indirect_root == i;
 		const bool spec_active = specialization.buffers[i].indirect_root == i;
+		if (!layout.dynamic_indirect_buffers) {
+			if (cand_active || spec_active ||
+			    candidate.specialization.buffers[i] != specialization.buffers[i]) {
+				return false;
+			}
+			continue;
+		}
 		if (cand_active != spec_active) return false;
 		if (!spec_active) {
 			if (candidate.specialization.buffers[i] != specialization.buffers[i]) return false;
@@ -257,6 +391,7 @@ bool IsCompatibleModuleSpecialization(
 			}
 		}
 	}
+	if (!layout.dynamic_indirect_buffers) return true;
 	uint32_t live_children = 0u;
 	std::array<uint32_t, ShaderRecompiler::IR::ShaderInfo::MaxBufferRoots> root_children {};
 	for (size_t c = base_count; c < specialization.buffers.size(); ++c) {
@@ -326,15 +461,18 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 	                                         Common::DebugCounters::Peak::ShaderCompileNs);
 	const auto profile = SpirvProfile(m_graphics);
 	options.profile    = &profile;
+	const auto compile_spec = CanonicalizeModuleSpecialization(
+	    program.resource_plan, program.modules, program.specialization,
+	    profile.dynamic_indirect_buffers);
 	auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
-	                                               program.specialization, push_data);
+	                                               compile_spec, push_data);
 	auto info = std::move(result.program).TakeCompiledInfo();
 
 	// The same inputs give the same module id across runs.
 	const auto function_code = program.FunctionCode();
 	ShaderRecompiler::IR::Writer inputs;
 	ShaderRecompiler::IR::IoAll(inputs, key.stage, key.hash, key.user_data_count, key.static_state,
-	                            info.bindings.push_data_start_dword, program.specialization);
+	                            info.bindings.push_data_start_dword, compile_spec);
 	inputs.Raw(function_code.data(), function_code.size_bytes()); // Last, so it needs no size.
 	const auto id = XXH3_64bits(inputs.bytes.data(), inputs.bytes.size());
 
@@ -345,7 +483,7 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 	    .id             = id,
 	    .module         = CompileSPV(result.spirv, m_graphics.device),
 	    .info           = std::move(info),
-	    .specialization = program.specialization,
+	    .specialization = compile_spec,
 	    .function_code  = {function_code.begin(), function_code.end()},
 	});
 	m_compiled[static_cast<size_t>(key.stage)]++;

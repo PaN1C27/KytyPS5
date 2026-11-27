@@ -797,8 +797,13 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 			EXIT_IF(slot >= buffer_capacity);
 			auto& source = prepared.buffer_sources[slot];
 			const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[resource]);
-			const auto address = descriptor.Base48();
-			auto size = descriptor.GetSize();
+			const auto address = descriptor.Type() == 0u ? descriptor.Base48() : 0u;
+			auto size = descriptor.Type() == 0u ? descriptor.GetSize() : 0u;
+			if (!metadata.scalar &&
+			    (descriptor.Format() == Prospero::BufferFormat::kInvalid ||
+			     (descriptor.OutOfBounds() == 0u && descriptor.Stride() == 0u))) {
+				size = 0u;
+			}
 			if (size != 0 && descriptor.Stride() == 0 && descriptor.OutOfBounds() == 2 &&
 			    !metadata.scalar) {
 				// OOB_SELECT=2 only tests NumRecords != 0; a zero-stride fetch
@@ -888,9 +893,16 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		// Null bindings allow 0 bytes, not the shared null buffer's 16, so no store reaches it.
 		prepared.shader_data[layout.MemorySizeDword() + index] =
 		    static_cast<uint32_t>(prepared.buffer_sources[index].size + buffer_offset);
-		if (layout.dynamic_indirect_buffers) {
-			prepared.shader_data[layout.MemoryStrideDword() + index] =
-			    spec.buffers[resource].packed_stride & 0x3fffu;
+		if (layout.dynamic_buffer_strides) {
+			const auto descriptor =
+			    DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[resource]);
+			uint32_t dynamic_stride = descriptor.Type() == 0u ? descriptor.Stride() : 0u;
+			if (metadata.formatted &&
+			    (descriptor.Type() != 0u ||
+			     descriptor.Format() == Prospero::BufferFormat::kInvalid)) {
+				dynamic_stride |= ShaderRecompiler::IR::DynamicBufferInvalidFormatBit;
+			}
+			prepared.shader_data[layout.MemoryStrideDword() + index] = dynamic_stride;
 		}
 	}
 	std::ranges::copy(layout.indirect_map,
