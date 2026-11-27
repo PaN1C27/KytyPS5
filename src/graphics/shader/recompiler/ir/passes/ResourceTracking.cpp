@@ -3433,6 +3433,27 @@ private:
 					pred_work.push_back(inst);
 				}
 			};
+			const auto push_exec_conjuncts = [&](Value v) {
+				std::vector<const Inst*> stack;
+				if (const auto* root = v.Resolve().TryInstruction();
+				    root != nullptr && pred_atoms.insert(root).second) {
+					stack.push_back(root);
+				}
+				while (!stack.empty()) {
+					const auto* cur = stack.back();
+					stack.pop_back();
+					const auto op = cur->GetOpcode();
+					if (op == ValueOpcode::LogicalAnd || op == ValueOpcode::LogicalOr ||
+					    op == ValueOpcode::LogicalNot) {
+						for (size_t a = 0; a < cur->NumArgs(); ++a) {
+							if (const auto* ch = cur->Arg(a).Resolve().TryInstruction();
+							    ch != nullptr && pred_atoms.insert(ch).second) {
+								stack.push_back(ch);
+							}
+						}
+					}
+				}
+			};
 			const auto push_phi_edges = [&](const Inst* phi) {
 				if (phi->NumPhiBlocks() != phi->NumArgs()) return;
 				for (size_t arm = 0; arm < phi->NumArgs(); ++arm) {
@@ -3442,7 +3463,7 @@ private:
 					for (uint32_t hop = 0u; hop < 8u && pred != nullptr; ++hop) {
 						if (const auto edge = ConditionalEdge(pred, to);
 						    edge && edge->lanes == LaneQuantifier::All) {
-							push_pred(edge->condition);
+							push_exec_conjuncts(edge->condition);
 						}
 						if (pred->ImmPredecessors().size() != 1u) break;
 						to   = pred;
@@ -3450,8 +3471,13 @@ private:
 					}
 				}
 			};
-			for (const auto* sel: candidate_selects) {
+			const auto seed_selector_operands = [&](const Inst* sel) {
 				push_pred(sel->Arg(0));
+				push_val(sel->Arg(1));
+				push_val(sel->Arg(2));
+			};
+			for (const auto* sel: candidate_selects) {
+				seed_selector_operands(sel);
 			}
 			while (!val_work.empty() || !pred_work.empty()) {
 				while (!pred_work.empty()) {
@@ -3459,10 +3485,8 @@ private:
 					pred_work.pop_back();
 					const auto op = cur->GetOpcode();
 					if (op == ValueOpcode::LogicalAnd || op == ValueOpcode::LogicalOr ||
-					    op == ValueOpcode::LogicalNot ||
-					    (op == ValueOpcode::Phi && cur->GetType() == Type::U1)) {
+					    op == ValueOpcode::LogicalNot) {
 						for (size_t a = 0; a < cur->NumArgs(); ++a) push_pred(cur->Arg(a));
-						if (op == ValueOpcode::Phi) push_phi_edges(cur);
 					} else if (op == ValueOpcode::IEqual32 || op == ValueOpcode::INotEqual32 ||
 					           op == ValueOpcode::ULessThan32 ||
 					           op == ValueOpcode::ULessThanEqual32 ||
@@ -3476,14 +3500,12 @@ private:
 					val_work.pop_back();
 					switch (cur->GetOpcode()) {
 						case ValueOpcode::SelectU32:
-							push_pred(cur->Arg(0));
-							push_val(cur->Arg(1));
-							push_val(cur->Arg(2));
+							seed_selector_operands(cur);
 							break;
 						case ValueOpcode::ReadFirstLane:
 							if (cur->NumArgs() == 2u) {
 								push_val(cur->Arg(0));
-								push_pred(cur->Arg(1));
+								push_exec_conjuncts(cur->Arg(1));
 							}
 							break;
 						case ValueOpcode::Phi:
@@ -3771,8 +3793,19 @@ private:
 
 		const auto pred_true = [&](Value root_cond, const GuardState& guards) {
 			if (guards.contradictory) return true;
-			std::vector<Value>              pending {root_cond};
-			std::unordered_set<const Inst*> seen_cond;
+			const auto root_resolved = root_cond.Resolve();
+			if (root_resolved.IsImmediate()) {
+				return root_resolved.GetType() == Type::U1 && root_resolved.U1();
+			}
+			const auto* root_inst = root_resolved.TryInstruction();
+			if (root_inst != nullptr && root_inst->GetOpcode() != ValueOpcode::LogicalAnd) {
+				for (const auto* p: guards.pos) {
+					if (implies_guard(Value(const_cast<Inst*>(p)), root_resolved)) return true;
+				}
+				return false;
+			}
+			std::vector<Value>       pending {root_resolved};
+			std::vector<const Inst*> seen_cond;
 			while (!pending.empty()) {
 				const auto cond = pending.back().Resolve();
 				pending.pop_back();
@@ -3781,7 +3814,10 @@ private:
 					return false;
 				}
 				const auto* ci = cond.TryInstruction();
-				if (ci != nullptr && !seen_cond.insert(ci).second) continue;
+				if (ci != nullptr) {
+					if (std::ranges::find(seen_cond, ci) != seen_cond.end()) continue;
+					seen_cond.push_back(ci);
+				}
 				bool matched = false;
 				for (const auto* p: guards.pos) {
 					if (implies_guard(Value(const_cast<Inst*>(p)), cond)) {
@@ -3897,66 +3933,91 @@ private:
 		std::map<std::pair<GuardState, std::pair<const Inst*, const Inst*>>, GuardState>
 		    expand_step_cache;
 		const auto expand_guards = [&](GuardState state) -> GuardState {
-			std::unordered_set<const Inst*> p_seen(state.pos.begin(), state.pos.end());
-			std::unordered_set<const Inst*> n_seen(state.neg.begin(), state.neg.end());
-			const auto add_pos = [&](Value v, bool& changed) {
+			const auto add_pos = [&](Value v, bool& grew) {
 				v = v.Resolve();
 				if (v.IsImmediate()) {
 					if (v.GetType() == Type::U1 && !v.U1()) state.contradictory = true;
 					return;
 				}
-				if (const auto* i = v.TryInstruction(); i != nullptr && p_seen.insert(i).second) {
+				if (const auto* i = v.TryInstruction();
+				    i != nullptr && std::ranges::find(state.pos, i) == state.pos.end()) {
 					order_of(i);
 					state.pos.push_back(i);
-					if (n_seen.contains(i)) state.contradictory = true;
-					changed = true;
+					if (std::ranges::find(state.neg, i) != state.neg.end()) {
+						state.contradictory = true;
+					}
+					grew = true;
 				}
 			};
-			const auto add_neg = [&](Value v, bool& changed) {
+			const auto add_neg = [&](Value v, bool& grew) {
 				v = v.Resolve();
 				if (v.IsImmediate()) {
 					if (v.GetType() == Type::U1 && v.U1()) state.contradictory = true;
 					return;
 				}
-				if (const auto* i = v.TryInstruction(); i != nullptr && n_seen.insert(i).second) {
+				if (const auto* i = v.TryInstruction();
+				    i != nullptr && std::ranges::find(state.neg, i) == state.neg.end()) {
 					order_of(i);
 					state.neg.push_back(i);
-					if (p_seen.contains(i)) state.contradictory = true;
-					changed = true;
+					if (std::ranges::find(state.pos, i) != state.pos.end()) {
+						state.contradictory = true;
+					}
+					grew = true;
 				}
 			};
-			bool changed = true;
-			while (changed && !state.contradictory) {
-				changed = false;
-				for (size_t idx = 0; idx < state.pos.size() && !state.contradictory; ++idx) {
-					const auto* g  = state.pos[idx];
+			size_t pos_cursor  = 0u;
+			size_t neg_cursor  = 0u;
+			bool   recheck_neg = !state.pos.empty() && !state.neg.empty();
+			while (!state.contradictory &&
+			       (pos_cursor < state.pos.size() || neg_cursor < state.neg.size() || recheck_neg)) {
+				while (pos_cursor < state.pos.size() && !state.contradictory) {
+					const auto* g  = state.pos[pos_cursor++];
 					const auto  op = g->GetOpcode();
 					if (op == ValueOpcode::LogicalAnd) {
-						add_pos(g->Arg(0), changed);
-						add_pos(g->Arg(1), changed);
+						add_pos(g->Arg(0), recheck_neg);
+						add_pos(g->Arg(1), recheck_neg);
 					} else if (op == ValueOpcode::LogicalNot) {
-						add_neg(g->Arg(0), changed);
+						bool neg_grew = false;
+						add_neg(g->Arg(0), neg_grew);
 					} else if (op == ValueOpcode::Phi) {
 						for (const auto* c: invariant_guards(std::span(&g, 1u), g->Parent())) {
-							add_pos(Value(const_cast<Inst*>(c)), changed);
+							add_pos(Value(const_cast<Inst*>(c)), recheck_neg);
 						}
 					}
 				}
-				for (size_t idx = 0; idx < state.neg.size() && !state.contradictory; ++idx) {
-					const auto* g = state.neg[idx];
+				if (state.contradictory) break;
+				const size_t scan_limit = neg_cursor;
+				if (recheck_neg) {
+					recheck_neg = false;
+					for (size_t idx = 0u; idx < scan_limit && !state.contradictory; ++idx) {
+						const auto* g = state.neg[idx];
+						if (pred_true(Value(const_cast<Inst*>(g)), state)) {
+							state.contradictory = true;
+							break;
+						}
+						if (g->GetOpcode() == ValueOpcode::LogicalAnd) {
+							bool neg_grew = false;
+							if (pred_true(g->Arg(0), state)) add_neg(g->Arg(1), neg_grew);
+							if (pred_true(g->Arg(1), state)) add_neg(g->Arg(0), neg_grew);
+						}
+					}
+				}
+				while (neg_cursor < state.neg.size() && !state.contradictory) {
+					const auto* g = state.neg[neg_cursor++];
 					if (pred_true(Value(const_cast<Inst*>(g)), state)) {
 						state.contradictory = true;
 						break;
 					}
-					const auto op = g->GetOpcode();
+					const auto op       = g->GetOpcode();
+					bool       neg_grew = false;
 					if (op == ValueOpcode::LogicalOr) {
-						add_neg(g->Arg(0), changed);
-						add_neg(g->Arg(1), changed);
+						add_neg(g->Arg(0), neg_grew);
+						add_neg(g->Arg(1), neg_grew);
 					} else if (op == ValueOpcode::LogicalNot) {
-						add_pos(g->Arg(0), changed);
+						add_pos(g->Arg(0), recheck_neg);
 					} else if (op == ValueOpcode::LogicalAnd) {
-						if (pred_true(g->Arg(0), state)) add_neg(g->Arg(1), changed);
-						if (pred_true(g->Arg(1), state)) add_neg(g->Arg(0), changed);
+						if (pred_true(g->Arg(0), state)) add_neg(g->Arg(1), neg_grew);
+						if (pred_true(g->Arg(1), state)) add_neg(g->Arg(0), neg_grew);
 					}
 				}
 			}
@@ -3998,6 +4059,9 @@ private:
 		};
 		std::map<PhiKey, uint32_t>                                         phi_id_map;
 		std::vector<PhiKey>                                                phi_order;
+		std::unordered_map<const Inst*, uint32_t>                          phi_clone_counts;
+		static constexpr uint32_t                                          kMaxClonesPerPhi   = 16u;
+		static constexpr size_t                                            kMaxTotalPhiClones = 512u;
 		std::vector<std::optional<Range>>                                  phi_slots;
 		std::vector<std::pair<uint32_t, uint32_t>>                         widen_counts;
 		std::vector<std::vector<uint32_t>>                                 dependents;
@@ -4131,17 +4195,26 @@ private:
 								const auto   inv_neg =
 								    invariant_neg_guards(t.guards.neg, inst->Parent());
 								const PhiKey key {inst, inv, inv_neg};
+								const auto   found = phi_id_map.find(key);
 								if (!seeding_phis) {
-									const auto found = phi_id_map.find(key);
 									start_refine(t, found != phi_id_map.end()
 									                    ? phi_slots[found->second]
 									                    : std::optional<Range> {Range {}});
 									break;
 								}
-								const auto [it, inserted] = phi_id_map.try_emplace(
-								    key, static_cast<uint32_t>(phi_order.size()));
-								const uint32_t id = it->second;
-								if (inserted) {
+								uint32_t id = 0u;
+								if (found != phi_id_map.end()) {
+									id = found->second;
+								} else {
+									auto& count = phi_clone_counts[inst];
+									if (count >= kMaxClonesPerPhi ||
+									    phi_order.size() >= kMaxTotalPhiClones) {
+										start_refine(t, Range {});
+										break;
+									}
+									++count;
+									id = static_cast<uint32_t>(phi_order.size());
+									phi_id_map.emplace(key, id);
 									phi_order.push_back(key);
 									phi_slots.push_back(std::nullopt);
 									widen_counts.emplace_back(0u, 0u);

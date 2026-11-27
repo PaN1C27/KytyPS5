@@ -9358,6 +9358,337 @@ void TestDisjunctiveGuardRelativeRegisterPartition() {
   }
 }
 
+void TestInductiveSelectorIgnoresUnrelatedLoopExecMasks() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  for (const bool clobber : {false, true}) {
+    Fixture fixture;
+    auto *entry = fixture.block;
+    auto *early_return = fixture.AddBlock();
+    auto *b_check = fixture.AddBlock();
+    auto *b_true = fixture.AddBlock();
+    auto *b_merge1 = fixture.AddBlock();
+    auto *b_else = fixture.AddBlock();
+    auto *b_merge2 = fixture.AddBlock();
+    auto *wf1_header = fixture.AddBlock();
+    auto *wf1_body = fixture.AddBlock();
+    auto *b_post_wf1 = fixture.AddBlock();
+    auto *loop_header = fixture.AddBlock();
+    auto *part_body = fixture.AddBlock();
+    auto *wf2_header = fixture.AddBlock();
+    auto *wf2_body = fixture.AddBlock();
+    auto *b_exit = fixture.AddBlock();
+
+    entry->AddBranch(b_check);
+    entry->AddBranch(early_return);
+    b_check->AddBranch(b_true);
+    b_check->AddBranch(b_merge1);
+    b_true->AddBranch(b_merge1);
+    b_merge1->AddBranch(b_else);
+    b_merge1->AddBranch(b_merge2);
+    b_else->AddBranch(b_merge2);
+
+    const auto lane = fixture.Emit(ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)}, 0, entry);
+    const auto in_dispatch = fixture.Emit(ValueOpcode::ULessThan32, {lane, Value(32u)}, 0, entry);
+    const auto in_handle = fixture.Buffer(
+        {fixture.UserData(0u), Value(16u << 16u), Value(8u), Value(0x16204u)}, 0x100u);
+    MemoryInfo read_mem;
+    read_mem.kind = ResourceKind::Buffer;
+    read_mem.data_dwords = 2u;
+    read_mem.idxen = true;
+    const auto hdr_pair = fixture.Emit(ValueOpcode::LoadBufferU32x2,
+        {in_handle, lane, Value(0u), Value(0u), in_dispatch},
+        fixture.AddMemory(read_mem, 0x90u), entry);
+    const auto v15 = fixture.Emit(ValueOpcode::CompositeExtractU32x2, {hdr_pair, Value(0u)}, 0, entry);
+    const auto v13 = fixture.Emit(ValueOpcode::CompositeExtractU32x2, {hdr_pair, Value(1u)}, 0, entry);
+    const auto active = fixture.Emit(ValueOpcode::LogicalAnd,
+        {in_dispatch, fixture.Emit(ValueOpcode::INotEqual32, {Value(0xffffffffu), v15}, 0, entry)},
+        0, entry);
+    const auto v4_raw = fixture.Emit(ValueOpcode::SelectU32,
+        {active, fixture.Emit(ValueOpcode::BitwiseAnd32, {Value(7u), v13}, 0, entry), Value(0u)},
+        0, entry);
+    entry->condition = fixture.Emit(ValueOpcode::ConditionRef, {active},
+                                    CFG::BranchCondition::ExecNonZero, entry);
+    entry->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                         .true_block = b_check, .false_block = early_return};
+    early_return->terminator.kind = CFG::TerminatorKind::Return;
+
+    const auto eq2 = fixture.Emit(ValueOpcode::IEqual32, {Value(2u), v4_raw}, 0, b_check);
+    const auto eq5 = fixture.Emit(ValueOpcode::IEqual32, {Value(5u), v4_raw}, 0, b_check);
+    const auto is_2_or_5 = fixture.Emit(ValueOpcode::LogicalAnd,
+        {active, fixture.Emit(ValueOpcode::LogicalAnd,
+            {active, fixture.Emit(ValueOpcode::LogicalOr, {eq2, eq5}, 0, b_check)}, 0, b_check)},
+        0, b_check);
+    b_check->condition = fixture.Emit(ValueOpcode::ConditionRef, {is_2_or_5},
+                                      CFG::BranchCondition::ExecNonZero, b_check);
+    b_check->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                           .true_block = b_true, .false_block = b_merge1};
+
+    const auto v4_true_val = fixture.Emit(ValueOpcode::SelectU32,
+        {fixture.Emit(ValueOpcode::ULessThan32, {v13, Value(5u)}, 0, b_true), v13, Value(4u)},
+        0, b_true);
+    const auto v4_true = fixture.Emit(ValueOpcode::SelectU32,
+        {is_2_or_5, v4_true_val, v4_raw}, 0, b_true);
+    b_true->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = b_merge1};
+
+    auto &phi_120 = b_merge1->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+    phi_120.AddPhiOperand(b_check, v4_raw);
+    phi_120.AddPhiOperand(b_true, v4_true);
+    const auto not_2_or_5 = fixture.Emit(ValueOpcode::LogicalAnd,
+        {active, fixture.Emit(ValueOpcode::LogicalNot, {is_2_or_5}, 0, b_merge1)}, 0, b_merge1);
+    b_merge1->condition = fixture.Emit(ValueOpcode::ConditionRef, {not_2_or_5},
+                                       CFG::BranchCondition::ExecNonZero, b_merge1);
+    b_merge1->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                            .true_block = b_else, .false_block = b_merge2};
+
+    const auto v4_else_zero = fixture.Emit(ValueOpcode::SelectU32,
+        {not_2_or_5, Value(0u), Value(&phi_120)}, 0, b_else);
+    const auto v4_else = fixture.Emit(ValueOpcode::SelectU32,
+        {not_2_or_5, Value(1u), v4_else_zero}, 0, b_else);
+    b_else->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = b_merge2};
+
+    auto &v4 = b_merge2->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+    v4.AddPhiOperand(b_merge1, Value(&phi_120));
+    v4.AddPhiOperand(b_else, v4_else);
+    const auto v18_init = fixture.Emit(ValueOpcode::IAdd32, {Value(&v4), Value(4u)}, 0, b_merge2);
+
+    // Build 48 sequential structured loops threading EXEC masks and comparisons
+    // before the inductive partition, matching multi-pass compute shaders.
+    auto *prev_blk = b_merge2;
+    Value prev_exec = active;
+    Value prev_val = v13;
+    for (uint32_t l = 0u; l < 48u; ++l) {
+      auto *lhdr = fixture.AddBlock();
+      auto *lbody = fixture.AddBlock();
+      auto *lpost = fixture.AddBlock();
+      prev_blk->AddBranch(lhdr);
+      prev_blk->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = lhdr};
+
+      auto &lexec = lhdr->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U1));
+      auto &lval = lhdr->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+      lhdr->AddBranch(lbody);
+      lhdr->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = lbody};
+
+      const auto lcmp = fixture.Emit(ValueOpcode::INotEqual32,
+          {Value(&lval), Value(l + 100u)}, 0, lbody);
+      const auto next_lexec = fixture.Emit(ValueOpcode::LogicalAnd,
+          {Value(&lexec), lcmp}, 0, lbody);
+      const auto next_lval = fixture.Emit(ValueOpcode::SelectU32,
+          {next_lexec, fixture.Emit(ValueOpcode::IAdd32, {Value(&lval), Value(1u)}, 0, lbody),
+           Value(&lval)},
+          0, lbody);
+      lbody->condition = fixture.Emit(ValueOpcode::ConditionRef, {next_lexec},
+                                      CFG::BranchCondition::VccNonZero, lbody);
+      lbody->AddBranch(lhdr);
+      lbody->AddBranch(lpost);
+      lbody->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                           .true_block = lhdr, .false_block = lpost};
+
+      lexec.AddPhiOperand(prev_blk, prev_exec);
+      lexec.AddPhiOperand(lbody, next_lexec);
+      lval.AddPhiOperand(prev_blk, prev_val);
+      lval.AddPhiOperand(lbody, next_lval);
+
+      prev_blk = lpost;
+      prev_exec = fixture.Emit(ValueOpcode::LogicalAnd, {active, Value(&lexec)}, 0, lpost);
+      prev_val = next_lval;
+    }
+    prev_blk->AddBranch(wf1_header);
+    prev_blk->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = wf1_header};
+
+    wf1_header->AddBranch(wf1_body);
+    wf1_body->AddBranch(wf1_header);
+    wf1_body->AddBranch(b_post_wf1);
+    b_post_wf1->AddBranch(loop_header);
+    loop_header->AddBranch(part_body);
+    loop_header->AddBranch(b_exit);
+    part_body->AddBranch(wf2_header);
+    wf2_header->AddBranch(wf2_body);
+    wf2_body->AddBranch(wf2_header);
+    wf2_body->AddBranch(loop_header);
+
+    auto &wf1_v18 = wf1_header->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+    auto &wf1_exec = wf1_header->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U1));
+    wf1_header->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = wf1_body};
+
+    const auto m0_a = fixture.Emit(ValueOpcode::ReadFirstLane, {Value(&v4), Value(&wf1_exec)},
+                                   0, wf1_body);
+    const auto lane_eq_a = fixture.Emit(ValueOpcode::LogicalAnd,
+        {Value(&wf1_exec), fixture.Emit(ValueOpcode::IEqual32, {m0_a, Value(&v4)}, 0, wf1_body)},
+        0, wf1_body);
+    const auto wm_a = fixture.Emit(ValueOpcode::LogicalAnd,
+        {lane_eq_a, fixture.Emit(ValueOpcode::IEqual32, {m0_a, Value(7u)}, 0, wf1_body)},
+        0, wf1_body);
+    const auto next_wf1_v18 = fixture.Emit(ValueOpcode::SelectU32,
+        {wm_a, lane, Value(&wf1_v18)}, 0, wf1_body);
+    const auto next_wf1_exec = fixture.Emit(ValueOpcode::LogicalAnd,
+        {Value(&wf1_exec), fixture.Emit(ValueOpcode::LogicalNot, {lane_eq_a}, 0, wf1_body)},
+        0, wf1_body);
+    wf1_body->condition = fixture.Emit(ValueOpcode::ConditionRef, {next_wf1_exec},
+                                       CFG::BranchCondition::VccNonZero, wf1_body);
+    wf1_body->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                            .true_block = wf1_header, .false_block = b_post_wf1};
+    wf1_v18.AddPhiOperand(prev_blk, v18_init);
+    wf1_v18.AddPhiOperand(wf1_body, next_wf1_v18);
+    wf1_exec.AddPhiOperand(prev_blk, prev_exec);
+    wf1_exec.AddPhiOperand(wf1_body, next_wf1_exec);
+
+    const auto count_idx = fixture.UserData(2u);
+    const auto data_pair = fixture.Emit(ValueOpcode::LoadBufferU32x2,
+        {in_handle, fixture.Emit(ValueOpcode::SelectU32, {prev_exec, count_idx, lane}, 0, b_post_wf1),
+         Value(0u), Value(0u), prev_exec},
+        fixture.AddMemory(read_mem, 0x5ecu), b_post_wf1);
+    const auto raw_count0 = fixture.Emit(ValueOpcode::CompositeExtractU32x2,
+                                         {data_pair, Value(0u)}, 0, b_post_wf1);
+    const auto raw_count1 = fixture.Emit(ValueOpcode::CompositeExtractU32x2,
+                                         {data_pair, Value(1u)}, 0, b_post_wf1);
+    const auto v8_init = fixture.Emit(ValueOpcode::IAdd32, {raw_count0, raw_count1}, 0, b_post_wf1);
+    const auto right_init = fixture.Emit(ValueOpcode::IAdd32,
+        {next_wf1_v18, Value(UINT32_MAX)}, 0, b_post_wf1);
+    b_post_wf1->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = loop_header};
+
+    auto &left_outer = loop_header->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+    auto &right_outer = loop_header->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+    auto &v8_outer = loop_header->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+    auto &loop_exec = loop_header->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U1));
+    const auto continue_part = fixture.Emit(ValueOpcode::ULessThan32,
+        {Value(&left_outer), Value(&right_outer)}, 0, loop_header);
+    const auto body_exec = fixture.Emit(ValueOpcode::LogicalAnd,
+        {Value(&loop_exec), continue_part}, 0, loop_header);
+    loop_header->condition = fixture.Emit(ValueOpcode::ConditionRef, {body_exec},
+                                          CFG::BranchCondition::VccNonZero, loop_header);
+    loop_header->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                               .true_block = part_body, .false_block = b_exit};
+
+    const auto left_step = fixture.Emit(ValueOpcode::SelectU32,
+        {body_exec, fixture.Emit(ValueOpcode::IAdd32, {Value(&left_outer), Value(1u)}, 0, part_body),
+         Value(&left_outer)}, 0, part_body);
+    const auto right_next = fixture.Emit(ValueOpcode::SelectU32,
+        {fixture.Emit(ValueOpcode::IEqual32, {Value(&left_outer), Value(0u)}, 0, part_body),
+         Value(&right_outer),
+         fixture.Emit(ValueOpcode::IAdd32, {Value(&right_outer), Value(UINT32_MAX)}, 0, part_body)},
+        0, part_body);
+    const auto right_step = fixture.Emit(ValueOpcode::SelectU32,
+        {body_exec, right_next, Value(&right_outer)}, 0, part_body);
+    part_body->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = wf2_header};
+
+    auto &wf2_left = wf2_header->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+    auto &wf2_right = wf2_header->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+    auto &wf2_v8 = wf2_header->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+    auto &wf2_exec = wf2_header->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U1));
+    wf2_header->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = wf2_body};
+
+    const auto m0_b = fixture.Emit(ValueOpcode::ReadFirstLane, {Value(&wf2_right), Value(&wf2_exec)},
+                                   0, wf2_body);
+    const auto lane_eq_b = fixture.Emit(ValueOpcode::LogicalAnd,
+        {Value(&wf2_exec), fixture.Emit(ValueOpcode::IEqual32, {m0_b, Value(&wf2_right)}, 0, wf2_body)},
+        0, wf2_body);
+    const auto rel_write_b = [&](Value old_val, uint32_t offset) {
+      const auto write_mask = fixture.Emit(ValueOpcode::LogicalAnd,
+          {lane_eq_b, fixture.Emit(ValueOpcode::IEqual32, {m0_b, Value(offset)}, 0, wf2_body)},
+          0, wf2_body);
+      return fixture.Emit(ValueOpcode::SelectU32, {write_mask, lane, old_val}, 0, wf2_body);
+    };
+    const auto next_wf2_left = rel_write_b(Value(&wf2_left), 12u);
+    const auto next_wf2_right = rel_write_b(Value(&wf2_right), 11u);
+    const auto next_wf2_v8 = rel_write_b(Value(&wf2_v8), clobber ? 7u : 8u);
+    const auto next_wf2_exec = fixture.Emit(ValueOpcode::LogicalAnd,
+        {Value(&wf2_exec), fixture.Emit(ValueOpcode::LogicalNot, {lane_eq_b}, 0, wf2_body)},
+        0, wf2_body);
+    wf2_body->condition = fixture.Emit(ValueOpcode::ConditionRef, {next_wf2_exec},
+                                       CFG::BranchCondition::VccNonZero, wf2_body);
+    wf2_body->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                            .true_block = wf2_header, .false_block = loop_header};
+
+    wf2_left.AddPhiOperand(part_body, left_step);
+    wf2_left.AddPhiOperand(wf2_body, next_wf2_left);
+    wf2_right.AddPhiOperand(part_body, right_step);
+    wf2_right.AddPhiOperand(wf2_body, next_wf2_right);
+    wf2_v8.AddPhiOperand(part_body, Value(&v8_outer));
+    wf2_v8.AddPhiOperand(wf2_body, next_wf2_v8);
+    wf2_exec.AddPhiOperand(part_body, body_exec);
+    wf2_exec.AddPhiOperand(wf2_body, next_wf2_exec);
+
+    left_outer.AddPhiOperand(b_post_wf1, Value(0u));
+    left_outer.AddPhiOperand(wf2_body, next_wf2_left);
+    right_outer.AddPhiOperand(b_post_wf1, right_init);
+    right_outer.AddPhiOperand(wf2_body, next_wf2_right);
+    v8_outer.AddPhiOperand(b_post_wf1, v8_init);
+    v8_outer.AddPhiOperand(wf2_body, next_wf2_v8);
+    loop_exec.AddPhiOperand(b_post_wf1, prev_exec);
+    loop_exec.AddPhiOperand(wf2_body, body_exec);
+
+    const auto v8_shl27 = fixture.Emit(ValueOpcode::ShiftLeftLogical32,
+        {Value(&v8_outer), Value(27u)}, 0, b_exit);
+    const auto v8_shl2 = fixture.Emit(ValueOpcode::ShiftLeftLogical32,
+        {Value(&v8_outer), Value(2u)}, 0, b_exit);
+    const auto v8_aligned = fixture.Emit(ValueOpcode::BitwiseAnd32,
+        {Value(0xffffff83u),
+         fixture.Emit(ValueOpcode::ShiftLeftLogical32,
+             {fixture.Emit(ValueOpcode::IAdd32, {Value(&v8_outer), Value(32u)}, 0, b_exit),
+              Value(2u)}, 0, b_exit)},
+        0, b_exit);
+    const auto aligned_cond = fixture.Emit(ValueOpcode::LogicalAnd,
+        {prev_exec, fixture.Emit(ValueOpcode::IEqual32, {v8_shl27, Value(0u)}, 0, b_exit)},
+        0, b_exit);
+    const auto selected_size = fixture.Emit(ValueOpcode::SelectU32,
+        {prev_exec,
+         fixture.Emit(ValueOpcode::SelectU32, {aligned_cond, v8_shl2, v8_aligned}, 0, b_exit),
+         v8_shl2},
+        0, b_exit);
+    const auto out_records = fixture.Emit(ValueOpcode::ShiftRightLogical32,
+        {fixture.Emit(ValueOpcode::ReadFirstLane, {selected_size, prev_exec}, 0, b_exit), Value(2u)},
+        0, b_exit);
+    const auto out_handle = fixture.Emit(ValueOpcode::GetBufferResource,
+        {fixture.UserData(1u), Value(4u << 16u), out_records, Value(0x16204u)},
+        MemoryFlags{0, 0xe3cu}, b_exit);
+    MemoryInfo write_mem;
+    write_mem.kind = ResourceKind::Buffer;
+    fixture.Emit(ValueOpcode::StoreBufferU32,
+        {out_handle, Value(0u), Value(0u), Value(0u), Value(1u), prev_exec},
+        fixture.AddMemory(write_mem, 0xe3cu), b_exit);
+    b_exit->terminator.kind = CFG::TerminatorKind::Return;
+
+    const auto t0 = std::chrono::steady_clock::now();
+    if (clobber) {
+      CheckFatal([&] { fixture.PlanAndTrack(); }, "not a valid runtime value",
+                 "48-loop EXEC chain test folded a reachable relative write");
+      const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - t0).count();
+      Check(elapsed_ms < 1000, "inductive selector pass exceeded 1000ms budget with clobber=true");
+      continue;
+    }
+    fixture.PlanAndTrack();
+    const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+    Check(elapsed_ms < 1000, "inductive selector pass exceeded 1000ms budget with clobber=false");
+    auto plan = ExtractResourcePlan(fixture.program);
+    const std::array<uint32_t, 4> user_data{0x1000u, 0x2000u, 1u, 0u};
+    FakeGuestMemory fake([](void *, uint64_t address, std::span<uint32_t> words) {
+      if (words.size() != 1u) return false;
+      if (address == 0x1010u) {
+        words[0] = 7u;
+        return true;
+      }
+      if (address == 0x1014u) {
+        words[0] = 2u;
+        return true;
+      }
+      if (address >= 0x1000u && address < 0x1200u) {
+        words[0] = 0u;
+        return true;
+      }
+      return false;
+    }, nullptr);
+    DescriptorValue descriptor;
+    const auto &bufs = fixture.program.info.buffers;
+    Check(bufs.size() == 2u &&
+              EvaluateSrtDescriptor(plan, {.user_data = user_data}, bufs[1].source, descriptor) &&
+              descriptor.dwords[2] == 32u,
+          "48-loop EXEC chain did not preserve disjunctive guard runtime buffer capacity");
+  }
+}
+
 void TestDmaAddressMaterialization() {
   Fixture fixture;
   const auto based =
@@ -10390,6 +10721,8 @@ int main() {
     Run("bounded relative register reads", TestBoundedRelativeRegisterReads);
     Run("disjunctive guard relative register partition",
         TestDisjunctiveGuardRelativeRegisterPartition);
+    Run("inductive selector ignores unrelated loop EXEC masks",
+        TestInductiveSelectorIgnoresUnrelatedLoopExecMasks);
     Run("DMA address materialization", TestDmaAddressMaterialization);
     Run("dynamic FLAT address", TestDynamicFlatAddressesUseDma);
     Run("buffer swizzle specialization", TestBufferSwizzleSpecialization);
