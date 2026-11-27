@@ -294,6 +294,32 @@ ShaderRecompiler::IR::ResourceSpecialization CanonicalizeModuleSpecialization(
 			canonical.buffers[i].zero_stride_oob    = true;
 		}
 	}
+	for (uint32_t i = 0; i < canonical.images.size(); ++i) {
+		auto& img = canonical.images[i];
+		if (img.fmask || img.indirect_root != i || img.indirect_search_iterations > 17u) {
+			continue;
+		}
+		bool has_child = false;
+		for (uint32_t j = 0; j < canonical.images.size(); ++j) {
+			if (j != i && !canonical.images[j].fmask && canonical.images[j].indirect_root == i) {
+				has_child = true;
+				break;
+			}
+		}
+		if (!has_child) continue;
+		img.indirect_mapping_offset = 0u;
+		if (img.indirect_search_iterations > 0u) {
+			img.indirect_search_iterations = 1u;
+		}
+	}
+	for (uint32_t s = 0; s < canonical.samplers.size(); ++s) {
+		auto& smp = canonical.samplers[s];
+		if (smp.indirect_root != s || smp.indirect_search_iterations > 17u) continue;
+		smp.indirect_mapping_offset = 0u;
+		if (smp.indirect_search_iterations > 0u) {
+			smp.indirect_search_iterations = 1u;
+		}
+	}
 	return canonical;
 }
 
@@ -302,9 +328,55 @@ bool IsCompatibleModuleSpecialization(
     const ShaderRecompiler::IR::ResourceSpecialization& specialization) {
 	if (candidate.specialization == specialization) return true;
 	const auto& layout = candidate.info.bindings;
-	if (candidate.specialization.images != specialization.images ||
-	    candidate.specialization.samplers != specialization.samplers) {
+	if (candidate.specialization.images.size() != specialization.images.size() ||
+	    candidate.specialization.samplers.size() != specialization.samplers.size()) {
 		return false;
+	}
+	const auto find_indirect_root = [](const auto& roots, uint32_t resource) {
+		return std::ranges::find_if(roots, [resource](const ShaderRecompiler::IR::IndirectBufferRoot& entry) {
+			return entry.resource == resource;
+		});
+	};
+	for (uint32_t i = 0, compacted = 0u; i < specialization.images.size(); ++i) {
+		const auto& cand_img = candidate.specialization.images[i];
+		const auto& spec_img = specialization.images[i];
+		if (cand_img.fmask != spec_img.fmask) return false;
+		if (spec_img.fmask) {
+			if (cand_img != spec_img) return false;
+			continue;
+		}
+		const uint32_t comp_idx = compacted++;
+		if (cand_img == spec_img) continue;
+		if (cand_img.indirect_root != i || spec_img.indirect_root != i ||
+		    (cand_img.indirect_search_iterations > 0u) != (spec_img.indirect_search_iterations > 0u) ||
+		    spec_img.indirect_search_iterations > 17u) {
+			return false;
+		}
+		auto cand_norm = cand_img;
+		auto spec_norm = spec_img;
+		cand_norm.indirect_mapping_offset = spec_norm.indirect_mapping_offset = 0u;
+		cand_norm.indirect_search_iterations = spec_norm.indirect_search_iterations = 0u;
+		if (cand_norm != spec_norm) return false;
+		const auto root = find_indirect_root(layout.indirect_image_roots, comp_idx);
+		if (root == layout.indirect_image_roots.end() ||
+		    root->binary_search != (spec_img.indirect_search_iterations > 0u)) {
+			return false;
+		}
+	}
+	for (uint32_t s = 0; s < specialization.samplers.size(); ++s) {
+		const auto& cand_smp = candidate.specialization.samplers[s];
+		const auto& spec_smp = specialization.samplers[s];
+		if (cand_smp == spec_smp) continue;
+		if (cand_smp.indirect_root != s || spec_smp.indirect_root != s ||
+		    (cand_smp.indirect_search_iterations > 0u) != (spec_smp.indirect_search_iterations > 0u) ||
+		    spec_smp.indirect_search_iterations > 17u) {
+			return false;
+		}
+		const auto root = find_indirect_root(layout.indirect_sampler_roots, s);
+		if (root == layout.indirect_sampler_roots.end() ||
+		    root->binary_search != (spec_smp.indirect_search_iterations > 0u)) {
+			return false;
+		}
 	}
 	const uint32_t base_count = layout.dynamic_indirect_buffers
 	                                ? layout.base_buffer_count

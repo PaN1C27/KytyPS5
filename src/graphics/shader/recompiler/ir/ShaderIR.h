@@ -561,6 +561,8 @@ struct Bindings {
 	bool dynamic_indirect_buffers = false;
 	std::vector<IndirectBufferRoot> indirect_buffer_roots;
 	std::vector<uint32_t> indirect_root_mappings;
+	std::vector<IndirectBufferRoot> indirect_image_roots;
+	std::vector<IndirectBufferRoot> indirect_sampler_roots;
 	std::vector<IndirectBufferTable> indirect_buffer_tables;
 	std::vector<uint32_t> indirect_map;
 
@@ -580,8 +582,14 @@ struct Bindings {
 		            ? descriptor_counts[static_cast<size_t>(DescriptorBindingKind::Buffers)]
 		            : 0u);
 	}
-	[[nodiscard]] uint32_t IndirectMapDword() const {
+	[[nodiscard]] uint32_t IndirectImageMappingDword() const {
 		return IndirectRootMappingDword() + static_cast<uint32_t>(indirect_buffer_roots.size());
+	}
+	[[nodiscard]] uint32_t IndirectSamplerMappingDword() const {
+		return IndirectImageMappingDword() + static_cast<uint32_t>(indirect_image_roots.size());
+	}
+	[[nodiscard]] uint32_t IndirectMapDword() const {
+		return IndirectSamplerMappingDword() + static_cast<uint32_t>(indirect_sampler_roots.size());
 	}
 	[[nodiscard]] uint32_t ShaderDataDwords() const {
 		return IndirectMapDword() + static_cast<uint32_t>(indirect_map.size());

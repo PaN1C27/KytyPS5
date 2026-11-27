@@ -947,6 +947,26 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 			}
 		}
 	}
+	if (!layout.indirect_image_roots.empty()) {
+		uint32_t compacted = 0u;
+		size_t   cursor    = 0u;
+		for (const auto& img : spec.images) {
+			if (img.fmask) continue;
+			if (cursor < layout.indirect_image_roots.size() &&
+			    layout.indirect_image_roots[cursor].resource == compacted) {
+				const auto& root = layout.indirect_image_roots[cursor++];
+				prepared.shader_data[layout.IndirectImageMappingDword() + root.mapping_dword] =
+				    img.indirect_mapping_offset;
+			}
+			++compacted;
+		}
+		EXIT_IF(cursor != layout.indirect_image_roots.size());
+	}
+	for (const auto& root : layout.indirect_sampler_roots) {
+		EXIT_IF(root.resource >= spec.samplers.size());
+		prepared.shader_data[layout.IndirectSamplerMappingDword() + root.mapping_dword] =
+		    spec.samplers[root.resource].indirect_mapping_offset;
+	}
 	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::FlattenedSrt)] != 0) {
 		prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
 	}

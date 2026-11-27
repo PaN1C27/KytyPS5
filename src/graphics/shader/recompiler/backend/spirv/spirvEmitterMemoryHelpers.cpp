@@ -57,10 +57,8 @@ static uint32_t LoadFlattenedSrt(EmitterState& state, uint32_t index) {
 	return value;
 }
 
-uint32_t EmitImageHeapEntry(EmitterState& state, uint32_t key, uint32_t mapping_offset) {
-	const auto Mapping = [&](uint32_t word) {
-		return LoadFlattenedSrt(state, ConstantU32(state, mapping_offset + word));
-	};
+template <typename MappingFn>
+uint32_t EmitImageHeapEntryImpl(EmitterState& state, uint32_t key, MappingFn&& Mapping) {
 	// Keys past the table select its trailing null slot.
 	const auto index = EmitUMin32(state, Binary(state, spv::OpShiftRightLogical, TypeU32(state), key,
 	                                            ConstantU32(state, 2u)),
@@ -75,6 +73,19 @@ uint32_t EmitImageHeapEntry(EmitterState& state, uint32_t key, uint32_t mapping_
 	state.builder.AddFunction(spv::OpLoad, TypeU32(state), entry, pointer,
 	                          spv::MemoryAccessAlignedMask, 4u);
 	return entry;
+}
+
+uint32_t EmitImageHeapEntry(EmitterState& state, uint32_t key, uint32_t mapping_offset) {
+	return EmitImageHeapEntryImpl(state, key, [&](uint32_t word) {
+		return LoadFlattenedSrt(state, ConstantU32(state, mapping_offset + word));
+	});
+}
+
+uint32_t EmitImageHeapEntryDynamic(EmitterState& state, uint32_t key, uint32_t mapping) {
+	return EmitImageHeapEntryImpl(state, key, [&](uint32_t word) {
+		return LoadFlattenedSrt(
+		    state, word == 0u ? mapping : EmitAddU32(state, mapping, ConstantU32(state, word)));
+	});
 }
 
 static uint32_t EmitIndirectResourceIndexImpl(EmitterState& state, uint32_t key, uint32_t mapping,
@@ -356,6 +367,38 @@ void PlanIndirectResourceMaps(EmitterState& state) {
 			    .binary_search = buf.indirect_search_iterations > 0u,
 			});
 			bindings.indirect_root_mappings.push_back(buf.indirect_mapping_offset);
+		}
+	}
+	if (state.profile.dynamic_indirect_buffers) {
+		for (uint32_t r = 0; r < info.images.size(); ++r) {
+			const auto& img = info.images[r];
+			if (img.indirect_root != r || img.indirect_resources.size() < 2u ||
+			    img.indirect_search_iterations > 17u) {
+				continue;
+			}
+			bindings.indirect_image_roots.push_back({
+			    .resource      = r,
+			    .mapping_dword = static_cast<uint32_t>(bindings.indirect_image_roots.size()),
+			    .binary_search = img.indirect_search_iterations > 0u,
+			});
+		}
+		for (const auto& smp : info.samplers) {
+			if (smp.indirect_root == IR::SamplerResource::NoIndirectSampler ||
+			    smp.indirect_resources.empty() || smp.indirect_search_iterations > 17u) {
+				continue;
+			}
+			const uint32_t snap = smp.snapshot_index;
+			if (std::ranges::any_of(bindings.indirect_sampler_roots,
+			                        [snap](const IR::IndirectBufferRoot& e) {
+				                        return e.resource == snap;
+			                        })) {
+				continue;
+			}
+			bindings.indirect_sampler_roots.push_back({
+			    .resource      = snap,
+			    .mapping_dword = static_cast<uint32_t>(bindings.indirect_sampler_roots.size()),
+			    .binary_search = smp.indirect_search_iterations > 0u,
+			});
 		}
 	}
 	const auto InternMap = [&](IndirectResourcePlan& plan) {

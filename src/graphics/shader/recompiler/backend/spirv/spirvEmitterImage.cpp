@@ -681,8 +681,22 @@ auto EmitImageAccess(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t resul
 	    image.indirect_resources.size() < 2u) {
 		ctx.Fail(inst, "has no indirect image runtime mapping");
 	}
+	const auto find_indirect_root = [](const auto& roots, uint32_t resource) {
+		return std::ranges::find_if(roots, [&](const IR::IndirectBufferRoot& entry) {
+			return entry.resource == resource;
+		});
+	};
+	const auto& bindings = state.program.bindings;
+	const auto  image_root = find_indirect_root(bindings.indirect_image_roots, mem.resource);
+	const auto  dynamic_mapping = [&]() -> std::optional<uint32_t> {
+		if (image_root == bindings.indirect_image_roots.end()) return std::nullopt;
+		return EmitShaderDataDwordLoad(
+		    state, bindings.IndirectImageMappingDword() + image_root->mapping_dword);
+	}();
 	if (image.heap) {
-		const auto entry = EmitImageHeapEntry(state, key, image.indirect_mapping_offset);
+		const auto entry = dynamic_mapping.has_value()
+		    ? EmitImageHeapEntryDynamic(state, key, *dynamic_mapping)
+		    : EmitImageHeapEntry(state, key, image.indirect_mapping_offset);
 		const auto kinds = static_cast<uint32_t>(image.indirect_resources.size()) - 1u;
 		// One kind leaves every slot word a bare element.
 		if (kinds == 1u) return emit(image.indirect_resources[1], entry);
@@ -696,8 +710,11 @@ auto EmitImageAccess(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t resul
 		                              ConstantU32(state, IR::ImageHeapKindShift)),
 		                       kinds, result_type, EmitKind);
 	}
-	const auto selected = EmitIndirectResourceIndex(
-	    state, key, image.indirect_mapping_offset, image.indirect_search_iterations, 0u);
+	const auto selected = dynamic_mapping.has_value()
+	    ? EmitIndirectResourceIndexDynamic(state, key, *dynamic_mapping,
+	                                       image_root->binary_search ? 17u : 0u, 0u)
+	    : EmitIndirectResourceIndex(state, key, image.indirect_mapping_offset,
+	                                  image.indirect_search_iterations, 0u);
 	const auto plan_it = state.indirect_plans.find(&inst);
 	IndirectResourcePlan fallback_plan;
 	if (plan_it == state.indirect_plans.end()) {
@@ -805,10 +822,24 @@ std::array<ImageSampler, 2> LoadImageSamplers(ValueEmitContext& ctx, const IR::I
 			if (handle == nullptr || handle->GetOpcode() != IR::ValueOpcode::GetSamplerResource)
 				ctx.Fail(inst, "has invalid finite sampler key provenance");
 			auto selected = ctx.Def(handle->Arg(0));
-			if (samplers[index].indirect_root != IR::SamplerResource::NoIndirectSampler)
-				selected = EmitIndirectResourceIndex(state, selected,
-				    samplers[index].indirect_mapping_offset,
-				    samplers[index].indirect_search_iterations, 0u);
+			if (samplers[index].indirect_root != IR::SamplerResource::NoIndirectSampler) {
+				const auto& bindings = state.program.bindings;
+				const auto  sampler_root = std::ranges::find_if(
+				    bindings.indirect_sampler_roots,
+				    [snap = samplers[index].snapshot_index](const IR::IndirectBufferRoot& entry) {
+					    return entry.resource == snap;
+				    });
+				if (sampler_root != bindings.indirect_sampler_roots.end()) {
+					const auto mapping = EmitShaderDataDwordLoad(
+					    state, bindings.IndirectSamplerMappingDword() + sampler_root->mapping_dword);
+					selected = EmitIndirectResourceIndexDynamic(
+					    state, selected, mapping, sampler_root->binary_search ? 17u : 0u, 0u);
+				} else {
+					selected = EmitIndirectResourceIndex(state, selected,
+					    samplers[index].indirect_mapping_offset,
+					    samplers[index].indirect_search_iterations, 0u);
+				}
+			}
 			array_index = SamplerArrayIndex(state, selected, candidates);
 		}
 		sampler = {LoadSamplerDescriptor(state, index, array_index), array_index != 0u};

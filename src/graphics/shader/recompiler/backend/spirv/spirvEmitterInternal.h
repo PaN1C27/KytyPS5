@@ -468,6 +468,7 @@ uint32_t EmitIndirectResourceIndexDynamic(EmitterState& state, uint32_t key, uin
                                           uint32_t search_iterations, uint32_t default_resource);
 // Slot word of an image heap byte offset; offsets past the heap select the null element.
 uint32_t EmitImageHeapEntry(EmitterState& state, uint32_t key, uint32_t mapping_offset);
+uint32_t EmitImageHeapEntryDynamic(EmitterState& state, uint32_t key, uint32_t mapping);
 MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::MemoryInfo& mem,
                                                  uint32_t array_index = 0u);
 

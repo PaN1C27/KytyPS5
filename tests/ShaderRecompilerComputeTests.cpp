@@ -52683,6 +52683,222 @@ void CheckDirectBufferSpecializationReuse(VulkanHarness &vulkan) {
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
+void CheckDynamicIndirectImageSamplerReuse(VulkanHarness &vulkan) {
+  constexpr const char *name = "DynamicIndirectImageSamplerReuse";
+  constexpr uintptr_t base = 0x0000000208000000ull;
+  constexpr uint64_t allocation_size = 0x40000;
+  constexpr u32 buf_table_offset = 0x0100u;
+  constexpr u32 img_table_offset = 0x0400u;
+  constexpr u32 smp_table_offset = 0x0800u;
+  constexpr u32 out_offset = 0x2000u;
+  constexpr u32 buf_data_offset = 0x4000u;
+  constexpr u32 tex0_offset = 0x10000u;
+  constexpr u32 tex1_offset = 0x11000u;
+
+  // s[0:3]=buf_table, s4=buf_rows, s5=pair_count, s[8:11]=out_buf,
+  // s[12:13]=img_table_ptr, s[14:15]=smp_table_ptr.
+  std::vector<u32> compute{
+      EncodeVop1(0x01u, 1u, InlineU32(0u)),
+      EncodeSMovB32(36u, InlineU32(0u)),
+  };
+  const auto header1 = compute.size();
+  compute.push_back(EncodeSopc(0x04u, 36u, 4u));
+  const auto exit1 = compute.size();
+  compute.push_back(0u);
+  compute.insert(compute.end(), {
+      EncodeSop2(0x26u, 37u, 36u, 255u), 16u,
+      EncodeSmem0(0x0au, 20u, 0u), EncodeSmem1(0u, 37u),
+      EncodeSopp(0x0cu, 0u),
+      EncodeMubuf0(0x01u, 0u, true, false), EncodeMubuf1(4u, 5u, 1u),
+      EncodeSopp(0x0cu, 0u),
+      EncodeVop1(0x01u, 2u, 36u),
+      EncodeMubuf0(0x1du, 0u, true, false), EncodeMubuf1(4u, 2u, 2u),
+      EncodeSop2(0x02u, 36u, 36u, InlineU32(1u)),
+  });
+  compute.push_back(EncodeSopp(0x02u, static_cast<u32>(header1 - compute.size() - 1u)));
+  compute[exit1] = EncodeSopp(0x04u, static_cast<u32>(compute.size() - exit1 - 1u));
+
+  AppendVMovLiteral(&compute, 10u, std::bit_cast<u32>(0.5f));
+  AppendVMovLiteral(&compute, 11u, std::bit_cast<u32>(0.5f));
+  AppendVMovLiteral(&compute, 12u, std::bit_cast<u32>(2.0f));
+  AppendVMovLiteral(&compute, 13u, std::bit_cast<u32>(2.0f));
+  compute.push_back(EncodeSMovB32(36u, InlineU32(0u)));
+  const auto header2 = compute.size();
+  compute.push_back(EncodeSopc(0x04u, 36u, 5u));
+  const auto exit2 = compute.size();
+  compute.push_back(0u);
+  compute.insert(compute.end(), {
+      EncodeSop2(0x26u, 37u, 36u, 255u), 32u,
+      EncodeSmem0(0x03u, 24u, 6u), EncodeSmem1(0u, 37u),
+      EncodeSop2(0x26u, 37u, 36u, 255u), 16u,
+      EncodeSmem0(0x02u, 32u, 7u), EncodeSmem1(0u, 37u),
+      0xbf8cc07fu, // s_waitcnt lgkmcnt(0)
+      EncodeMimg0(0x20u, 0x1u), EncodeMimg1(4u, 10u, 6u, 8u),
+      EncodeMimg0(0x20u, 0x1u), EncodeMimg1(5u, 12u, 6u, 8u),
+      0xbf8c0070u, // s_waitcnt vmcnt(0) lgkmcnt(0)
+      EncodeSop2(0x02u, 38u, 4u, 36u),
+      EncodeVop1(0x01u, 2u, 38u),
+      EncodeMubuf0(0x1du, 0u, true, false), EncodeMubuf1(4u, 2u, 2u),
+      EncodeSop2(0x02u, 36u, 36u, InlineU32(1u)),
+  });
+  compute.push_back(EncodeSopp(0x02u, static_cast<u32>(header2 - compute.size() - 1u)));
+  compute[exit2] = EncodeSopp(0x04u, static_cast<u32>(compute.size() - exit2 - 1u));
+  AppendEnd(&compute);
+  ShaderMapUserData(reinterpret_cast<uint64_t>(compute.data()),
+                    {.type = Prospero::ShaderBinaryType::kCs,
+                     .code_size_bytes = static_cast<u32>(compute.size() * sizeof(u32))});
+
+  int64_t direct_offset = -1;
+  void *mapped = reinterpret_cast<void *>(base);
+  Require(name, "memory allocation",
+          LibKernel::Memory::KernelAllocateDirectMemory(
+              0, LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size, 0x10000, 0,
+              &direct_offset) == 0 &&
+              LibKernel::Memory::KernelMapDirectMemory(&mapped, allocation_size, 0x3, 0x10,
+                                                       direct_offset, 0x10000) == 0,
+          "memory allocation or mapping failed");
+
+  const auto store = std::filesystem::temp_directory_path() /
+                     fmt::format("kyty_dyn_img_smp_{}",
+                                 std::chrono::steady_clock::now().time_since_epoch().count()) /
+                     "TEST00003.shaders";
+
+  const auto write_desc = [](u32 *dst, u32 byte_off, uint64_t addr, u32 stride, u32 records,
+                             Prospero::BufferFormat fmt) {
+    ShaderBufferResource desc{};
+    desc.UpdateAddress48(addr);
+    desc.fields[1] |= (stride & 0x3fffu) << 16u;
+    desc.fields[2] = records;
+    desc.fields[3] = DstSel(4, 5, 6, 7) | (static_cast<u32>(fmt) << 12u);
+    std::copy_n(desc.fields, 4u, dst + byte_off / 4u);
+  };
+
+  const auto dispatch_case = [&](RenderContext &context, const std::vector<std::array<u32, 2>> &rows) {
+    auto *words = static_cast<u32 *>(mapped);
+    std::memset(words, 0, allocation_size);
+    words[tex0_offset / 4u] = std::bit_cast<u32>(10.0f);
+    words[tex1_offset / 4u] = std::bit_cast<u32>(20.0f);
+    for (size_t i = 0; i < rows.size(); ++i) {
+      const uint64_t row_addr = base + buf_data_offset + i * 0x100u;
+      words[(buf_data_offset + static_cast<u32>(i) * 0x100u) / 4u] = rows[i][0];
+      words[(buf_data_offset + static_cast<u32>(i) * 0x100u) / 4u + 1u] = rows[i][1];
+      write_desc(words, buf_table_offset + static_cast<u32>(i) * 16u, row_addr, 8u, 2u,
+                 Prospero::BufferFormat::k32_32Float);
+    }
+    for (u32 i = 0; i < 2u; ++i) {
+      const uint64_t tex_addr = base + (i == 0u ? tex0_offset : tex1_offset);
+      u32 *t = words + (img_table_offset + i * 32u) / 4u;
+      t[0] = static_cast<u32>(tex_addr >> 8u);
+      t[1] = static_cast<u32>(tex_addr >> 40u) |
+             (static_cast<u32>(Prospero::BufferFormat::k32Float) << 20u);
+      t[2] = 0u;
+      t[3] = DstSel(4, 0, 0, 1) |
+             (static_cast<u32>(Prospero::TileMode::kLinear) << 20u) |
+             (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u);
+      const auto border = i == 0u ? Prospero::SamplerBorderColor::kOpaqueBlack
+                                  : Prospero::SamplerBorderColor::kOpaqueWhite;
+      const auto clamp = static_cast<u32>(Prospero::SamplerClampMode::kClampBorder);
+      u32 *s = words + (smp_table_offset + i * 16u) / 4u;
+      s[0] = clamp | (clamp << 3u) | (clamp << 6u);
+      s[2] = 1u << 24u;
+      s[3] = static_cast<u32>(border) << 30u;
+    }
+
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      auto &shaders = processor.GetShCtx();
+      shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(compute.data()),
+                           .num_thread_x = 1, .num_thread_y = 1, .num_thread_z = 1,
+                           .wave_size = 64, .user_sgpr = 16});
+      std::array<u32, 16> ud{};
+      write_desc(ud.data(), 0u, base + buf_table_offset, 16u, static_cast<u32>(rows.size()),
+                 Prospero::BufferFormat::k32_32UInt);
+      ud[4] = static_cast<u32>(rows.size());
+      ud[5] = 2u;
+      write_desc(ud.data(), 32u, base + out_offset, 8u, 16u, Prospero::BufferFormat::k32_32UInt);
+      const uint64_t img_table_addr = base + img_table_offset;
+      const uint64_t smp_table_addr = base + smp_table_offset;
+      ud[12] = static_cast<u32>(img_table_addr);
+      ud[13] = static_cast<u32>(img_table_addr >> 32u);
+      ud[14] = static_cast<u32>(smp_table_addr);
+      ud[15] = static_cast<u32>(smp_table_addr >> 32u);
+      for (u32 r = 0; r < ud.size(); ++r) shaders.SetCsUserSgpr(r, ud[r]);
+      context.MapMemory(base, allocation_size);
+      processor.DispatchDirect(1, 1, 1, 0x41u);
+      const size_t total_pairs = rows.size() + 2u;
+      context.GetBufferCache().ReadMemory(base + out_offset, total_pairs * 8u);
+      std::vector<u32> actual(total_pairs * 2u);
+      (void)LibKernel::Memory::TryReadBacking(base + out_offset, actual.data(),
+                                              actual.size() * sizeof(u32));
+      context.UnmapMemory(base, allocation_size);
+      for (size_t i = 0; i < rows.size(); ++i) {
+        Require(name, "buffer row output",
+                actual[i * 2u] == rows[i][0] && actual[i * 2u + 1u] == rows[i][1],
+                "streaming buffer row mismatched before shifted image/sampler pairs");
+      }
+      const u32 tex0_u = std::bit_cast<u32>(10.0f);
+      const u32 tex1_u = std::bit_cast<u32>(20.0f);
+      const u32 b0_u   = 0u;
+      const u32 b1_u   = std::bit_cast<u32>(1.0f);
+      const size_t base_idx = rows.size() * 2u;
+      Require(name, "shifted image/sampler pair 0",
+              actual[base_idx + 0u] == tex0_u && actual[base_idx + 1u] == b0_u,
+              "indirect image/sampler pair 0 returned wrong texel or border");
+      Require(name, "shifted image/sampler pair 1",
+              actual[base_idx + 2u] == tex1_u && actual[base_idx + 3u] == b1_u,
+              "indirect image/sampler pair 1 returned wrong texel or border");
+    });
+  };
+
+  const std::vector<std::array<u32, 2>> b1{
+      {0x3f800000u, 0x40000000u}, {0x3f000000u, 0x40200000u},
+      {0x3e800000u, 0x40100000u}};
+  const std::vector<std::array<u32, 2>> b2{
+      {0x40400000u, 0x40800000u}, {0x40a00000u, 0x40c00000u},
+      {0x41000000u, 0x41100000u}, {0x41200000u, 0x41300000u}};
+  const std::vector<std::array<u32, 2>> b3{
+      {0x41400000u, 0x41500000u}, {0x41600000u, 0x41700000u}};
+
+  const auto cs_index = static_cast<size_t>(ShaderType::Compute);
+  {
+    RenderContext context(vulkan.RuntimeContext(), store);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    auto &pipelines = context.GetPipelineCache();
+    dispatch_case(context, b1);
+    Require(name, "initial compile", PipelineCacheTestAccess::Compiled(pipelines)[cs_index] == 1u,
+            "initial dispatch compiled unexpected module count");
+    dispatch_case(context, b2);
+    dispatch_case(context, b3);
+    Require(name, "shifted SRT mapping reuse",
+            PipelineCacheTestAccess::Compiled(pipelines)[cs_index] == 1u,
+            "shifting indirect image/sampler SRT offsets triggered a shader recompile");
+    context.ShutdownGpu();
+    LibKernel::Memory::InstallGpuResources(nullptr);
+  }
+  {
+    RenderContext context(vulkan.RuntimeContext(), store);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    auto &pipelines = context.GetPipelineCache();
+    dispatch_case(context, b1);
+    dispatch_case(context, b2);
+    dispatch_case(context, b3);
+    Require(name, "warm store reuse",
+            PipelineCacheTestAccess::Compiled(pipelines)[cs_index] == 0u,
+            "warm shader store recompiled shader across shifted image/sampler SRT offsets");
+    context.ShutdownGpu();
+    LibKernel::Memory::InstallGpuResources(nullptr);
+  }
+  std::filesystem::remove_all(store.parent_path());
+  Require(name, "release",
+          LibKernel::Memory::KernelMunmap(base, allocation_size) == 0 &&
+              LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
+          "memory release failed");
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
 void CheckPs5GameExampleImageClearRuntimeShape() {
   const auto MakeCode = [] {
     std::vector<u32> code;
@@ -60488,6 +60704,7 @@ int main(int argc, char **argv) {
     CheckStableProgramIds(vulkan);
     CheckStreamingIndirectBufferReuse(vulkan);
     CheckDirectBufferSpecializationReuse(vulkan);
+    CheckDynamicIndirectImageSamplerReuse(vulkan);
     CheckShaderStore(vulkan);
     vulkan.CheckZeroStrideBufferBinding();
     return 0;
@@ -60813,6 +61030,7 @@ int main(int argc, char **argv) {
   CheckShaderStore(vulkan);
   CheckStreamingIndirectBufferReuse(vulkan);
   CheckDirectBufferSpecializationReuse(vulkan);
+  CheckDynamicIndirectImageSamplerReuse(vulkan);
   vulkan.CheckOrderedDispatch();
   vulkan.CheckZeroStrideBufferBinding();
   vulkan.CheckNullStorageBufferDescriptor();
