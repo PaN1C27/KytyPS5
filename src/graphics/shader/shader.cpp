@@ -650,29 +650,40 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 std::array<ShaderParams, 3>
 PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context& context,
                             std::array<ShaderVertexInputInfo, 3>& input_info) {
-	const auto& sh        = context.GetShaderRegisters();
-	const auto [local, local_hash] = ShaderGetMappedData(regs.ls_regs.data_addr, "ShaderGetInputInfoLS():");
-	const auto [control, control_hash] = ShaderGetMappedData(regs.hs_regs.data_addr, "ShaderGetInputInfoHS():");
-	const auto [evaluation, evaluation_hash] = ShaderGetMappedData(regs.es_regs.data_addr, "ShaderGetInputInfoTES():");
-	EXIT_NOT_IMPLEMENTED(local.type != Prospero::ShaderBinaryType::kHsFront ||
-	                     control.type != Prospero::ShaderBinaryType::kHsBack ||
-	                     evaluation.type != Prospero::ShaderBinaryType::kGs);
+	const auto& sh = context.GetShaderRegisters();
+	const auto [local, local_hash] =
+	    ShaderGetMappedData(regs.ls_regs.data_addr, "ShaderGetInputInfoLS():");
+	const bool     merged_hs = local.type == Prospero::ShaderBinaryType::kHs;
+	ShaderMapEntry control_entry {{}, local_hash};
+	if (merged_hs) {
+		control_entry.data = local;
+	} else {
+		EXIT_NOT_IMPLEMENTED(local.type != Prospero::ShaderBinaryType::kHsFront ||
+		                     regs.hs_regs.user_data_addr == 0);
+		control_entry = ShaderGetMappedData(regs.hs_regs.data_addr, "ShaderGetInputInfoHS():");
+		EXIT_NOT_IMPLEMENTED(control_entry.data.type != Prospero::ShaderBinaryType::kHsBack);
+	}
+	const auto& [control, control_hash]      = control_entry;
+	const auto [evaluation, evaluation_hash] =
+	    ShaderGetMappedData(regs.es_regs.data_addr, "ShaderGetInputInfoTES():");
+	EXIT_NOT_IMPLEMENTED(evaluation.type != Prospero::ShaderBinaryType::kGs);
 	const auto stages = context.GetShaderStages();
 	EXIT_NOT_IMPLEMENTED((stages & 0x4u) == 0);
-	EXIT_IF(regs.hs_regs.user_data_addr == 0);
 
 	const auto local_users      = std::span(regs.hs_user_sgpr.value, regs.hs_regs.rsrc2.user_sgpr);
 	const auto evaluation_users = std::span(regs.gs_user_sgpr.value, regs.gs_regs.rsrc2.user_sgpr);
 	std::array<ShaderParams, 3> params {
 	    GetShaderParams(regs.ls_regs.data_addr, local_hash, local_users, local),
-	    GetShaderParams(regs.hs_regs.data_addr, control_hash, local_users, control, 8u),
-	    GetShaderParams(regs.es_regs.data_addr, evaluation_hash, evaluation_users,
-	                    evaluation),
+	    GetShaderParams(merged_hs ? regs.ls_regs.data_addr : regs.hs_regs.data_addr, control_hash,
+	                    local_users, control, 8u),
+	    GetShaderParams(regs.es_regs.data_addr, evaluation_hash, evaluation_users, evaluation),
 	};
-	// The fused HS back half receives its separate user-data address in s0:s1.
-	// RDNA2 reserves s0:s7 before the native HS user SGPRs.
-	params[1].user_data[0] = static_cast<uint32_t>(regs.hs_regs.user_data_addr);
-	params[1].user_data[1] = static_cast<uint32_t>(regs.hs_regs.user_data_addr >> 32u);
+	if (!merged_hs) {
+		// The fused HS back half receives its separate user-data address in s0:s1.
+		// RDNA2 reserves s0:s7 before the native HS user SGPRs.
+		params[1].user_data[0] = static_cast<uint32_t>(regs.hs_regs.user_data_addr);
+		params[1].user_data[1] = static_cast<uint32_t>(regs.hs_regs.user_data_addr >> 32u);
+	}
 
 	if (!ShaderGetStaticVertexInputInfo(regs.ls_regs.data_addr, regs.hs_user_sgpr,
 	                                    regs.hs_regs.rsrc2.user_sgpr, sh, local, input_info[0])) {

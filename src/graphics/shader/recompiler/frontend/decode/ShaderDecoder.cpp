@@ -159,6 +159,165 @@ std::string FormatExp(const Instruction& inst) {
 	return text;
 }
 
+bool HasFrontSetPcTerminator(std::span<const uint32_t> code) {
+	uint32_t words = 0;
+	while (words < code.size()) {
+		Instruction inst;
+		DecodeInstruction(code, words, inst);
+		words += inst.word_count;
+		if (inst.opcode == Opcode::S_SETPC_B64) {
+			return true;
+		}
+		if (inst.opcode == Opcode::S_ENDPGM) {
+			return false;
+		}
+	}
+	return false;
+}
+
+bool IsAllowedMergedHsPrologOpcode(Opcode opcode) {
+	switch (opcode) {
+		case Opcode::S_INST_PREFETCH:
+		case Opcode::S_CLAUSE:
+		case Opcode::S_NOP:
+		case Opcode::S_WAITCNT:
+		case Opcode::S_WAITCNT_DEPCTR:
+		case Opcode::S_MOV_B32:
+		case Opcode::S_MOV_B64:
+		case Opcode::S_BFE_U32:
+		case Opcode::S_AND_B32:
+		case Opcode::V_MBCNT_LO_U32_B32:
+		case Opcode::V_MBCNT_HI_U32_B32: return true;
+		default: return false;
+	}
+}
+
+bool IsExecRestoreInstruction(const Instruction& inst) {
+	return (inst.opcode == Opcode::S_MOV_B64 || inst.opcode == Opcode::S_MOV_B32) &&
+	       inst.dst.kind == OperandKind::ExecLo;
+}
+
+bool IsHandoffPrefixOpcode(Opcode opcode) {
+	switch (opcode) {
+		case Opcode::S_INST_PREFETCH:
+		case Opcode::S_CLAUSE:
+		case Opcode::S_NOP:
+		case Opcode::S_MOV_B64:
+		case Opcode::S_MOV_B32:
+		case Opcode::S_WAITCNT:
+		case Opcode::S_WAITCNT_DEPCTR:
+		case Opcode::S_BARRIER: return true;
+		default: return false;
+	}
+}
+
+bool OperandReadsS3LowByte(const Operand& op, const std::array<bool, 108>& tracked_s3_low_byte) {
+	if (op.kind != OperandKind::Sgpr) {
+		return false;
+	}
+	if (op.reg == 3u && op.sdwa_sel == 0u) {
+		return true;
+	}
+	return op.reg < tracked_s3_low_byte.size() && tracked_s3_low_byte[op.reg] && op.sdwa_sel == 6u;
+}
+
+bool TrySplitMergedHsProgram(const Program& full, size_t& ls_cmp_index, size_t& handoff_index) {
+	std::array<bool, 108> tracked_s3_low_byte {};
+	size_t                ls_branch_index = full.instructions.size();
+	size_t                last_non_nop    = full.instructions.size();
+
+	const auto is_imm = [](const Operand& op, uint32_t expected) {
+		return (op.kind == OperandKind::IntegerInlineConstant ||
+		        op.kind == OperandKind::LiteralConstant) &&
+		       op.value == expected;
+	};
+	const auto is_s3 = [](const Operand& op) {
+		return op.kind == OperandKind::Sgpr && op.reg == 3u && op.sdwa_sel == 6u;
+	};
+
+	for (size_t i = 0; i < full.instructions.size(); i++) {
+		const auto& inst = full.instructions[i];
+		if (IsDirectBranch(inst.opcode)) {
+			ls_branch_index = i;
+			break;
+		}
+		if (inst.opcode != Opcode::S_NOP) {
+			if (last_non_nop < full.instructions.size()) {
+				const auto& prev = full.instructions[last_non_nop];
+				if (!IsAllowedMergedHsPrologOpcode(prev.opcode)) {
+					return false;
+				}
+				if (prev.dst.kind == OperandKind::Sgpr &&
+				    prev.dst.reg < tracked_s3_low_byte.size()) {
+					const uint32_t count = std::max(prev.data_dwords, 1u);
+					for (uint32_t d = 0;
+					     d < count && prev.dst.reg + d < tracked_s3_low_byte.size(); d++) {
+						tracked_s3_low_byte[prev.dst.reg + d] = false;
+					}
+					if ((prev.opcode == Opcode::S_BFE_U32 && is_s3(prev.src0) &&
+					     is_imm(prev.src1, 0x00080000u)) ||
+					    (prev.opcode == Opcode::S_AND_B32 &&
+					     ((is_s3(prev.src0) && is_imm(prev.src1, 0xffu)) ||
+					      (is_s3(prev.src1) && is_imm(prev.src0, 0xffu))))) {
+						tracked_s3_low_byte[prev.dst.reg] = true;
+					}
+				}
+			}
+			last_non_nop = i;
+		}
+	}
+
+	if (ls_branch_index >= full.instructions.size() || last_non_nop >= ls_branch_index) {
+		return false;
+	}
+	const auto& ls_branch  = full.instructions[ls_branch_index];
+	const auto  handoff_pc = ls_branch.branch_target;
+	if (ls_branch.opcode != Opcode::S_CBRANCH_EXECZ || handoff_pc <= ls_branch.pc) {
+		return false;
+	}
+	ls_cmp_index       = last_non_nop;
+	const auto& ls_cmp = full.instructions[ls_cmp_index];
+	if (ls_cmp.dst.kind != OperandKind::ExecLo ||
+	    (!OperandReadsS3LowByte(ls_cmp.src0, tracked_s3_low_byte) &&
+	     !OperandReadsS3LowByte(ls_cmp.src1, tracked_s3_low_byte))) {
+		return false;
+	}
+
+	handoff_index = full.instructions.size();
+	for (size_t i = ls_branch_index + 1u; i < full.instructions.size(); i++) {
+		if (full.instructions[i].pc == handoff_pc) {
+			handoff_index = i;
+			break;
+		}
+	}
+	if (handoff_index <= ls_branch_index + 1u || handoff_index >= full.instructions.size()) {
+		return false;
+	}
+	if (!IsExecRestoreInstruction(full.instructions[handoff_index])) {
+		return false;
+	}
+	for (size_t i = ls_branch_index + 1u; i < handoff_index; i++) {
+		const auto& inst = full.instructions[i];
+		if (IsDirectBranch(inst.opcode) &&
+		    (inst.branch_target <= ls_branch.pc || inst.branch_target > handoff_pc)) {
+			return false;
+		}
+	}
+	for (size_t i = handoff_index; i < full.instructions.size(); i++) {
+		const auto& inst = full.instructions[i];
+		if (IsDirectBranch(inst.opcode) && inst.branch_target < handoff_pc) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool HasSwapPc(const std::vector<Instruction>& instructions) {
+	return std::ranges::any_of(instructions, [](const Instruction& inst) {
+		return inst.opcode == Opcode::S_SWAPPC_B64;
+	});
+}
+
 } // namespace
 
 bool IsConditionalBranch(Opcode opcode) {
@@ -384,6 +543,69 @@ Program DecodeFrontProgram(std::span<const uint32_t> front) {
 	        result.instructions.back().opcode != Opcode::S_SETPC_B64);
 	result.code = front.first(front_words);
 	return result;
+}
+
+Program DecodeLocalProgram(std::span<const uint32_t> local) {
+	if (HasFrontSetPcTerminator(local)) {
+		auto  result      = DecodeFrontProgram(local);
+		auto& handoff     = result.instructions.back();
+		handoff.opcode    = Opcode::S_ENDPGM;
+		handoff.src_count = 0;
+		handoff.dst       = {};
+		return result;
+	}
+	Program full;
+	DecodeProgram(local, full);
+	size_t ls_cmp_index  = 0;
+	size_t handoff_index = 0;
+	EXIT_NOT_IMPLEMENTED(!TrySplitMergedHsProgram(full, ls_cmp_index, handoff_index));
+	const auto handoff_pc = full.instructions[handoff_index].pc;
+	full.instructions.resize(handoff_index);
+	Instruction end;
+	end.pc         = handoff_pc;
+	end.word_count = 1;
+	end.family     = Family::SOPP;
+	end.opcode     = Opcode::S_ENDPGM;
+	full.instructions.push_back(end);
+	full.has_swap_pc = HasSwapPc(full.instructions);
+	return full;
+}
+
+Program DecodeControlProgram(std::span<const uint32_t> control) {
+	Program full;
+	DecodeProgram(control, full);
+	size_t ls_cmp_index  = 0;
+	size_t handoff_index = 0;
+	if (!TrySplitMergedHsProgram(full, ls_cmp_index, handoff_index)) {
+		return full;
+	}
+	const auto handoff_pc = full.instructions[handoff_index].pc;
+	auto&      jump       = full.instructions[ls_cmp_index];
+	const auto jump_pc    = jump.pc;
+	jump                  = {};
+	jump.pc               = jump_pc;
+	jump.word_count       = 1;
+	jump.family           = Family::SOPP;
+	jump.opcode           = Opcode::S_BRANCH;
+	jump.branch_target    = handoff_pc;
+
+	full.instructions.erase(full.instructions.begin() + static_cast<ptrdiff_t>(ls_cmp_index + 1u),
+	                        full.instructions.begin() + static_cast<ptrdiff_t>(handoff_index));
+
+	for (size_t idx = ls_cmp_index + 1u; idx < full.instructions.size(); idx++) {
+		auto& inst = full.instructions[idx];
+		if (!IsHandoffPrefixOpcode(inst.opcode)) {
+			break;
+		}
+		if (inst.opcode == Opcode::S_BARRIER) {
+			inst.opcode    = Opcode::S_NOP;
+			inst.src_count = 0;
+			inst.dst       = {};
+			break;
+		}
+	}
+	full.has_swap_pc = HasSwapPc(full.instructions);
+	return full;
 }
 
 void DecodeProgram(std::span<const uint32_t> code, Program& program) {

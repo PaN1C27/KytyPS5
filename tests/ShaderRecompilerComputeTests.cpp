@@ -51064,6 +51064,109 @@ void CheckTessellationWaveSizes(VulkanHarness &vulkan) {
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
+// Native pre-fused Prospero::ShaderBinaryType::kHs binaries bind only ls_regs.data_addr with
+// hs_regs.data_addr == 0 and hs_regs.user_data_addr == 0, sharing hs_user_sgpr from s8.
+void CheckMergedHsTessellationPrepare(VulkanHarness &vulkan) {
+  using namespace ShaderRecompiler;
+  constexpr const char *name = "MergedHsTessellationPrepare";
+  std::vector<u32> merged;
+  merged.push_back(EncodeSopp(0x20u, 3u));                   // s_clause 3
+  merged.push_back(EncodeSop1(0x04u, 126u, 193u));           // s_mov_b64 exec, -1
+  AppendVop3(&merged, 0x365u, 0u, 193u, InlineU32(0u));      // v_mbcnt_lo_u32_b32 v0, -1, 0
+  AppendVop3(&merged, 0x366u, 0u, 193u, Vgpr(0u));           // v_mbcnt_hi_u32_b32 v0, -1, v0
+  merged.push_back(EncodeVopc(0xd4u, 249u, 0u));             // v_cmpx_gt_u32_sdwa s3.b0, v0
+  merged.push_back(EncodeVopcSdwa(3u, 0u, 0u, 0u, 6u, 0u, 0u, 0u, 0u, 0u, 0u, 1u, 0u));
+  const size_t ls_branch = merged.size();
+  merged.push_back(0u);
+  merged.push_back(EncodeVop2(0x0bu, 4u, 255u, 3u)); // v4 = v3 * 0x50
+  merged.push_back(0x50u);
+  merged.push_back(EncodeDs0(0x0eu, (3u << 8u) | 1u));
+  merged.push_back(EncodeDs1Ex(0u, 5u, 2u, 4u));
+  const size_t handoff = merged.size();
+  merged[ls_branch] = EncodeSopp(0x08u, static_cast<u32>(handoff - ls_branch - 1u));
+  merged.push_back(EncodeSop1(0x04u, 126u, 193u)); // s_mov_b64 exec, -1
+  merged.push_back(EncodeSopp(0x0au, 0u));         // s_barrier (LS->HS handoff)
+  merged.push_back(EncodeVopc(0xd1u, 249u, 3u));   // v_cmpx_lt_u32_sdwa v0, s3.b1
+  merged.push_back(EncodeVopcSdwa(0u, 0u, 0u, 6u, 1u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 1u));
+  const size_t hs_branch = merged.size();
+  merged.push_back(0u);
+  AppendVop3(&merged, 0x148u, 4u, Vgpr(1u), InlineU32(8u), InlineU32(5u));
+  AppendVop3(&merged, 0x148u, 5u, Vgpr(1u), InlineU32(0u), InlineU32(8u));
+  merged.push_back(EncodeVop2(0x0bu, 6u, 255u, 4u));
+  merged.push_back(0x50u);
+  merged.push_back(EncodeDs0(0x37u, (3u << 8u) | 1u));
+  merged.push_back(EncodeDs1Ex(7u, 0u, 0u, 6u));
+  AppendVop3(&merged, 0x143u, 9u, 255u, Vgpr(5u), Vgpr(6u));
+  merged.push_back(4u * 0x50u);
+  merged.push_back(EncodeMubuf0(0x1cu, 4u, false, true));
+  merged.push_back(EncodeMubuf1(7u, 0u, 9u, 2u));
+  merged.push_back(EncodeVopc(0xd4u, InlineU32(1u), 4u));
+  for (u32 r = 11u; r < 15u; r++) {
+    AppendVMovLiteral(&merged, r, 0x3f800000u);
+  }
+  merged.push_back(EncodeVop1(0x01u, 15u, InlineU32(0u)));
+  merged.push_back(EncodeMubuf0(0x1eu, 0u, false, true));
+  merged.push_back(EncodeMubuf1(11u, 0u, 15u, 4u));
+  const size_t end_word = merged.size();
+  merged[hs_branch] = EncodeSopp(0x08u, static_cast<u32>(end_word - hs_branch - 1u));
+  AppendEnd(&merged);
+
+  std::vector<u32> evaluation;
+  AppendVop3(&evaluation, 0x169u, 24u, 255u, Vgpr(7u));
+  evaluation.push_back(4u * 0x50u);
+  evaluation.push_back(EncodeMubuf0(0x0du, 4u, false, true));
+  evaluation.push_back(EncodeMubuf1(10u, 2u, 24u, 4u));
+  evaluation.push_back(EncodeExp0(0x0cu, 0xfu));
+  evaluation.push_back(EncodeExp1(10u, 10u, 10u, 10u));
+  AppendEnd(&evaluation);
+
+  static ShaderUserData user_data{};
+  const auto map = [](const std::vector<u32> &code, Prospero::ShaderBinaryType type) {
+    ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+                      {.type = type, .user_data = &user_data,
+                       .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+  };
+  map(merged, Prospero::ShaderBinaryType::kHs);
+  map(evaluation, Prospero::ShaderBinaryType::kGs);
+
+  HW::VertexShaderInfo regs{};
+  regs.ls_regs.data_addr = reinterpret_cast<uint64_t>(merged.data());
+  regs.hs_regs.data_addr = 0;
+  regs.hs_regs.user_data_addr = 0;
+  regs.hs_regs.rsrc2.user_sgpr = 2;
+  regs.hs_user_sgpr.value[0] = 0x1111u;
+  regs.hs_user_sgpr.value[1] = 0x2222u;
+  regs.es_regs.data_addr = reinterpret_cast<uint64_t>(evaluation.data());
+
+  HW::Context context;
+  context.SetShaderStages(0x0260210du); // VS_EN=LS(1) | HS_EN(4) | ES_EN=TES | W32
+  context.SetLsHsConfig(0x00010404u);   // 4 input and 4 output control points
+  context.SetTfParam(0x00000049u);      // triangles, fractional odd, cw
+
+  std::array<ShaderVertexInputInfo, 3> info{};
+  const auto params = PrepareTessellationPrograms(regs, context, info);
+  AnalyzeTessellationPrograms(params[0].code, params[1].code, info[0].tess);
+  for (auto &stage : info) stage.tess = info[0].tess;
+
+  Require(name, "shared merged hash",
+          params[0].hash == params[1].hash && params[1].user_data_count == 10u &&
+              params[1].user_data[0] == 0u && params[1].user_data[8] == 0x1111u &&
+              params[1].user_data[9] == 0x2222u,
+          "merged kHs prepare did not reuse LS hash and user SGPRs from s8");
+
+  PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+  const auto *ls_mod = PipelineCacheTestAccess::GetProgram(cache, params[0], info[0]);
+  const auto *hs_mod = PipelineCacheTestAccess::GetProgram(cache, params[1], info[1]);
+  const auto *tes_mod = PipelineCacheTestAccess::GetProgram(cache, params[2], info[2]);
+  Require(name, "compiled distinct Vulkan modules",
+          ls_mod != nullptr && hs_mod != nullptr && tes_mod != nullptr && ls_mod != hs_mod &&
+              ls_mod->info.stage == ShaderType::Local &&
+              hs_mod->info.stage == ShaderType::TessellationControl &&
+              tes_mod->info.stage == ShaderType::TessellationEvaluation,
+          "merged kHs did not compile distinct LS/HS/TES Vulkan shader modules");
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
 // Module ids come from the module inputs, not from the order of compilation.
 void CheckStableProgramIds(VulkanHarness &vulkan) {
   constexpr const char *name = "StableProgramIds";
@@ -58564,6 +58667,7 @@ int main(int argc, char **argv) {
     CheckTessellationPrograms();
     CheckEmbeddedFetchVertexOffset();
     CheckTessellationWaveSizes(vulkan);
+    CheckMergedHsTessellationPrepare(vulkan);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--cmpx-eq-u16-only") == 0) {
@@ -59715,6 +59819,7 @@ int main(int argc, char **argv) {
   vulkan.CheckNativeIndirectDispatch();
   CheckComputeLdsLimit(vulkan);
   CheckTessellationWaveSizes(vulkan);
+  CheckMergedHsTessellationPrepare(vulkan);
   CheckStableProgramIds(vulkan);
   CheckComputeQueueModules(vulkan);
   CheckGraphicsPushDataModules(vulkan);

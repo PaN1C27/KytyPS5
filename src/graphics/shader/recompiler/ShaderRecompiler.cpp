@@ -485,10 +485,9 @@ ShaderSource PrepareShaderSource(std::span<const uint32_t> code, const CompileOp
 	if (!options.back_code.empty()) {
 		source.decoded = DecodeFusedProgram(code, options.back_code, source.code);
 	} else if (options.stage == ShaderType::Local) {
-		source.decoded = Decoder::DecodeFrontProgram(code);
-		auto& handoff = source.decoded.instructions.back();
-		handoff.opcode = Decoder::Opcode::S_ENDPGM;
-		handoff.src_count = 0;
+		source.decoded = Decoder::DecodeLocalProgram(code);
+	} else if (options.stage == ShaderType::TessellationControl) {
+		source.decoded = Decoder::DecodeControlProgram(code);
 	} else {
 		Decoder::DecodeProgram(code, source.decoded);
 	}

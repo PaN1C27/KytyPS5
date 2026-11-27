@@ -163,6 +163,7 @@ void ReflectTessellationLayout(const Decoder::Program& program, bool local,
 			const auto third = read(inst.src2);
 			Address    value;
 			switch (inst.opcode) {
+				case Opcode::V_MOV_B32: value = lhs; break;
 				case Opcode::V_BFE_U32:
 					if (lhs.kind == Kind::PackedControlPoint && rhs.kind == Kind::Affine &&
 					    rhs.coefficient == 0u && third.kind == Kind::Affine &&
@@ -277,9 +278,8 @@ IR::Value ActiveAddress(IR::Block& block, IR::Block::iterator before, IR::Value 
 
 void AnalyzeTessellationPrograms(std::span<const uint32_t> local, std::span<const uint32_t> control,
                                  ShaderTessellationInputInfo& info) {
-	const auto       local_program = Decoder::DecodeFrontProgram(local);
-	Decoder::Program control_program;
-	Decoder::DecodeProgram(control, control_program);
+	const auto local_program   = Decoder::DecodeLocalProgram(local);
+	const auto control_program = Decoder::DecodeControlProgram(control);
 	ReflectTessellationLayout(local_program, true, info);
 	ReflectTessellationLayout(control_program, false, info);
 	LOGF("Tessellation interface: input_cp=%u output_cp=%u ls_stride=%u hs_stride=%u "

@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/Tessellation.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
@@ -14303,6 +14304,116 @@ void TestDynamicIndirectBufferCollapsesStridesAndPadsCapacity() {
         "dynamic indirect buffer missed NonUniform storage buffer capability");
 }
 
+void TestMergedHsProgramSplittingAndReflection() {
+  using namespace ShaderRecompiler;
+
+  for (const bool with_handoff_barrier : {false, true}) {
+    std::vector<uint32_t> code;
+    const auto push_vop3 = [&](uint32_t op, uint32_t dst, uint32_t src0, uint32_t src1,
+                               uint32_t src2 = 0) {
+      code.push_back(EncodeVop3Word0(op, dst));
+      code.push_back(EncodeVop3Word1(src0, src1, src2));
+    };
+
+    // Merged LS-HS prolog: compute lane ID into v0 and gate LS lanes on s3[7:0].
+    code.push_back(EncodeSopp(0x20u, 3u));                   // s_clause 3
+    code.push_back(EncodeSop1(0x04u, 126u, 193u));           // s_mov_b64 exec, -1
+    push_vop3(0x365u, 0u, 193u, 128u);                       // v_mbcnt_lo_u32_b32 v0, -1, 0
+    push_vop3(0x366u, 0u, 193u, 256u);                       // v_mbcnt_hi_u32_b32 v0, -1, v0
+    code.push_back(EncodeVopc(0xd4u, 249u, 0u));             // v_cmpx_gt_u32_sdwa s3.b0, v0
+    code.push_back(EncodeVopcSdwa(3u, 0u, 0u, 0u, 6u, 0u, 0u, 0u, 0u, 0u, 0u, 1u, 0u));
+    const size_t ls_branch_word = code.size();
+    code.push_back(0u); // s_cbranch_execz <handoff>
+
+    // LS body: multiply v3 by 0x50 and store 2 dwords to LDS.
+    code.push_back(EncodeVop2(0x0bu, 4u, 255u, 3u)); // v_mul_u32_u24 v4, 0x50, v3
+    code.push_back(0x50u);
+    code.push_back(EncodeDs0(0x0eu, (3u << 8u) | 1u)); // ds_write2_b32 v4, v2, v5
+    code.push_back(EncodeDs1Ex(0u, 5u, 2u, 4u));
+
+    const size_t handoff_word = code.size();
+    code[ls_branch_word] =
+        EncodeSopp(0x08u, static_cast<uint32_t>(handoff_word - ls_branch_word - 1u));
+
+    // HS handoff: restore exec, optional wait/barrier, then gate HS lanes on s3[15:8].
+    code.push_back(EncodeSop1(0x04u, 126u, 193u)); // s_mov_b64 exec, -1
+    if (with_handoff_barrier) {
+      code.push_back(EncodeSopp(0x0au, 0u)); // s_barrier (LS->HS sync to strip)
+    }
+    code.push_back(EncodeVopc(0xd1u, 249u, 3u)); // v_cmpx_lt_u32_sdwa v0, s3.b1
+    code.push_back(EncodeVopcSdwa(0u, 0u, 0u, 6u, 1u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 1u));
+    const size_t hs_branch_word = code.size();
+    code.push_back(0u); // s_cbranch_execz <end>
+
+    // HS body: unpack control point & relative patch, read LDS, store HS control/patch/factors.
+    push_vop3(0x148u, 4u, 256u + 1u, 128u + 8u, 128u + 5u); // v4 = cp = v1[12:8]
+    push_vop3(0x148u, 5u, 256u + 1u, 128u + 0u, 128u + 8u); // v5 = patch = v1[7:0]
+    code.push_back(EncodeVop2(0x0bu, 6u, 255u, 4u));        // v6 = cp * 0x50
+    code.push_back(0x50u);
+    code.push_back(EncodeDs0(0x37u, (3u << 8u) | 1u));      // ds_read2_b32 v[7:8], v6
+    code.push_back(EncodeDs1Ex(7u, 0u, 0u, 6u));
+    push_vop3(0x143u, 9u, 255u, 256u + 5u, 256u + 6u); // v9 = patch * (4 * 0x50) + cp * 0x50
+    code.push_back(4u * 0x50u);
+    code.push_back(EncodeMubuf0(0x1cu, 4u, false) | (1u << 12u)); // buffer_store_dword s2, offen
+    code.push_back(EncodeMubuf1(7u, 0u, 9u, 2u));
+
+    // Patch constants and outer/inner tessellation factors written on cp == 0.
+    code.push_back(EncodeVopc(0xd4u, 128u + 1u, 4u)); // v_cmpx_gt_u32 1, v4
+    code.push_back(EncodeVop1(0x01u, 11u, 242u));     // v11 = 1.0f
+    code.push_back(EncodeVop1(0x01u, 12u, 242u));
+    code.push_back(EncodeVop1(0x01u, 13u, 242u));
+    code.push_back(EncodeVop1(0x01u, 14u, 242u));
+    code.push_back(EncodeVop1(0x01u, 15u, 255u));     // v15 = 0x8000
+    code.push_back(0x8000u);
+    code.push_back(EncodeMubuf0(0x1eu, 0u, false) | (1u << 12u)); // patch constant x4 @ 0x8000
+    code.push_back(EncodeMubuf1(11u, 0u, 15u, 2u));
+    code.push_back(EncodeVop1(0x01u, 15u, 128u));                 // factor offset = 0
+    code.push_back(EncodeMubuf0(0x1eu, 0u, false) | (1u << 12u)); // factors x4 via s4
+    code.push_back(EncodeMubuf1(11u, 0u, 15u, 4u));
+
+    const size_t end_word = code.size();
+    code[hs_branch_word] = EncodeSopp(0x08u, static_cast<uint32_t>(end_word - hs_branch_word - 1u));
+    code.push_back(EncodeSopp(0x01u, 0u)); // s_endpgm
+
+    ShaderTessellationInputInfo tess{
+        .input_control_points = 4u,
+        .output_control_points = 4u,
+        .domain = 1u,          // triangles
+        .partitioning = 2u,    // fractional odd
+        .output_topology = 2u, // cw
+    };
+    AnalyzeTessellationPrograms(code, code, tess);
+    Check(tess.ls_stride == 0x50u && tess.hs_stride == 0x50u && tess.patch_base == 0x8000u &&
+              tess.patch_size == 16u,
+          "merged kHs reflection did not recover LS/HS strides and patch constant range");
+
+    ShaderVertexInputInfo vertex_info{};
+    vertex_info.float_mode = 0xc0u;
+    vertex_info.wave_size = 64u;
+    vertex_info.tess = tess;
+    const std::array<uint32_t, 8> user_data{};
+    for (const ShaderType stage : {ShaderType::Local, ShaderType::TessellationControl}) {
+      vertex_info.logical_stage = stage;
+      CompileOptions options{.stage = stage,
+                             .wave_size = 64u,
+                             .user_data_base = 8u,
+                             .emit_debug_info = true,
+                             .user_data = user_data};
+      options.input_info.vertex = &vertex_info;
+      auto compiled = CompileProgram(TranslateProgram(code, options), options, {});
+      CheckSpirvBinaryValidates(compiled.spirv);
+      const std::string asm_text = DisassembleSpirvBinary(compiled.spirv);
+      Check(!SpirvContainsOpcode(compiled.spirv, 224u),
+            "merged kHs LS/HS stages must not emit an OpControlBarrier for the handoff barrier");
+      if (stage == ShaderType::TessellationControl) {
+        Check(asm_text.find("BuiltIn InvocationId") != std::string::npos &&
+                  asm_text.find("BuiltIn SubgroupLocalInvocationId") == std::string::npos,
+              "merged kHs HS stage must lower lane IDs via InvocationId");
+      }
+    }
+  }
+}
+
 #include "ShaderRayTracingTests.inc"
 
 } // namespace
@@ -14532,6 +14643,7 @@ int main() {
   TestNewShaderRecompilerVop3LaneReadDestinationEncoding();
   TestLargeMixedIndirectBufferAndImageUsesCompactShaderDataMap();
   TestDynamicIndirectBufferCollapsesStridesAndPadsCapacity();
+  TestMergedHsProgramSplittingAndReflection();
 
   return 0;
 }
