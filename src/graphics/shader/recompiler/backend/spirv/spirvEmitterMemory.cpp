@@ -262,9 +262,11 @@ uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address, bool coherent = f
 	const auto present =
 	    Binary(state, spv::OpINotEqual, TypeBool(state), bda, ConstantU64(state, 0));
 	// A page that no buffer backs yet reads as zero, except in BVH traversal shaders: there it
-	// reads as all ones, the absent-node link bvh_intersect returns, because guest list walks end
-	// on negative links and would advance over zero entries forever.
-	const auto missing = ConstantU32(state, state.program.info.bvh ? ~0u : 0u);
+	// reads as all ones, the absent-node link bvh_intersect and trinity_bvh_intersect return,
+	// because guest list and parent-pointer walks end on negative links and would advance over
+	// zero entries forever.
+	const bool bvh_traversal = state.program.info.bvh || state.program.info.bvh8;
+	const auto missing       = ConstantU32(state, bvh_traversal ? ~0u : 0u);
 	return EmitValueOrDefaultIfCondition(state, present, TypeU32(state), missing, [&]() {
 		return LoadBdaDwordFromPointer(state, bda, coherent);
 	});
@@ -1201,16 +1203,17 @@ uint32_t LoadIndirectBuffer(ValueEmitContext& ctx, const IndirectBufferAccess& b
 		    });
 		    const auto any_present =
 		        Binary(state, spv::OpLogicalOr, TypeBool(state), first.present, last.present);
+		    const bool bvh_traversal = state.program.info.bvh || state.program.info.bvh8;
 		    const auto missing = ConstantU32(
-		        state, state.program.info.bvh ? (bits == 32u ? ~0u : ((1u << bits) - 1u)) : 0u);
+		        state, bvh_traversal ? (bits == 32u ? ~0u : ((1u << bits) - 1u)) : 0u);
 		    std::array<uint32_t, 4> fallback {};
 		    for (uint32_t component = 0; component < components; ++component) {
-			    fallback[component] = state.program.info.bvh
+			    fallback[component] = bvh_traversal
 			                              ? Select(state, TypeU32(state), comp_in_bounds[component],
 			                                       missing, ConstantU32(state, 0))
 			                              : ConstantU32(state, 0);
 		    }
-		    const auto fallback_composite = state.program.info.bvh
+		    const auto fallback_composite = bvh_traversal
 		                                        ? ConstructU32Composite(state, components, fallback)
 		                                        : ConstantU32CompositeZero(state, components);
 		    return EmitValueOrDefaultIfCondition(

@@ -287,6 +287,81 @@ TestCase TrinityBvhAliases() {
   return test;
 }
 
+TestCase TrinityBvhUnbackedBdaReads() {
+  TestCase test;
+  test.name = "TrinityBvhUnbackedBdaReads";
+  constexpr uint64_t GuestBase = 0x0000000110000000ull;
+  constexpr uint64_t UnmappedGlobal = GuestBase + 0x100000ull;
+  constexpr uint64_t UnmappedIndirect = GuestBase + 0x200000ull;
+  constexpr u32 DescByteOffset = 256u;
+  constexpr u32 OutputDwordOffset = 128u;
+
+  test.initial.assign(256u, 0u);
+  test.initial[DescByteOffset / 4u + 0u] = static_cast<u32>(UnmappedIndirect);
+  test.initial[DescByteOffset / 4u + 1u] = static_cast<u32>((UnmappedIndirect >> 32u) & 0xffffu);
+  test.initial[DescByteOffset / 4u + 2u] = 8u;
+  test.initial[DescByteOffset / 4u + 3u] =
+      DstSel(4, 5, 6, 7) |
+      (static_cast<u32>(Prospero::BufferFormat::k32_32UInt) << 12u) |
+      (3u << 28u);
+  test.expected = test.initial;
+  test.expected[OutputDwordOffset + 0u] = 0xffffffffu;
+  test.expected[OutputDwordOffset + 1u] = 0xffffffffu;
+  test.expected[OutputDwordOffset + 2u] = 0u;
+  test.expected[OutputDwordOffset + 3u] = 0x7f800000u;
+
+  auto &code = test.code;
+  // Set info.bvh8 via IMAGE_BVH8_INTERSECT_RAY with an invalid descriptor (fast ~0u miss),
+  // then verify unbacked BDA global and indirect buffer loads both return ~0u for in-bounds dwords.
+  AppendSMovLiteral(&code, 8, GuestBase >> 8u);
+  AppendSMovLiteral(&code, 9, 0u);
+  AppendSMovLiteral(&code, 10, 0u);
+  AppendSMovLiteral(&code, 11, 0u);
+  code.push_back(EncodeSop1(0x04, 126, 129)); // s_mov_b32 exec_lo, 1
+  for (u32 reg = 4u; reg <= 15u; ++reg) AppendVMovU32(&code, reg, 0u);
+  code.insert(code.end(), {EncodeMimg0(0xe5, 15, 2, false, 0, true), EncodeMimg1(32, 4, 2),
+                           0x08070605u, 0x00000e0bu});
+
+  // Load index 0 from test buffer so s[12:15] becomes an indirect buffer V#.
+  AppendVMovU32(&code, 30, 0u);
+  code.push_back(EncodeMubuf0(0x0cu, 0u, false, true));
+  code.push_back(EncodeMubuf1(2u, 0u, 30u));
+  code.push_back(EncodeSopp(0x0cu, 0u));
+  code.push_back(EncodeVop1(0x02u, 20u, Vgpr(2u)));
+  code.push_back(EncodeSop2(0x1eu, 20u, 20u, InlineU32(5u)));
+  code.push_back(EncodeSmem0(0x0au, 12u, 0u));
+  code.push_back(EncodeSmem1(DescByteOffset, 20u));
+  code.push_back(EncodeSopp(0x0cu, 0u));
+
+  // Unbacked BDA GLOBAL_LOAD_DWORD -> ~0u.
+  AppendVMovLiteral(&code, 4u, static_cast<u32>(UnmappedGlobal));
+  AppendVMovU32(&code, 5u, static_cast<u32>(UnmappedGlobal >> 32u));
+  code.push_back(EncodeFlat0(0x0cu, 2u));
+  code.push_back(EncodeFlat1(3u, 0x7du, 0u, 4u));
+  code.push_back(EncodeSopp(0x0cu, 0u));
+
+  // Unbacked indirect BUFFER_LOAD_DWORDX2 at byte offset 4 with NumRecords=8 -> {~0u, 0u}.
+  AppendVMovU32(&code, 8u, 4u);
+  code.push_back(EncodeMubuf0(0x0du, 0u, false, true));
+  code.push_back(EncodeMubuf1(6u, 3u, 8u));
+  code.push_back(EncodeSopp(0x0cu, 0u));
+
+  AppendStoreVgpr(&code, 3u, OutputDwordOffset + 0u);
+  AppendStoreVgpr(&code, 6u, OutputDwordOffset + 1u);
+  AppendStoreVgpr(&code, 7u, OutputDwordOffset + 2u);
+  AppendStoreVgpr(&code, 32u, OutputDwordOffset + 3u);
+  AppendEnd(&code);
+
+  test.bda_mappings = {{GuestBase, 0u}};
+  test.compute_info.wave_size = 32u;
+  test.compute_info.threads_num[0] = 1u;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+  test.compute_info.thread_ids_num = 1u;
+  test.has_compute_info = true;
+  test.required_spirv = {"trinity_bvh_intersect", "get_bda_pointer", "load_indirect_buffer_32x2"};
+  return test;
+}
+
 std::vector<TestCase> TrinityBvhCases() {
   return {TrinityBvhIntersections(false, true, false, false),
           TrinityBvhIntersections(false, true, true, true),
@@ -299,7 +374,8 @@ std::vector<TestCase> TrinityBvhCases() {
           TrinityBvhIntersections(true, true, true, true, 0, false, 64),
           TrinityBvhIntersections(false, true, false, false, 0, false, 32, true),
           TrinityBvhIntersections(true, true, false, false, 0, false, 32, true),
-          TrinityBvhAliases()};
+          TrinityBvhAliases(),
+          TrinityBvhUnbackedBdaReads()};
 }
 
 TestCase TrinityStack(u32 wave_size, u32 capacity, bool storage = false) {

@@ -66,6 +66,16 @@ void TestTrinityBvhInstruction() {
             SpirvInstructionOpcodeCount(result.spirv, 246u) == 1,
         "Trinity BVH8 duplicated helpers or unrolled its four-child loop");
   CheckSpirvBinaryValidates(RecompileForTest(code, MakeCompileOptions(ShaderType::Pixel)).spirv);
+  ShaderComputeInputInfo reset_compute{};
+  auto reset_options = MakeCompileOptions(ShaderType::Compute);
+  reset_options.input_info.compute = &reset_compute;
+  auto reset_program = RecompileForTest(std::array{EncodeSopp(0x01)}, reset_options).program;
+  reset_program.info.bvh8 = true;
+  reset_program.info.bvh_stack = true;
+  reset_program.shader_info_complete = false;
+  ShaderRecompiler::IR::CollectShaderInfo(reset_program, reset_options.input_info);
+  Check(!reset_program.info.bvh8 && !reset_program.info.bvh_stack,
+        "CollectShaderInfo did not reset Trinity BVH flags");
   for (const auto words : {std::array{0xf1949f05u, 0x40010000u, 0x0a030201u, 0x0000040du},
                            std::array{0xf1949f05u, 0x0001f700u, 0x0a030201u, 0x0000040du},
                            std::array{0xf1949f05u, 0x00010000u, 0xfe030201u, 0x0000040du},
