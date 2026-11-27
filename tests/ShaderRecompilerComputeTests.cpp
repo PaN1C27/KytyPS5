@@ -346,6 +346,15 @@ struct TextureCacheTestAccess {
   static_assert(TextureCache::ImagePageTable::kFirstLevelBits == 14);
 
   static uint64_t GcTick(const TextureCache &cache) { return cache.m_gc_tick; }
+  static uint64_t TriggerGcMemory(const TextureCache &cache) {
+    return cache.m_trigger_gc_memory;
+  }
+  static uint64_t PressureGcMemory(const TextureCache &cache) {
+    return cache.m_pressure_gc_memory;
+  }
+  static uint64_t CriticalGcMemory(const TextureCache &cache) {
+    return cache.m_critical_gc_memory;
+  }
   // Suspend points that collect nothing.
   static void SkipFrames(TextureCache &cache, uint64_t frames) {
     cache.m_gc_tick += frames;
@@ -364,10 +373,11 @@ struct TextureCacheTestAccess {
 
   static void ConfigureGarbageCollection(TextureCache &cache,
                                          std::span<const ImageId> oldest,
-                                         uint64_t tick, uint64_t pressure) {
+                                         uint64_t tick, uint64_t pressure,
+                                         uint64_t critical = UINT64_MAX) {
     cache.m_trigger_gc_memory = 0;
     cache.m_pressure_gc_memory = pressure;
-    cache.m_critical_gc_memory = UINT64_MAX;
+    cache.m_critical_gc_memory = critical;
     cache.m_gc_tick = tick;
     std::vector<ImageId> live;
     cache.m_lru_cache = {};
@@ -11162,8 +11172,18 @@ public:
                                               &gc_stale_values[index],
                                               sizeof(uint32_t));
       }
+      if (context.GetGraphics().CanReportMemoryUsage()) {
+        constexpr uint64_t kOneGiB = 1024ull * 1024 * 1024;
+        Require(name, "GC memory threshold ordering",
+                TextureCacheTestAccess::TriggerGcMemory(texture_cache) >= kOneGiB &&
+                    TextureCacheTestAccess::TriggerGcMemory(texture_cache) <
+                        TextureCacheTestAccess::PressureGcMemory(texture_cache) &&
+                    TextureCacheTestAccess::PressureGcMemory(texture_cache) <
+                        TextureCacheTestAccess::CriticalGcMemory(texture_cache),
+                "TextureCache GC thresholds violated 1 GiB <= trigger < pressure < critical");
+      }
       TextureCacheTestAccess::ConfigureGarbageCollection(
-          texture_cache, gc_images, 17, UINT64_MAX);
+          texture_cache, gc_images, 161, UINT64_MAX);
       texture_cache.RunGarbageCollector();
       Require(name, "downloadable image pre-pressure retention",
               std::ranges::all_of(gc_images,
@@ -11782,7 +11802,7 @@ public:
                                   [](ImageId image) { return bool{image}; }),
           "failed to create eleven depth/stencil association pairs");
       TextureCacheTestAccess::ConfigureGarbageCollection(
-          texture_cache, gc_depth_lru, 81, UINT64_MAX);
+          texture_cache, gc_depth_lru, 161, UINT64_MAX);
       texture_cache.RunGarbageCollector();
       bool gc_depth_budget = true;
       for (size_t index = 0; index < gc_depth_pair_count; index++) {
@@ -11875,7 +11895,7 @@ public:
         }
       }
       TextureCacheTestAccess::ConfigureGarbageCollection(
-          texture_cache, gc_kept_lru, 17, UINT64_MAX);
+          texture_cache, gc_kept_lru, 161, UINT64_MAX);
       texture_cache.RunGarbageCollector();
       Require(name, "kept images outside the deletion budget",
               !TextureCacheTestAccess::Contains(texture_cache,
@@ -11888,6 +11908,31 @@ public:
                       }),
               "kept GPU or heap-referenced images spent the deletion budget "
               "of the aged clean image behind them");
+
+      auto gc_tier_desc = MakeLinearDesc(
+          base + 0x2ec0000, sizeof(uint32_t), vk::Format::eR32Uint,
+          Prospero::BufferFormat::k32UInt, Prospero::ImageType::kColor2D,
+          {1, 1, 1}, 1, 4, 1);
+      const auto gc_tier_image = texture_cache.FindImage(gc_tier_desc);
+      (void)texture_cache.FindTexture(gc_tier_image, gc_tier_desc);
+      TextureCacheTestAccess::ConfigureGarbageCollection(
+          texture_cache, std::array{gc_tier_image}, 20, UINT64_MAX);
+      texture_cache.RunGarbageCollector();
+      Require(name, "GC unpressured age tier (160)",
+              TextureCacheTestAccess::Contains(texture_cache, gc_tier_image),
+              "unpressured GC evicted a clean image idle for 20 frames");
+      TextureCacheTestAccess::ConfigureGarbageCollection(
+          texture_cache, std::array{gc_tier_image}, 20, 0);
+      texture_cache.RunGarbageCollector();
+      Require(name, "GC pressured age tier (80)",
+              TextureCacheTestAccess::Contains(texture_cache, gc_tier_image),
+              "pressured GC evicted a clean image idle for 20 frames");
+      TextureCacheTestAccess::ConfigureGarbageCollection(
+          texture_cache, std::array{gc_tier_image}, 20, 0, 0);
+      texture_cache.RunGarbageCollector();
+      Require(name, "GC critical age tier (16)",
+              !TextureCacheTestAccess::Contains(texture_cache, gc_tier_image),
+              "critical GC failed to evict a clean image idle for 20 frames");
 
       auto gc_tiled = MakeLinearDesc(
           base + 0x2f00000, 256 * 256 * sizeof(uint32_t),
@@ -59948,6 +59993,12 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     CheckSharedIndirectBufferLoads(vulkan);
     CheckCoalescedIndirectBufferMultiPageAndCompileTime(vulkan);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--unified-texture-cache-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckResidentImageHeap();
+    vulkan.CheckUnifiedTextureCacheFlow();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--runtime-buffer-only") == 0) {

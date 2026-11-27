@@ -138,7 +138,8 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 		    std::max<int64_t>(std::min(budget - 6 * threshold / 10, budget - GiB), GiB + GiB / 2));
 		m_critical_gc_memory = static_cast<uint64_t>(
 		    std::max<int64_t>(std::min(budget - 2 * threshold / 10, budget - GiB / 2), 3 * GiB));
-		m_trigger_gc_memory = static_cast<uint64_t>(std::max<int64_t>((budget - threshold) / 2, 0));
+		m_trigger_gc_memory = static_cast<uint64_t>(
+		    std::max<int64_t>(std::min(budget - 8 * threshold / 10, budget - 2 * GiB), GiB));
 	}
 }
 
@@ -2135,16 +2136,18 @@ void TextureCache::RunGarbageCollector() {
 	const auto collect = [&](bool allow_aggressive) {
 		bool     pressured  = m_total_used_memory >= m_pressure_gc_memory;
 		bool     aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
-		uint64_t age        = 16;
+		uint64_t age        = 160;
 		size_t   deletions  = 10;
 		if (aggressive) {
-			age       = 160;
+			age       = 16;
 			deletions = 40;
 		} else if (pressured) {
 			age       = 80;
 			deletions = 20;
 		}
-		age = std::min(age, tick);
+		if (tick < age) {
+			return;
+		}
 		std::vector<ImageId> candidates;
 		// Deleting depth recursively deletes its stencil association, so finish LRU traversal
 		// first.
