@@ -49,33 +49,104 @@ std::vector<Value> PhiWeb(Value value) {
 
 uint32_t PossibleU32Bits(Value value, const auto& normalize) {
 	std::unordered_map<const Inst*, uint32_t> known;
-	const auto visit = [&](auto&& self, Value at) -> uint32_t {
-		at = normalize(at);
+	struct Frame {
+		Value       at;
+		const Inst* inst = nullptr;
+		bool        post = false;
+	};
+	const auto read_bits = [&](Value raw) -> uint32_t {
+		const auto at = normalize(raw);
 		if (at.IsImmediate()) return at.GetType() == Type::U32 ? at.U32() : UINT32_MAX;
 		const auto* inst = at.TryInstruction();
 		if (inst == nullptr) return UINT32_MAX;
-		// Keep cycles unknown while sharing results across the SSA graph.
-		const auto [entry, inserted] = known.try_emplace(inst, UINT32_MAX);
-		if (!inserted) return entry->second;
-		auto& bits = entry->second;
-		const auto arg = [&](uint32_t index) { return self(self, inst->Arg(index)); };
-		switch (inst->GetOpcode()) {
-			case ValueOpcode::BitwiseAnd32: bits = arg(0) & arg(1); break;
-			case ValueOpcode::BitwiseOr32:
-			case ValueOpcode::UMax32: bits = arg(0) | arg(1); break;
-			case ValueOpcode::SelectU32: bits = arg(1) | arg(2); break;
-			case ValueOpcode::Phi: {
-				uint32_t merged = 0u;
-				for (uint32_t index = 0; index < inst->NumArgs(); ++index) merged |= arg(index);
-				if (inst->NumArgs() != 0u) bits = merged;
-				break;
+		const auto found = known.find(inst);
+		return found != known.end() ? found->second : UINT32_MAX;
+	};
+
+	std::vector<Frame> stack {{.at = value}};
+	while (!stack.empty()) {
+		const auto frame = stack.back();
+		stack.pop_back();
+		if (frame.post) {
+			const auto* inst = frame.inst;
+			const auto  arg  = [&](uint32_t index) { return read_bits(inst->Arg(index)); };
+			uint32_t    bits = UINT32_MAX;
+			switch (inst->GetOpcode()) {
+				case ValueOpcode::BitwiseAnd32: bits = arg(0) & arg(1); break;
+				case ValueOpcode::BitwiseOr32:
+				case ValueOpcode::UMax32: bits = arg(0) | arg(1); break;
+				case ValueOpcode::SelectU32: bits = arg(1) | arg(2); break;
+				case ValueOpcode::Phi: {
+					uint32_t merged = 0u;
+					for (uint32_t index = 0; index < inst->NumArgs(); ++index) merged |= arg(index);
+					if (inst->NumArgs() != 0u) bits = merged;
+					break;
+				}
+				case ValueOpcode::ShiftLeftLogical32:
+				case ValueOpcode::ShiftRightLogical32: {
+					const auto shift = inst->Arg(1).Resolve();
+					if (shift.IsImmediate() && shift.GetType() == Type::U32) {
+						bits = inst->GetOpcode() == ValueOpcode::ShiftLeftLogical32
+						           ? arg(0) << (shift.U32() & 31u)
+						           : arg(0) >> (shift.U32() & 31u);
+					}
+					break;
+				}
+				case ValueOpcode::BitFieldInsert: {
+					const auto offset = inst->Arg(2).Resolve();
+					const auto count  = inst->Arg(3).Resolve();
+					if (offset.IsImmediate() && count.IsImmediate() && offset.U32() < 32u &&
+					    count.U32() <= 32u - offset.U32()) {
+						const auto field =
+						    (count.U32() == 32u ? UINT32_MAX : (1u << count.U32()) - 1u)
+						    << offset.U32();
+						bits = (arg(0) & ~field) | ((arg(1) << offset.U32()) & field);
+					}
+					break;
+				}
+				default: break;
 			}
+			known[inst] = bits;
+			continue;
+		}
+		const auto at = normalize(frame.at);
+		if (at.IsImmediate()) continue;
+		const auto* inst = at.TryInstruction();
+		if (inst == nullptr) continue;
+		if (!known.try_emplace(inst, UINT32_MAX).second) continue;
+
+		const auto push_child = [&](uint32_t index) {
+			const auto child = normalize(inst->Arg(index));
+			if (const auto* ci = child.IsImmediate() ? nullptr : child.TryInstruction();
+			    ci != nullptr && !known.contains(ci)) {
+				stack.push_back({.at = child});
+			}
+		};
+		switch (inst->GetOpcode()) {
+			case ValueOpcode::BitwiseAnd32:
+			case ValueOpcode::BitwiseOr32:
+			case ValueOpcode::UMax32:
+				stack.push_back({.inst = inst, .post = true});
+				push_child(1u);
+				push_child(0u);
+				break;
+			case ValueOpcode::SelectU32:
+				stack.push_back({.inst = inst, .post = true});
+				push_child(2u);
+				push_child(1u);
+				break;
+			case ValueOpcode::Phi:
+				if (inst->NumArgs() != 0u) {
+					stack.push_back({.inst = inst, .post = true});
+					for (uint32_t index = inst->NumArgs(); index-- > 0;) push_child(index);
+				}
+				break;
 			case ValueOpcode::ShiftLeftLogical32:
 			case ValueOpcode::ShiftRightLogical32: {
 				const auto shift = inst->Arg(1).Resolve();
 				if (shift.IsImmediate() && shift.GetType() == Type::U32) {
-					bits = inst->GetOpcode() == ValueOpcode::ShiftLeftLogical32
-					    ? arg(0) << (shift.U32() & 31u) : arg(0) >> (shift.U32() & 31u);
+					stack.push_back({.inst = inst, .post = true});
+					push_child(0u);
 				}
 				break;
 			}
@@ -84,17 +155,16 @@ uint32_t PossibleU32Bits(Value value, const auto& normalize) {
 				const auto count  = inst->Arg(3).Resolve();
 				if (offset.IsImmediate() && count.IsImmediate() && offset.U32() < 32u &&
 				    count.U32() <= 32u - offset.U32()) {
-					const auto field = (count.U32() == 32u ? UINT32_MAX : (1u << count.U32()) - 1u)
-					                   << offset.U32();
-					bits = (arg(0) & ~field) | ((arg(1) << offset.U32()) & field);
+					stack.push_back({.inst = inst, .post = true});
+					push_child(1u);
+					push_child(0u);
 				}
 				break;
 			}
 			default: break;
 		}
-		return bits;
-	};
-	return visit(visit, value);
+	}
+	return read_bits(value);
 }
 
 uint32_t PossibleU32Bits(Value value) {
@@ -216,12 +286,38 @@ public:
 			range_values.push_back(value);
 			return value;
 		};
-		const auto contains = [&](const auto& self, uint32_t node) -> uint32_t {
-			if (std::ranges::find(range_values, node) != range_values.end()) return 1u;
-			const auto entry = m_nodes[node];
-			if (entry.variable == UINT32_MAX) return 0u;
-			return Select(NodeFor(entry.variable, 0u, 1u), self(self, entry.high),
-			              self(self, entry.low));
+		std::unordered_map<uint32_t, uint32_t> contains_memo;
+		const auto contains = [&](uint32_t root_node) -> uint32_t {
+			struct Frame {
+				uint32_t node = 0;
+				bool     post = false;
+			};
+			std::vector<Frame> stack {{root_node, false}};
+			while (!stack.empty()) {
+				const auto frame = stack.back();
+				stack.pop_back();
+				if (frame.post) {
+					const auto entry = m_nodes[frame.node];
+					contains_memo[frame.node] =
+					    Select(NodeFor(entry.variable, 0u, 1u), contains_memo.at(entry.high),
+					           contains_memo.at(entry.low));
+					continue;
+				}
+				if (contains_memo.contains(frame.node)) continue;
+				if (std::ranges::find(range_values, frame.node) != range_values.end()) {
+					contains_memo.emplace(frame.node, 1u);
+					continue;
+				}
+				const auto entry = m_nodes[frame.node];
+				if (entry.variable == UINT32_MAX) {
+					contains_memo.emplace(frame.node, 0u);
+					continue;
+				}
+				stack.push_back({frame.node, true});
+				if (!contains_memo.contains(entry.low)) stack.push_back({entry.low, false});
+				if (!contains_memo.contains(entry.high)) stack.push_back({entry.high, false});
+			}
+			return contains_memo.at(root_node);
 		};
 		const auto state = [&](bool in_body) {
 			m_values[1].clear();
@@ -241,7 +337,7 @@ public:
 			const auto initial = mask.Arg(arm).Resolve();
 			if (initial.IsImmediate() && initial.GetType() == Type::U1 && initial.U1()) continue;
 			state(true);
-			const auto retained = contains(contains, Evaluate(carried.Arg(arm), true));
+			const auto retained = contains(Evaluate(carried.Arg(arm), true));
 			if (Select(Evaluate(mask.Arg(arm), true), 1u, retained) != 1u) return false;
 		}
 		for (uint32_t arm = 0; arm < selected.NumArgs(); ++arm) {
@@ -251,7 +347,7 @@ public:
 			auto allowed = Evaluate(exit_conditions[arm].first, true);
 			if (!exit_conditions[arm].second) allowed = Select(allowed, 0u, 1u);
 			allowed = Select(allowed, Evaluate(active, true), 0u);
-			if (Select(allowed, contains(contains, value), 1u) != 1u) return false;
+			if (Select(allowed, contains(value), 1u) != 1u) return false;
 		}
 		return true;
 	}
@@ -278,119 +374,385 @@ private:
 	}
 
 	uint32_t Select(uint32_t condition, uint32_t yes, uint32_t no) {
-		if (condition == 0u) return no;
-		if (condition == 1u || yes == no) return yes;
-		if (yes == 1u && no == 0u) return condition;
-		const std::array key {condition, yes, no};
-		if (const auto found = m_choices.find(key); found != m_choices.end()) return found->second;
-		const auto variable = std::min({m_nodes[condition].variable, m_nodes[yes].variable,
-		                                m_nodes[no].variable});
-		const auto arm = [&](uint32_t value, bool high) {
-			const auto node = m_nodes[value];
-			return node.variable == variable ? (high ? node.high : node.low) : value;
+		struct Frame {
+			uint32_t cond = 0;
+			uint32_t yes  = 0;
+			uint32_t no   = 0;
+			uint32_t var  = 0;
+			bool     post = false;
 		};
-		const auto low = Select(arm(condition, false), arm(yes, false), arm(no, false));
-		const auto high = Select(arm(condition, true), arm(yes, true), arm(no, true));
-		const auto result = NodeFor(variable, low, high);
-		m_choices.emplace(key, result);
-		return result;
+		std::vector<Frame> stack {{condition, yes, no, 0u, false}};
+		const auto         trivial = [&](uint32_t c, uint32_t y, uint32_t n, uint32_t& out) {
+			if (c == 0u) {
+				out = n;
+				return true;
+			}
+			if (c == 1u || y == n) {
+				out = y;
+				return true;
+			}
+			if (y == 1u && n == 0u) {
+				out = c;
+				return true;
+			}
+			if (const auto found = m_choices.find({c, y, n}); found != m_choices.end()) {
+				out = found->second;
+				return true;
+			}
+			return false;
+		};
+		uint32_t root_res = 0u;
+		while (!stack.empty()) {
+			const auto frame = stack.back();
+			stack.pop_back();
+			if (frame.post) {
+				const auto arm = [&](uint32_t value, bool high) {
+					const auto node = m_nodes[value];
+					return node.variable == frame.var ? (high ? node.high : node.low) : value;
+				};
+				uint32_t low = 0u, high = 0u;
+				if (!trivial(arm(frame.cond, false), arm(frame.yes, false), arm(frame.no, false),
+				             low)) {
+					low = m_choices.at(
+					    {arm(frame.cond, false), arm(frame.yes, false), arm(frame.no, false)});
+				}
+				if (!trivial(arm(frame.cond, true), arm(frame.yes, true), arm(frame.no, true),
+				             high)) {
+					high = m_choices.at(
+					    {arm(frame.cond, true), arm(frame.yes, true), arm(frame.no, true)});
+				}
+				const auto result = NodeFor(frame.var, low, high);
+				m_choices.emplace(std::array {frame.cond, frame.yes, frame.no}, result);
+				root_res = result;
+				continue;
+			}
+			if (trivial(frame.cond, frame.yes, frame.no, root_res)) continue;
+			const auto variable = std::min(
+			    {m_nodes[frame.cond].variable, m_nodes[frame.yes].variable, m_nodes[frame.no].variable});
+			const auto arm = [&](uint32_t value, bool high) {
+				const auto node = m_nodes[value];
+				return node.variable == variable ? (high ? node.high : node.low) : value;
+			};
+			stack.push_back({frame.cond, frame.yes, frame.no, variable, true});
+			uint32_t dummy = 0u;
+			const auto lc = arm(frame.cond, false), ly = arm(frame.yes, false),
+			           ln = arm(frame.no, false);
+			if (!trivial(lc, ly, ln, dummy)) stack.push_back({lc, ly, ln, 0u, false});
+			const auto hc = arm(frame.cond, true), hy = arm(frame.yes, true),
+			           hn = arm(frame.no, true);
+			if (!trivial(hc, hy, hn, dummy)) stack.push_back({hc, hy, hn, 0u, false});
+		}
+		return root_res;
 	}
 
 	uint32_t Compare(const Inst& inst, uint32_t left, uint32_t right) {
-		if (left == right) {
-			if (inst.GetOpcode() == ValueOpcode::IEqual32) return 1u;
-			if (inst.GetOpcode() == ValueOpcode::INotEqual32) return 0u;
+		struct Frame {
+			uint32_t l    = 0;
+			uint32_t r    = 0;
+			uint32_t var  = 0;
+			bool     post = false;
+		};
+		const auto trivial = [&](uint32_t l, uint32_t r, uint32_t& out) {
+			if (l == r) {
+				if (inst.GetOpcode() == ValueOpcode::IEqual32) {
+					out = 1u;
+					return true;
+				}
+				if (inst.GetOpcode() == ValueOpcode::INotEqual32) {
+					out = 0u;
+					return true;
+				}
+			}
+			const auto key = std::tuple {inst.GetOpcode(), inst.Flags<uint64_t>(), l, r};
+			if (const auto found = m_predicates.find(key); found != m_predicates.end()) {
+				out = found->second;
+				return true;
+			}
+			return false;
+		};
+		std::vector<Frame> stack {{left, right, 0u, false}};
+		uint32_t           root_res = 0u;
+		while (!stack.empty()) {
+			const auto frame = stack.back();
+			stack.pop_back();
+			if (frame.post) {
+				const auto lhs = m_nodes[frame.l];
+				const auto rhs = m_nodes[frame.r];
+				const auto ll  = lhs.variable == frame.var ? lhs.low : frame.l;
+				const auto rl  = rhs.variable == frame.var ? rhs.low : frame.r;
+				const auto lh  = lhs.variable == frame.var ? lhs.high : frame.l;
+				const auto rh  = rhs.variable == frame.var ? rhs.high : frame.r;
+				uint32_t   low = 0u, high = 0u;
+				if (!trivial(ll, rl, low)) {
+					low = m_predicates.at(
+					    std::tuple {inst.GetOpcode(), inst.Flags<uint64_t>(), ll, rl});
+				}
+				if (!trivial(lh, rh, high)) {
+					high = m_predicates.at(
+					    std::tuple {inst.GetOpcode(), inst.Flags<uint64_t>(), lh, rh});
+				}
+				const auto result = Select(NodeFor(frame.var, 0u, 1u), high, low);
+				m_predicates.emplace(
+				    std::tuple {inst.GetOpcode(), inst.Flags<uint64_t>(), frame.l, frame.r}, result);
+				root_res = result;
+				continue;
+			}
+			if (trivial(frame.l, frame.r, root_res)) continue;
+			const auto variable = std::min(m_nodes[frame.l].variable, m_nodes[frame.r].variable);
+			if (variable == UINT32_MAX) {
+				const auto result = Unknown(Type::U1);
+				m_predicates.emplace(
+				    std::tuple {inst.GetOpcode(), inst.Flags<uint64_t>(), frame.l, frame.r}, result);
+				root_res = result;
+				continue;
+			}
+			const auto lhs = m_nodes[frame.l];
+			const auto rhs = m_nodes[frame.r];
+			stack.push_back({frame.l, frame.r, variable, true});
+			uint32_t   dummy = 0u;
+			const auto ll    = lhs.variable == variable ? lhs.low : frame.l;
+			const auto rl    = rhs.variable == variable ? rhs.low : frame.r;
+			if (!trivial(ll, rl, dummy)) stack.push_back({ll, rl, 0u, false});
+			const auto lh = lhs.variable == variable ? lhs.high : frame.l;
+			const auto rh = rhs.variable == variable ? rhs.high : frame.r;
+			if (!trivial(lh, rh, dummy)) stack.push_back({lh, rh, 0u, false});
 		}
-		const auto key = std::tuple {inst.GetOpcode(), inst.Flags<uint64_t>(), left, right};
-		if (const auto found = m_predicates.find(key); found != m_predicates.end()) return found->second;
-		const auto variable = std::min(m_nodes[left].variable, m_nodes[right].variable);
-		uint32_t result;
-		if (variable == UINT32_MAX) {
-			result = Unknown(Type::U1);
-		} else {
-			const auto lhs = m_nodes[left];
-			const auto rhs = m_nodes[right];
-			const auto low = Compare(inst, lhs.variable == variable ? lhs.low : left,
-			                         rhs.variable == variable ? rhs.low : right);
-			const auto high = Compare(inst, lhs.variable == variable ? lhs.high : left,
-			                          rhs.variable == variable ? rhs.high : right);
-			result = Select(NodeFor(variable, 0u, 1u), high, low);
-		}
-		m_predicates.emplace(key, result);
-		return result;
+		return root_res;
 	}
 
-	uint32_t Evaluate(Value value, bool current) {
-		value = value.Resolve();
-		if (value.IsImmediate()) {
-			if (value.GetType() == Type::U1) return value.U1() ? 1u : 0u;
-			for (const auto& [literal, node]: m_literals) {
-				if (literal == value) return node;
-			}
-			const auto node = Unknown(value.GetType());
-			m_literals.emplace_back(value, node);
-			return node;
-		}
-		const auto* inst = value.TryInstruction();
-		if (current && m_exclude_bound && inst == &m_bound) return 0u;
-		auto& values = m_values[current ? m_current : 0u];
-		if (const auto found = values.find(inst); found != values.end()) {
-			if (found->second == UINT32_MAX) found->second = Unknown(value.GetType());
-			return found->second;
-		}
-		const auto cached = values.emplace(inst, UINT32_MAX).first;
-		auto result = UINT32_MAX;
-		const auto arg = [&](uint32_t index) { return Evaluate(inst->Arg(index), current); };
-		switch (inst->GetOpcode()) {
-			case ValueOpcode::Phi: {
-				const auto invariant = ResolveInvariantPhi(m_program, value);
-				if (!invariant.IsEmpty()) {
-					result = Evaluate(invariant, current);
-				} else if (inst->Parent() == m_induction.Parent()) {
-					if (current) {
-						for (uint32_t i = 0; i < inst->NumArgs(); ++i) {
-							if (inst->PhiBlock(i) == m_incoming) result = Evaluate(inst->Arg(i), false);
-						}
-					}
-				} else if (inst->NumArgs() != 0u) {
-					result = arg(0);
-					for (uint32_t i = 1; i < inst->NumArgs(); ++i) {
-						if (arg(i) != result) { result = UINT32_MAX; break; }
-					}
+	uint32_t Evaluate(Value root_value, bool root_current) {
+		enum class Step : uint8_t {
+			Enter,
+			PhiLoopIncoming,
+			PhiMultiArg,
+			UnaryNot,
+			AndLeft,
+			AndRight,
+			OrLeft,
+			OrRight,
+			SelectCond,
+			SelectChosen,
+			SelectTrue,
+			SelectFalse,
+			CompareArg0,
+			CompareArg1,
+		};
+		struct Frame {
+			Step        step      = Step::Enter;
+			Value       value;
+			bool        current   = false;
+			const Inst* inst      = nullptr;
+			uint32_t    val_a     = 0u;
+			uint32_t    val_b     = 0u;
+			size_t      arg_index = 0u;
+			bool        has_cache = false;
+		};
+		std::vector<Frame> stack {{.step = Step::Enter, .value = root_value, .current = root_current}};
+		uint32_t           last_res = 0u;
+
+		const auto finish_frame = [&](Frame& frame, uint32_t result) {
+			if (frame.has_cache) {
+				auto& values = m_values[frame.current ? m_current : 0u];
+				if (result == UINT32_MAX) {
+					auto& slot = values.at(frame.inst);
+					if (slot == UINT32_MAX) slot = Unknown(frame.value.GetType());
+					result = slot;
+				} else {
+					values.at(frame.inst) = result;
 				}
-				break;
 			}
-			case ValueOpcode::LogicalNot: result = Select(arg(0), 0u, 1u); break;
-			case ValueOpcode::LogicalAnd: {
-				const auto left = arg(0);
-				result = left == 0u ? 0u : Select(left, arg(1), 0u);
-				break;
+			last_res = result;
+			stack.pop_back();
+		};
+		const auto push_eval = [&](Value v, bool cur) {
+			stack.push_back({.step = Step::Enter, .value = v, .current = cur});
+		};
+
+		while (!stack.empty()) {
+			auto& frame = stack.back();
+			switch (frame.step) {
+				case Step::Enter: {
+					frame.value = frame.value.Resolve();
+					if (frame.value.IsImmediate()) {
+						if (frame.value.GetType() == Type::U1) {
+							finish_frame(frame, frame.value.U1() ? 1u : 0u);
+							break;
+						}
+						bool found_lit = false;
+						for (const auto& [literal, node]: m_literals) {
+							if (literal == frame.value) {
+								finish_frame(frame, node);
+								found_lit = true;
+								break;
+							}
+						}
+						if (found_lit) break;
+						const auto node = Unknown(frame.value.GetType());
+						m_literals.emplace_back(frame.value, node);
+						finish_frame(frame, node);
+						break;
+					}
+					const auto* inst = frame.value.TryInstruction();
+					if (frame.current && m_exclude_bound && inst == &m_bound) {
+						finish_frame(frame, 0u);
+						break;
+					}
+					auto& values = m_values[frame.current ? m_current : 0u];
+					if (const auto found = values.find(inst); found != values.end()) {
+						if (found->second == UINT32_MAX) {
+							found->second = Unknown(frame.value.GetType());
+						}
+						finish_frame(frame, found->second);
+						break;
+					}
+					values.emplace(inst, UINT32_MAX);
+					frame.inst      = inst;
+					frame.has_cache = true;
+
+					switch (inst->GetOpcode()) {
+						case ValueOpcode::Phi: {
+							const auto invariant = ResolveInvariantPhi(m_program, frame.value);
+							if (!invariant.IsEmpty()) {
+								frame.step = Step::SelectChosen;
+								push_eval(invariant, frame.current);
+							} else if (inst->Parent() == m_induction.Parent()) {
+								if (frame.current) {
+									bool found_edge = false;
+									for (uint32_t i = 0; i < inst->NumArgs(); ++i) {
+										if (inst->PhiBlock(i) == m_incoming) {
+											frame.step = Step::PhiLoopIncoming;
+											push_eval(inst->Arg(i), false);
+											found_edge = true;
+											break;
+										}
+									}
+									if (!found_edge) finish_frame(frame, UINT32_MAX);
+								} else {
+									finish_frame(frame, UINT32_MAX);
+								}
+							} else if (inst->NumArgs() != 0u) {
+								frame.step      = Step::PhiMultiArg;
+								frame.arg_index = 0u;
+								push_eval(inst->Arg(0), frame.current);
+							} else {
+								finish_frame(frame, UINT32_MAX);
+							}
+							break;
+						}
+						case ValueOpcode::LogicalNot:
+							frame.step = Step::UnaryNot;
+							push_eval(inst->Arg(0), frame.current);
+							break;
+						case ValueOpcode::LogicalAnd:
+							frame.step = Step::AndLeft;
+							push_eval(inst->Arg(0), frame.current);
+							break;
+						case ValueOpcode::LogicalOr:
+							frame.step = Step::OrLeft;
+							push_eval(inst->Arg(0), frame.current);
+							break;
+						case ValueOpcode::SelectU1:
+						case ValueOpcode::SelectU32:
+							frame.step = Step::SelectCond;
+							push_eval(inst->Arg(0), frame.current);
+							break;
+						default:
+							if (inst->GetType() == Type::U1 && inst->NumArgs() == 2u &&
+							    inst->Arg(0).GetType() == Type::U32 &&
+							    inst->Arg(1).GetType() == Type::U32) {
+								frame.step = Step::CompareArg0;
+								push_eval(inst->Arg(0), frame.current);
+							} else {
+								finish_frame(frame, UINT32_MAX);
+							}
+							break;
+					}
+					break;
+				}
+				case Step::PhiLoopIncoming:
+				case Step::SelectChosen:
+					finish_frame(frame, last_res);
+					break;
+				case Step::PhiMultiArg: {
+					const auto* inst = frame.inst;
+					if (frame.arg_index == 0u) {
+						frame.val_a = last_res;
+					} else if (last_res != frame.val_a) {
+						finish_frame(frame, UINT32_MAX);
+						break;
+					}
+					if (++frame.arg_index < inst->NumArgs()) {
+						push_eval(inst->Arg(frame.arg_index), frame.current);
+					} else {
+						finish_frame(frame, frame.val_a);
+					}
+					break;
+				}
+				case Step::UnaryNot:
+					finish_frame(frame, Select(last_res, 0u, 1u));
+					break;
+				case Step::AndLeft: {
+					if (last_res == 0u) {
+						finish_frame(frame, 0u);
+						break;
+					}
+					frame.val_a = last_res;
+					frame.step  = Step::AndRight;
+					push_eval(frame.inst->Arg(1), frame.current);
+					break;
+				}
+				case Step::AndRight:
+					finish_frame(frame, Select(frame.val_a, last_res, 0u));
+					break;
+				case Step::OrLeft: {
+					if (last_res == 1u) {
+						finish_frame(frame, 1u);
+						break;
+					}
+					frame.val_a = last_res;
+					frame.step  = Step::OrRight;
+					push_eval(frame.inst->Arg(1), frame.current);
+					break;
+				}
+				case Step::OrRight:
+					finish_frame(frame, Select(frame.val_a, 1u, last_res));
+					break;
+				case Step::SelectCond: {
+					const auto* inst = frame.inst;
+					if (last_res == 0u) {
+						frame.step = Step::SelectChosen;
+						push_eval(inst->Arg(2), frame.current);
+						break;
+					}
+					if (last_res == 1u) {
+						frame.step = Step::SelectChosen;
+						push_eval(inst->Arg(1), frame.current);
+						break;
+					}
+					frame.val_a = last_res;
+					frame.step  = Step::SelectTrue;
+					push_eval(inst->Arg(1), frame.current);
+					break;
+				}
+				case Step::SelectTrue:
+					frame.val_b = last_res;
+					frame.step  = Step::SelectFalse;
+					push_eval(frame.inst->Arg(2), frame.current);
+					break;
+				case Step::SelectFalse:
+					finish_frame(frame, Select(frame.val_a, frame.val_b, last_res));
+					break;
+				case Step::CompareArg0:
+					frame.val_a = last_res;
+					frame.step  = Step::CompareArg1;
+					push_eval(frame.inst->Arg(1), frame.current);
+					break;
+				case Step::CompareArg1:
+					finish_frame(frame, Compare(*frame.inst, frame.val_a, last_res));
+					break;
 			}
-			case ValueOpcode::LogicalOr: {
-				const auto left = arg(0);
-				result = left == 1u ? 1u : Select(left, 1u, arg(1));
-				break;
-			}
-			case ValueOpcode::SelectU1:
-			case ValueOpcode::SelectU32: {
-				const auto condition = arg(0);
-				result = condition == 0u ? arg(2) : condition == 1u ? arg(1)
-				                                                   : Select(condition, arg(1), arg(2));
-				break;
-			}
-			default:
-				if (inst->GetType() == Type::U1 && inst->NumArgs() == 2u &&
-				    inst->Arg(0).GetType() == Type::U32 && inst->Arg(1).GetType() == Type::U32)
-					result = Compare(*inst, arg(0), arg(1));
-				break;
 		}
-		// Only unsupported values and cycles need free variables.
-		if (result == UINT32_MAX) {
-			if (cached->second == UINT32_MAX) cached->second = Unknown(value.GetType());
-			return cached->second;
-		}
-		cached->second = result;
-		return result;
+		return last_res;
 	}
 
 	const Program& m_program;
@@ -519,23 +881,52 @@ public:
 					// NativeDescriptorSource proved this read reaches the image. Preserve its
 					// SSA Phi edges while retaining descriptor DWORDs for other consumers.
 					std::map<const Inst*, Value> projected;
-					const auto project = [&](auto&& self, Value value) -> Value {
-						value = value.Resolve();
-						const auto* phi = value.TryInstruction();
-						if (phi == plan.table_read) return key;
-						if (phi == nullptr || phi->GetOpcode() != ValueOpcode::Phi) return Value(UINT32_MAX);
-						if (const auto found = projected.find(phi); found != projected.end()) return found->second;
+					std::vector<const Inst*>     work;
+					std::vector<const Inst*>     created;
+					if (const auto* root_phi = plan.handle->Arg(0).Resolve().TryInstruction();
+					    root_phi != nullptr && root_phi != plan.table_read &&
+					    root_phi->GetOpcode() == ValueOpcode::Phi) {
+						work.push_back(root_phi);
+					}
+					while (!work.empty()) {
+						const auto* phi = work.back();
+						work.pop_back();
+						if (projected.contains(phi)) continue;
 						auto* parent = phi->Parent();
 						const auto position = std::ranges::find_if(parent->Instructions(),
 						    [&](const Inst& inst) { return &inst == phi; });
 						auto& selected = *parent->PrependNewInst(position, ValueOpcode::Phi);
 						selected.SetFlags(Type::U32);
 						projected.emplace(phi, Value(&selected));
-						for (uint32_t arm = 0; arm < phi->NumArgs(); ++arm)
-							selected.AddPhiOperand(phi->PhiBlock(arm), self(self, phi->Arg(arm)));
-						return Value(&selected);
-					};
-					key = project(project, plan.handle->Arg(0));
+						created.push_back(phi);
+						for (uint32_t arm = 0; arm < phi->NumArgs(); ++arm) {
+							const auto* child = phi->Arg(arm).Resolve().TryInstruction();
+							if (child != nullptr && child != plan.table_read &&
+							    child->GetOpcode() == ValueOpcode::Phi &&
+							    !projected.contains(child)) {
+								work.push_back(child);
+							}
+						}
+					}
+					for (const auto* phi: created) {
+						auto* selected = projected.at(phi).Instruction();
+						for (uint32_t arm = 0; arm < phi->NumArgs(); ++arm) {
+							const auto* child = phi->Arg(arm).Resolve().TryInstruction();
+							Value       mapped(UINT32_MAX);
+							if (child == plan.table_read) {
+								mapped = key;
+							} else if (child != nullptr &&
+							           child->GetOpcode() == ValueOpcode::Phi) {
+								mapped = projected.at(child);
+							}
+							selected->AddPhiOperand(phi->PhiBlock(arm), mapped);
+						}
+					}
+					const auto* top = plan.handle->Arg(0).Resolve().TryInstruction();
+					key = top == plan.table_read ? key
+					    : top != nullptr && top->GetOpcode() == ValueOpcode::Phi
+					        ? projected.at(top)
+					        : Value(UINT32_MAX);
 				}
 				plan.handle->SetArg(0, key);
 				for (uint32_t word = 1; word < plan.handle->NumArgs(); ++word)
@@ -779,111 +1170,153 @@ private:
 		return selected.IsEmpty() ? value : selected;
 	}
 
-	Value LowerDescriptorValue(Value value) {
-		value            = value.Resolve();
-		const auto* inst = value.TryInstruction();
-		if (inst == nullptr) return value;
-		// The scalar planner owns reads and lowers their address handles separately.
-		uint32_t memory_index = 0;
-		if (ScalarReadMemory(*inst, memory_index) != nullptr) return value;
-		const auto [cached, inserted] = m_descriptor_values.emplace(inst, value);
-		if (!inserted) return cached->second;
-		if (inst->GetOpcode() != ValueOpcode::Phi) {
-			Inst* projected = nullptr;
-			for (size_t arg = 0; arg < inst->NumArgs(); ++arg) {
-				const auto lowered = LowerDescriptorValue(inst->Arg(arg));
-				if (lowered == inst->Arg(arg).Resolve()) continue;
-				if (projected == nullptr) {
-					projected = &m_program.value_storage.emplace_back(inst->GetOpcode(), inst->Flags<uint64_t>());
-					for (size_t i = 0; i < inst->NumArgs(); ++i) projected->SetArg(i, inst->Arg(i));
+	Value LowerDescriptorValue(Value root) {
+		struct LowerFrame {
+			Value                 value;
+			const Inst*           inst       = nullptr;
+			const Block*          branch     = nullptr;
+			std::array<size_t, 2> arms {};
+			bool                  post       = false;
+			bool                  one_arm    = false;
+		};
+		const auto get_lowered = [&](Value v) -> Value {
+			v                = v.Resolve();
+			const auto* inst = v.TryInstruction();
+			if (inst == nullptr) return v;
+			const auto found = m_descriptor_values.find(inst);
+			return found != m_descriptor_values.end() ? found->second : v;
+		};
+		std::vector<LowerFrame> stack {{.value = root}};
+		while (!stack.empty()) {
+			const auto frame = stack.back();
+			stack.pop_back();
+			if (frame.post) {
+				const auto* inst   = frame.inst;
+				auto        cached = m_descriptor_values.find(inst);
+				if (inst->GetOpcode() != ValueOpcode::Phi) {
+					Inst* projected = nullptr;
+					for (size_t arg = 0; arg < inst->NumArgs(); ++arg) {
+						const auto lowered = get_lowered(inst->Arg(arg));
+						if (lowered == inst->Arg(arg).Resolve()) continue;
+						if (projected == nullptr) {
+							projected = &m_program.value_storage.emplace_back(
+							    inst->GetOpcode(), inst->Flags<uint64_t>());
+							for (size_t i = 0; i < inst->NumArgs(); ++i)
+								projected->SetArg(i, inst->Arg(i));
+						}
+						projected->SetArg(arg, lowered);
+					}
+					if (projected != nullptr) cached->second = Value(projected);
+				} else if (frame.one_arm) {
+					cached->second = get_lowered(inst->Arg(frame.arms[0]));
+				} else {
+					const auto lowered0 = get_lowered(inst->Arg(frame.arms[0]));
+					const auto lowered1 = get_lowered(inst->Arg(frame.arms[1]));
+					if (!ValidateRuntimeValue(m_program, lowered0) ||
+					    !ValidateRuntimeValue(m_program, lowered1)) {
+						continue;
+					}
+					const auto& info      = *frame.branch;
+					const auto& term      = info.terminator;
+					const auto* incoming0 = inst->PhiBlock(frame.arms[0]);
+					const auto* target0   = incoming0 == frame.branch ? inst->Parent() : incoming0;
+					const auto  true_val  = term.true_block == target0 ? lowered0 : lowered1;
+					const auto  false_val = term.true_block == target0 ? lowered1 : lowered0;
+					auto&       selected  = m_program.value_storage.emplace_back(ValueOpcode::SelectU32);
+					selected.SetArg(0, info.condition);
+					selected.SetArg(1, true_val);
+					selected.SetArg(2, false_val);
+					cached->second = Value(&selected);
 				}
-				projected->SetArg(arg, lowered);
-			}
-			if (projected != nullptr) cached->second = Value(projected);
-			return cached->second;
-		}
-		const auto* merge = inst->Parent();
-		if (merge == nullptr || inst->NumPhiBlocks() != inst->NumArgs() ||
-		    inst->GetType() != Type::U32) {
-			return value;
-		}
-		std::array<size_t, 2> live_arms {};
-		size_t                live_count = 0;
-		for (size_t arm = 0; arm < inst->NumArgs(); ++arm) {
-			const auto* incoming = inst->PhiBlock(arm);
-			if (incoming == nullptr) {
-				return value;
-			}
-			if (IsUnreachablePhiEdge(incoming, merge)) {
 				continue;
 			}
-			if (live_count == 2u) {
-				return value;
+
+			const auto  value = frame.value.Resolve();
+			const auto* inst  = value.TryInstruction();
+			if (inst == nullptr) continue;
+			// The scalar planner owns reads and lowers their address handles separately.
+			uint32_t memory_index = 0;
+			if (ScalarReadMemory(*inst, memory_index) != nullptr) continue;
+			if (!m_descriptor_values.emplace(inst, value).second) continue;
+
+			if (inst->GetOpcode() != ValueOpcode::Phi) {
+				stack.push_back({.inst = inst, .post = true});
+				for (size_t arg = inst->NumArgs(); arg-- > 0;) {
+					stack.push_back({.value = inst->Arg(arg)});
+				}
+				continue;
 			}
-			live_arms[live_count++] = arm;
-		}
-		if (live_count == 0u) {
-			return value;
-		}
-		if (live_count == 1u) {
-			cached->second = LowerDescriptorValue(inst->Arg(live_arms[0]));
-			return cached->second;
-		}
-		const size_t arm0   = live_arms[0];
-		const size_t arm1   = live_arms[1];
-		const auto*  branch = inst->PhiBlock(arm0);
-		if (branch == nullptr || inst->PhiBlock(arm1) == nullptr ||
-		    branch == inst->PhiBlock(arm1)) {
-			return value;
-		}
-		if (branch->ImmSuccessors().size() != 2u) {
-			if (branch->ImmPredecessors().size() != 1u) {
-				return value;
+			const auto* merge = inst->Parent();
+			if (merge == nullptr || inst->NumPhiBlocks() != inst->NumArgs() ||
+			    inst->GetType() != Type::U32) {
+				continue;
 			}
-			branch = branch->ImmPredecessors()[0];
-		}
-		if (branch == merge || branch->ImmSuccessors().size() != 2u) {
-			return value;
-		}
-		std::array<const Block*, 2> targets;
-		for (uint32_t arm = 0; arm < 2; arm++) {
-			const auto* incoming = inst->PhiBlock(live_arms[arm]);
-			if (incoming == merge ||
-			    (incoming != branch &&
-			     (incoming->ImmPredecessors().size() != 1u ||
-			      incoming->ImmPredecessors()[0] != branch ||
-			      incoming->ImmSuccessors().size() != 1u ||
-			      incoming->ImmSuccessors()[0] != merge))) {
-				return value;
+			std::array<size_t, 2> live_arms {};
+			size_t                live_count = 0;
+			bool                  bad_edge   = false;
+			for (size_t arm = 0; arm < inst->NumArgs(); ++arm) {
+				const auto* incoming = inst->PhiBlock(arm);
+				if (incoming == nullptr) {
+					bad_edge = true;
+					break;
+				}
+				if (IsUnreachablePhiEdge(incoming, merge)) continue;
+				if (live_count == 2u) {
+					bad_edge = true;
+					break;
+				}
+				live_arms[live_count++] = arm;
 			}
-			targets[arm] = incoming == branch ? merge : incoming;
+			if (bad_edge || live_count == 0u) continue;
+			if (live_count == 1u) {
+				stack.push_back({.inst = inst, .arms = live_arms, .post = true, .one_arm = true});
+				stack.push_back({.value = inst->Arg(live_arms[0])});
+				continue;
+			}
+			const size_t arm0   = live_arms[0];
+			const size_t arm1   = live_arms[1];
+			const auto*  branch = inst->PhiBlock(arm0);
+			if (branch == nullptr || inst->PhiBlock(arm1) == nullptr ||
+			    branch == inst->PhiBlock(arm1)) {
+				continue;
+			}
+			if (branch->ImmSuccessors().size() != 2u) {
+				if (branch->ImmPredecessors().size() != 1u) continue;
+				branch = branch->ImmPredecessors()[0];
+			}
+			if (branch == merge || branch->ImmSuccessors().size() != 2u) continue;
+			std::array<const Block*, 2> targets {};
+			bool                        valid_diamond = true;
+			for (uint32_t arm = 0; arm < 2; arm++) {
+				const auto* incoming = inst->PhiBlock(live_arms[arm]);
+				if (incoming == merge ||
+				    (incoming != branch &&
+				     (incoming->ImmPredecessors().size() != 1u ||
+				      incoming->ImmPredecessors()[0] != branch ||
+				      incoming->ImmSuccessors().size() != 1u ||
+				      incoming->ImmSuccessors()[0] != merge))) {
+					valid_diamond = false;
+					break;
+				}
+				targets[arm] = incoming == branch ? merge : incoming;
+			}
+			if (!valid_diamond) continue;
+			const auto& info           = *branch;
+			const auto& term           = info.terminator;
+			const auto  predicate_type = !m_shader_writes     ? RuntimeValueType::Integer
+			                           : m_has_address_writes ? RuntimeValueType::ImmutableInteger
+			                                                  : RuntimeValueType::ScalarInteger;
+			if (term.kind != CFG::TerminatorKind::ConditionalBranch ||
+			    !((term.true_block == targets[0] && term.false_block == targets[1]) ||
+			      (term.false_block == targets[0] && term.true_block == targets[1])) ||
+			    !ValidateRuntimeValue(m_program, info.condition, predicate_type)) {
+				continue;
+			}
+			stack.push_back({.inst = inst, .branch = branch, .arms = live_arms, .post = true});
+			stack.push_back({.value = inst->Arg(arm1)});
+			stack.push_back({.value = inst->Arg(arm0)});
 		}
-		const auto& info = *branch;
-		const auto& term = info.terminator;
-		const auto predicate_type = !m_shader_writes     ? RuntimeValueType::Integer
-		                          : m_has_address_writes ? RuntimeValueType::ImmutableInteger
-		                                                 : RuntimeValueType::ScalarInteger;
-		if (term.kind != CFG::TerminatorKind::ConditionalBranch ||
-		    !((term.true_block == targets[0] && term.false_block == targets[1]) ||
-		      (term.false_block == targets[0] && term.true_block == targets[1])) ||
-		    !ValidateRuntimeValue(m_program, info.condition, predicate_type)) {
-			return value;
-		}
-		const auto lowered0 = LowerDescriptorValue(inst->Arg(arm0));
-		const auto lowered1 = LowerDescriptorValue(inst->Arg(arm1));
-		if (!ValidateRuntimeValue(m_program, lowered0) ||
-		    !ValidateRuntimeValue(m_program, lowered1)) {
-			return value;
-		}
-		// Retain a host expression; replacing the GPU Phi would break SSA dominance.
-		const auto true_val  = term.true_block == targets[0] ? lowered0 : lowered1;
-		const auto false_val = term.true_block == targets[0] ? lowered1 : lowered0;
-		auto&      selected  = m_program.value_storage.emplace_back(ValueOpcode::SelectU32);
-		selected.SetArg(0, info.condition);
-		selected.SetArg(1, true_val);
-		selected.SetArg(2, false_val);
-		cached->second = Value(&selected);
-		return cached->second;
+		return get_lowered(root);
 	}
 
 	void MakeSource(const Inst& handle, uint32_t width, bool sampler, bool sample_adjust,
@@ -1453,46 +1886,183 @@ private:
 		return (invariant.IsEmpty() ? guard : invariant).Resolve();
 	}
 
-	bool Implies(Value guard, Value required, bool allow_phi = true) const {
-		guard = SimplifyGuard(guard);
-		required = SimplifyGuard(required);
-		if (required == Value(true) || EquivalentValue(m_program, guard, required)) return true;
-		const auto* test = required.TryInstruction();
-		if (test != nullptr && test->GetOpcode() == ValueOpcode::INotEqual32) {
-			for (uint32_t arg = 0; arg < 2u; ++arg)
-				if (test->Arg(arg).Resolve() == Value(0u) &&
-				    ImpliesNonzero(guard, test->Arg(arg ^ 1u))) return true;
+	bool Implies(Value root_guard, Value root_required, bool root_allow_phi = true) const {
+		struct Frame {
+			Value       guard;
+			Value       required;
+			bool        allow_phi    = true;
+			const Inst* g_inst       = nullptr;
+			const Inst* r_inst       = nullptr;
+			uint8_t     kind         = 0u; // 0=Enter, 1=And, 2=Or, 3=Phi
+			size_t      arm          = 0u;
+			bool        has_entry    = false;
+			bool        dep_on_cycle = false;
+			bool        in_visiting  = false;
+		};
+		std::map<std::tuple<const Inst*, const Inst*, bool>, bool> memo;
+		std::set<std::tuple<const Inst*, const Inst*, bool>>       visiting;
+		std::vector<Frame>                                         stack;
+		stack.push_back({.guard = root_guard, .required = root_required, .allow_phi = root_allow_phi});
+		bool last_result = false;
+		bool last_cycle  = false;
+
+		const auto finish = [&](Frame& frame, bool ans, bool hit_cycle) {
+			const bool cycle = frame.dep_on_cycle || hit_cycle;
+			if (frame.in_visiting) {
+				visiting.erase({frame.g_inst, frame.r_inst, frame.allow_phi});
+				if (!cycle && frame.g_inst != nullptr && frame.r_inst != nullptr) {
+					memo.emplace(std::tuple {frame.g_inst, frame.r_inst, frame.allow_phi}, ans);
+				}
+			}
+			last_result = ans;
+			last_cycle  = cycle;
+			stack.pop_back();
+		};
+
+		while (!stack.empty()) {
+			auto& frame = stack.back();
+			if (frame.kind == 0u) {
+				const auto guard    = SimplifyGuard(frame.guard);
+				const auto required = SimplifyGuard(frame.required);
+				if (required == Value(true) || EquivalentValue(m_program, guard, required)) {
+					finish(frame, true, false);
+					continue;
+				}
+				const auto* test = required.TryInstruction();
+				if (test != nullptr && test->GetOpcode() == ValueOpcode::INotEqual32) {
+					bool matched = false;
+					for (uint32_t arg = 0; arg < 2u; ++arg) {
+						if (test->Arg(arg).Resolve() == Value(0u) &&
+						    ImpliesNonzero(guard, test->Arg(arg ^ 1u))) {
+							matched = true;
+							break;
+						}
+					}
+					if (matched) {
+						finish(frame, true, false);
+						continue;
+					}
+				}
+				const auto* inst = guard.TryInstruction();
+				if (inst == nullptr) {
+					finish(frame, false, false);
+					continue;
+				}
+				frame.guard  = guard;
+				frame.required = required;
+				frame.g_inst = inst;
+				frame.r_inst = test;
+				if (test != nullptr) {
+					if (const auto found = memo.find({inst, test, frame.allow_phi});
+					    found != memo.end()) {
+						finish(frame, found->second, false);
+						continue;
+					}
+					if (!visiting.emplace(inst, test, frame.allow_phi).second) {
+						finish(frame, false, true);
+						continue;
+					}
+					frame.in_visiting = true;
+				}
+				const auto op = inst->GetOpcode();
+				if (op == ValueOpcode::LogicalAnd) {
+					frame.kind = 1u;
+					stack.push_back({.guard     = inst->Arg(0),
+					                 .required  = required,
+					                 .allow_phi = frame.allow_phi});
+					continue;
+				}
+				if (op == ValueOpcode::LogicalOr) {
+					frame.kind = 2u;
+					stack.push_back({.guard     = inst->Arg(0),
+					                 .required  = required,
+					                 .allow_phi = frame.allow_phi});
+					continue;
+				}
+				if (!frame.allow_phi || op != ValueOpcode::Phi || inst->GetType() != Type::U1 ||
+				    test == nullptr || test->Parent() == inst->Parent() ||
+				    !AvailableBefore(*test, *inst) || inst->NumArgs() == 0u) {
+					finish(frame, false, false);
+					continue;
+				}
+				frame.kind      = 3u;
+				frame.arm       = 0u;
+				frame.has_entry = false;
+				const bool carried = Dominates(inst->Parent(), inst->PhiBlock(0));
+				frame.has_entry |= !carried;
+				stack.push_back({.guard     = inst->Arg(0),
+				                 .required  = carried ? guard : required,
+				                 .allow_phi = false});
+				continue;
+			}
+			frame.dep_on_cycle |= last_cycle;
+			if (frame.kind == 1u) {
+				if (last_result) {
+					finish(frame, true, false);
+					continue;
+				}
+				if (frame.arm == 0u) {
+					frame.arm = 1u;
+					stack.push_back({.guard     = frame.g_inst->Arg(1),
+					                 .required  = frame.required,
+					                 .allow_phi = frame.allow_phi});
+					continue;
+				}
+				finish(frame, false, false);
+				continue;
+			}
+			if (frame.kind == 2u) {
+				if (!last_result) {
+					finish(frame, false, false);
+					continue;
+				}
+				if (frame.arm == 0u) {
+					frame.arm = 1u;
+					stack.push_back({.guard     = frame.g_inst->Arg(1),
+					                 .required  = frame.required,
+					                 .allow_phi = frame.allow_phi});
+					continue;
+				}
+				finish(frame, true, false);
+				continue;
+			}
+			// frame.kind == 3u (Phi)
+			if (!last_result) {
+				finish(frame, false, false);
+				continue;
+			}
+			++frame.arm;
+			if (frame.arm < frame.g_inst->NumArgs()) {
+				const bool carried =
+				    Dominates(frame.g_inst->Parent(), frame.g_inst->PhiBlock(frame.arm));
+				frame.has_entry |= !carried;
+				stack.push_back({.guard     = frame.g_inst->Arg(frame.arm),
+				                 .required  = carried ? frame.guard : frame.required,
+				                 .allow_phi = false});
+				continue;
+			}
+			finish(frame, frame.has_entry, false);
 		}
-		const auto* inst = guard.TryInstruction();
-		if (inst == nullptr) return false;
-		if (inst->GetOpcode() == ValueOpcode::LogicalAnd)
-			return Implies(inst->Arg(0), required, allow_phi) || Implies(inst->Arg(1), required, allow_phi);
-		if (inst->GetOpcode() == ValueOpcode::LogicalOr)
-			return Implies(inst->Arg(0), required, allow_phi) && Implies(inst->Arg(1), required, allow_phi);
-		if (!allow_phi || inst->GetOpcode() != ValueOpcode::Phi || inst->GetType() != Type::U1 ||
-		    test == nullptr || test->Parent() == inst->Parent() || !AvailableBefore(*test, *inst)) return false;
-		// The required predicate must be invariant across this loop. Every entry
-		// establishes it; carried masks may only remove lanes from this same Phi.
-		bool entry = false;
-		for (size_t arm = 0; arm < inst->NumArgs(); ++arm) {
-			const bool carried = Dominates(inst->Parent(), inst->PhiBlock(arm));
-			if (!Implies(inst->Arg(arm), carried ? guard : required, false)) return false;
-			entry |= !carried;
-		}
-		return entry;
+		return last_result;
 	}
 
-	Value EqualLocalValue(Value guard, const auto& matches) const {
-		guard = SimplifyGuard(guard);
-		const auto* inst = guard.TryInstruction();
-		if (inst == nullptr) return {};
-		if (inst->GetOpcode() == ValueOpcode::LogicalAnd) {
-			const auto left = EqualLocalValue(inst->Arg(0), matches);
-			return left.IsEmpty() ? EqualLocalValue(inst->Arg(1), matches) : left;
+	Value EqualLocalValue(Value root_guard, const auto& matches) const {
+		std::vector<Value>              pending {root_guard};
+		std::unordered_set<const Inst*> visited;
+		while (!pending.empty()) {
+			const auto guard = SimplifyGuard(pending.back());
+			pending.pop_back();
+			const auto* inst = guard.TryInstruction();
+			if (inst == nullptr || !visited.insert(inst).second) continue;
+			if (inst->GetOpcode() == ValueOpcode::LogicalAnd) {
+				pending.push_back(inst->Arg(1));
+				pending.push_back(inst->Arg(0));
+				continue;
+			}
+			if (inst->GetOpcode() != ValueOpcode::IEqual32 || inst->NumArgs() != 2u) continue;
+			if (matches(inst->Arg(0))) return inst->Arg(1).Resolve();
+			if (matches(inst->Arg(1))) return inst->Arg(0).Resolve();
 		}
-		if (inst->GetOpcode() != ValueOpcode::IEqual32 || inst->NumArgs() != 2u) return {};
-		if (matches(inst->Arg(0))) return inst->Arg(1).Resolve();
-		if (matches(inst->Arg(1))) return inst->Arg(0).Resolve();
 		return {};
 	}
 
@@ -1540,42 +2110,62 @@ private:
 		return value.GetType() == Type::U32;
 	}
 
-	bool ImpliesNonzero(Value guard, Value value) const {
-		guard = SimplifyGuard(guard);
-		const auto* inst = guard.TryInstruction();
-		if (inst == nullptr) return false;
-		if (inst->GetOpcode() == ValueOpcode::LogicalAnd) {
-			return ImpliesNonzero(inst->Arg(0), value) ||
-			       ImpliesNonzero(inst->Arg(1), value);
+	bool ImpliesNonzero(Value root_guard, Value value) const {
+		std::vector<Value>              pending {root_guard};
+		std::unordered_set<const Inst*> visited;
+		while (!pending.empty()) {
+			const auto guard = SimplifyGuard(pending.back());
+			pending.pop_back();
+			const auto* inst = guard.TryInstruction();
+			if (inst == nullptr || !visited.insert(inst).second) continue;
+			if (inst->GetOpcode() == ValueOpcode::LogicalAnd) {
+				pending.push_back(inst->Arg(1));
+				pending.push_back(inst->Arg(0));
+				continue;
+			}
+			if (inst->NumArgs() != 2u) continue;
+			if (inst->GetOpcode() == ValueOpcode::ULessThan32 &&
+			    inst->Arg(0).Resolve() == Value(0u) &&
+			    EquivalentValue(m_program, inst->Arg(1), value)) {
+				return true;
+			}
+			if (inst->GetOpcode() != ValueOpcode::INotEqual32) continue;
+			uint32_t zero = 1u;
+			if ((ImmediateU32(inst->Arg(0), zero) && zero == 0u &&
+			     EquivalentValue(m_program, inst->Arg(1), value)) ||
+			    (ImmediateU32(inst->Arg(1), zero) && zero == 0u &&
+			     EquivalentValue(m_program, inst->Arg(0), value))) {
+				return true;
+			}
 		}
-		if (inst->NumArgs() != 2u) return false;
-		if (inst->GetOpcode() == ValueOpcode::ULessThan32)
-			return inst->Arg(0).Resolve() == Value(0u) &&
-			       EquivalentValue(m_program, inst->Arg(1), value);
-		if (inst->GetOpcode() != ValueOpcode::INotEqual32) return false;
-		uint32_t zero = 1u;
-		return (ImmediateU32(inst->Arg(0), zero) && zero == 0u &&
-		        EquivalentValue(m_program, inst->Arg(1), value)) ||
-		       (ImmediateU32(inst->Arg(1), zero) && zero == 0u &&
-		        EquivalentValue(m_program, inst->Arg(0), value));
+		return false;
 	}
 
-	bool ImpliesIndexBelow32(Value guard, Value index) const {
-		guard = SimplifyGuard(guard);
-		const auto* inst = guard.TryInstruction();
-		if (inst == nullptr) return false;
-		if (inst->GetOpcode() == ValueOpcode::LogicalAnd) {
-			return ImpliesIndexBelow32(inst->Arg(0), index) ||
-			       ImpliesIndexBelow32(inst->Arg(1), index);
+	bool ImpliesIndexBelow32(Value root_guard, Value index) const {
+		std::vector<Value>              pending {root_guard};
+		std::unordered_set<const Inst*> visited;
+		while (!pending.empty()) {
+			const auto guard = SimplifyGuard(pending.back());
+			pending.pop_back();
+			const auto* inst = guard.TryInstruction();
+			if (inst == nullptr || !visited.insert(inst).second) continue;
+			if (inst->GetOpcode() == ValueOpcode::LogicalAnd) {
+				pending.push_back(inst->Arg(1));
+				pending.push_back(inst->Arg(0));
+				continue;
+			}
+			if (inst->NumArgs() != 2u) continue;
+			uint32_t limit = 0;
+			if ((inst->GetOpcode() == ValueOpcode::SLessThan32 &&
+			     EquivalentValue(m_program, inst->Arg(0), index) &&
+			     ImmediateU32(inst->Arg(1), limit) && limit == 32u) ||
+			    (inst->GetOpcode() == ValueOpcode::SGreaterThan32 &&
+			     ImmediateU32(inst->Arg(0), limit) && limit == 32u &&
+			     EquivalentValue(m_program, inst->Arg(1), index))) {
+				return true;
+			}
 		}
-		if (inst->NumArgs() != 2u) return false;
-		uint32_t limit = 0;
-		return (inst->GetOpcode() == ValueOpcode::SLessThan32 &&
-		        EquivalentValue(m_program, inst->Arg(0), index) &&
-		        ImmediateU32(inst->Arg(1), limit) && limit == 32u) ||
-		       (inst->GetOpcode() == ValueOpcode::SGreaterThan32 &&
-		        ImmediateU32(inst->Arg(0), limit) && limit == 32u &&
-		        EquivalentValue(m_program, inst->Arg(1), index));
+		return false;
 	}
 
 	bool MaskOnlyLosesBits(Value value, Value mask, bool nonzero) const {
@@ -2212,41 +2802,61 @@ private:
 
 	Value UnsignedBound(Value guard, Value value, bool positive = true,
 	                    bool finite_bitscan = false, Value witness = {}) const {
-		const auto* test = SimplifyGuard(guard).TryInstruction();
-		if (test == nullptr) return {};
-		const auto op = test->GetOpcode();
-		if (op == ValueOpcode::LogicalNot)
-			return UnsignedBound(test->Arg(0), value, !positive, finite_bitscan, witness);
-		if ((op == ValueOpcode::LogicalAnd && positive) ||
-		    (op == ValueOpcode::LogicalOr && !positive)) {
-			const auto left = UnsignedBound(test->Arg(0), value, positive, finite_bitscan, witness);
-			return left.IsEmpty() ? UnsignedBound(test->Arg(1), value, positive, finite_bitscan, witness) : left;
-		}
-		if (op == ValueOpcode::LogicalAnd && !positive && !witness.IsEmpty()) {
-			// !(A & Q) proves !Q only for accesses whose EXEC also proves A.
-			for (uint32_t arm = 0; arm < 2u; ++arm) {
-				if (!Implies(witness, test->Arg(arm))) continue;
-				const auto bound = UnsignedBound(test->Arg(arm ^ 1u), value, false, finite_bitscan, witness);
-				if (!bound.IsEmpty()) return bound;
-			}
-		}
-		if ((positive ? op == ValueOpcode::ULessThan32 : op == ValueOpcode::UGreaterThanEqual32) &&
-		    EquivalentValue(m_program, test->Arg(0), value)) return test->Arg(1);
-		if ((positive ? op == ValueOpcode::UGreaterThan32 : op == ValueOpcode::ULessThanEqual32) &&
-		    EquivalentValue(m_program, test->Arg(1), value)) return test->Arg(0);
-		uint32_t limit = 0;
-		if ((positive ? op == ValueOpcode::ULessThanEqual32 : op == ValueOpcode::UGreaterThan32) &&
-		    ImmediateU32(test->Arg(1), limit) && limit != UINT32_MAX &&
-		    EquivalentValue(m_program, test->Arg(0), value)) return Value(limit + 1u);
 		const auto* scan = value.Resolve().TryInstruction();
-		if (finite_bitscan && scan != nullptr && scan->GetOpcode() == ValueOpcode::FindILsb32 &&
-		    (positive ? op == ValueOpcode::INotEqual32 : op == ValueOpcode::IEqual32)) {
-			for (uint32_t arg = 0; arg < 2u; ++arg) {
-				uint32_t excluded;
-				if (!ImmediateU32(test->Arg(arg), excluded)) continue;
-				if ((excluded == UINT32_MAX && EquivalentValue(m_program, test->Arg(arg ^ 1u), value)) ||
-				    (excluded == 0u && EquivalentValue(m_program, test->Arg(arg ^ 1u), scan->Arg(0))))
-					return Value(static_cast<uint32_t>(std::bit_width(SelectorMaximum(scan->Arg(0)))));
+		std::vector<std::pair<Value, bool>> pending {{guard, positive}};
+		std::set<std::pair<const Inst*, bool>> visited;
+		while (!pending.empty()) {
+			const auto [cur_guard, pos] = pending.back();
+			pending.pop_back();
+			const auto* test = SimplifyGuard(cur_guard).TryInstruction();
+			if (test == nullptr || !visited.emplace(test, pos).second) continue;
+			const auto op = test->GetOpcode();
+			if (op == ValueOpcode::LogicalNot) {
+				pending.emplace_back(test->Arg(0), !pos);
+				continue;
+			}
+			if ((op == ValueOpcode::LogicalAnd && pos) ||
+			    (op == ValueOpcode::LogicalOr && !pos)) {
+				pending.emplace_back(test->Arg(1), pos);
+				pending.emplace_back(test->Arg(0), pos);
+				continue;
+			}
+			if (op == ValueOpcode::LogicalAnd && !pos && !witness.IsEmpty()) {
+				// !(A & Q) proves !Q only for accesses whose EXEC also proves A.
+				for (uint32_t arm = 2u; arm-- > 0;) {
+					if (Implies(witness, test->Arg(arm))) {
+						pending.emplace_back(test->Arg(arm ^ 1u), false);
+					}
+				}
+				continue;
+			}
+			if ((pos ? op == ValueOpcode::ULessThan32 : op == ValueOpcode::UGreaterThanEqual32) &&
+			    EquivalentValue(m_program, test->Arg(0), value)) {
+				return test->Arg(1);
+			}
+			if ((pos ? op == ValueOpcode::UGreaterThan32 : op == ValueOpcode::ULessThanEqual32) &&
+			    EquivalentValue(m_program, test->Arg(1), value)) {
+				return test->Arg(0);
+			}
+			uint32_t limit = 0;
+			if ((pos ? op == ValueOpcode::ULessThanEqual32 : op == ValueOpcode::UGreaterThan32) &&
+			    ImmediateU32(test->Arg(1), limit) && limit != UINT32_MAX &&
+			    EquivalentValue(m_program, test->Arg(0), value)) {
+				return Value(limit + 1u);
+			}
+			if (finite_bitscan && scan != nullptr && scan->GetOpcode() == ValueOpcode::FindILsb32 &&
+			    (pos ? op == ValueOpcode::INotEqual32 : op == ValueOpcode::IEqual32)) {
+				for (uint32_t arg = 0; arg < 2u; ++arg) {
+					uint32_t excluded;
+					if (!ImmediateU32(test->Arg(arg), excluded)) continue;
+					if ((excluded == UINT32_MAX &&
+					     EquivalentValue(m_program, test->Arg(arg ^ 1u), value)) ||
+					    (excluded == 0u &&
+					     EquivalentValue(m_program, test->Arg(arg ^ 1u), scan->Arg(0)))) {
+						return Value(static_cast<uint32_t>(
+						    std::bit_width(SelectorMaximum(scan->Arg(0)))));
+					}
+				}
 			}
 		}
 		return {};
@@ -2832,57 +3442,157 @@ private:
 		};
 
 		std::map<std::pair<const Inst*, const Inst*>, bool> implies_cache;
-		const auto implies_guard = [&](auto&& self, Value guard, Value req,
-		                               uint32_t depth = 0u) -> bool {
-			guard = guard.Resolve();
-			req   = req.Resolve();
-			if (req == Value(true) || equiv(equiv, guard, req)) return true;
-			const auto* g_inst = guard.TryInstruction();
-			const auto* r_inst = req.TryInstruction();
-			if (depth > 32u || g_inst == nullptr) return false;
-			if (r_inst != nullptr) {
-				if (const auto found = implies_cache.find({g_inst, r_inst});
-				    found != implies_cache.end()) {
-					return found->second;
-				}
-			}
-			bool ans = false;
-			const auto op = g_inst->GetOpcode();
-			if (op == ValueOpcode::LogicalAnd) {
-				ans = self(self, g_inst->Arg(0), req, depth + 1u) ||
-				      self(self, g_inst->Arg(1), req, depth + 1u);
-			} else if (op == ValueOpcode::LogicalOr) {
-				ans = self(self, g_inst->Arg(0), req, depth + 1u) &&
-				      self(self, g_inst->Arg(1), req, depth + 1u);
-			} else if (op == ValueOpcode::Phi && g_inst->GetType() == Type::U1 &&
-			           g_inst->NumArgs() != 0u && g_inst->NumPhiBlocks() == g_inst->NumArgs()) {
-				const auto* phi_blk = g_inst->Parent();
-				bool        in_loop = false;
-				for (size_t i = 0; i < g_inst->NumPhiBlocks(); ++i) {
-					if (dominates_fast(phi_blk, g_inst->PhiBlock(i))) {
-						in_loop = true;
-						break;
+		const auto implies_guard = [&](Value root_guard, Value root_req) -> bool {
+			struct ImplyFrame {
+				Value       guard;
+				Value       req;
+				const Inst* g_inst       = nullptr;
+				const Inst* r_inst       = nullptr;
+				uint8_t     kind         = 0u; // 0=Enter, 1=And, 2=Or, 3=Phi
+				size_t      arm          = 0u;
+				bool        sub_req      = false;
+				bool        non_self     = false;
+				bool        dep_on_cycle = false;
+				bool        in_visiting  = false;
+			};
+			std::set<std::pair<const Inst*, const Inst*>> visiting_imply;
+			std::vector<ImplyFrame>                         stack {{.guard = root_guard, .req = root_req}};
+			bool                                            last_ans   = false;
+			bool                                            last_cycle = false;
+			const auto finish = [&](ImplyFrame& frame, bool ans, bool hit_cycle) {
+				const bool cycle = frame.dep_on_cycle || hit_cycle;
+				if (frame.in_visiting) {
+					visiting_imply.erase({frame.g_inst, frame.r_inst});
+					if (!cycle && frame.g_inst != nullptr && frame.r_inst != nullptr) {
+						implies_cache.emplace(std::pair {frame.g_inst, frame.r_inst}, ans);
 					}
 				}
-				if (!in_loop || (r_inst != nullptr && strictly_dominates(r_inst->Parent(), phi_blk))) {
-					bool non_self = false;
-					bool ok       = true;
-					for (size_t i = 0; i < g_inst->NumArgs(); ++i) {
-						const bool carried = dominates_fast(phi_blk, g_inst->PhiBlock(i));
-						if (carried && self(self, g_inst->Arg(i), guard, depth + 1u)) continue;
-						if (!self(self, g_inst->Arg(i), req, depth + 1u)) {
-							ok = false;
-							break;
+				last_ans   = ans;
+				last_cycle = cycle;
+				stack.pop_back();
+			};
+			while (!stack.empty()) {
+				auto& frame = stack.back();
+				if (frame.kind == 0u) {
+					const auto guard = frame.guard.Resolve();
+					const auto req   = frame.req.Resolve();
+					if (req == Value(true) || equiv(equiv, guard, req)) {
+						finish(frame, true, false);
+						continue;
+					}
+					const auto* g_inst = guard.TryInstruction();
+					const auto* r_inst = req.TryInstruction();
+					if (g_inst == nullptr) {
+						finish(frame, false, false);
+						continue;
+					}
+					frame.guard  = guard;
+					frame.req    = req;
+					frame.g_inst = g_inst;
+					frame.r_inst = r_inst;
+					if (r_inst != nullptr) {
+						if (const auto found = implies_cache.find({g_inst, r_inst});
+						    found != implies_cache.end()) {
+							finish(frame, found->second, false);
+							continue;
 						}
-						non_self = true;
+						if (!visiting_imply.emplace(g_inst, r_inst).second) {
+							finish(frame, false, true);
+							continue;
+						}
+						frame.in_visiting = true;
 					}
-					ans = ok && non_self;
+					const auto op = g_inst->GetOpcode();
+					if (op == ValueOpcode::LogicalAnd) {
+						frame.kind = 1u;
+						stack.push_back({.guard = g_inst->Arg(0), .req = req});
+						continue;
+					}
+					if (op == ValueOpcode::LogicalOr) {
+						frame.kind = 2u;
+						stack.push_back({.guard = g_inst->Arg(0), .req = req});
+						continue;
+					}
+					if (op == ValueOpcode::Phi && g_inst->GetType() == Type::U1 &&
+					    g_inst->NumArgs() != 0u && g_inst->NumPhiBlocks() == g_inst->NumArgs()) {
+						const auto* phi_blk = g_inst->Parent();
+						bool        in_loop = false;
+						for (size_t i = 0; i < g_inst->NumPhiBlocks(); ++i) {
+							if (dominates_fast(phi_blk, g_inst->PhiBlock(i))) {
+								in_loop = true;
+								break;
+							}
+						}
+						if (!in_loop ||
+						    (r_inst != nullptr && strictly_dominates(r_inst->Parent(), phi_blk))) {
+							frame.kind = 3u;
+							frame.arm  = 0u;
+							const bool carried = dominates_fast(phi_blk, g_inst->PhiBlock(0));
+							stack.push_back({.guard = g_inst->Arg(0),
+							                 .req   = carried ? guard : req});
+							continue;
+						}
+					}
+					finish(frame, false, false);
+					continue;
 				}
+				frame.dep_on_cycle |= last_cycle;
+				if (frame.kind == 1u) {
+					if (last_ans) {
+						finish(frame, true, false);
+						continue;
+					}
+					if (frame.arm == 0u) {
+						frame.arm = 1u;
+						stack.push_back({.guard = frame.g_inst->Arg(1), .req = frame.req});
+						continue;
+					}
+					finish(frame, false, false);
+					continue;
+				}
+				if (frame.kind == 2u) {
+					if (!last_ans) {
+						finish(frame, false, false);
+						continue;
+					}
+					if (frame.arm == 0u) {
+						frame.arm = 1u;
+						stack.push_back({.guard = frame.g_inst->Arg(1), .req = frame.req});
+						continue;
+					}
+					finish(frame, true, false);
+					continue;
+				}
+				const auto* g_inst  = frame.g_inst;
+				const auto* phi_blk = g_inst->Parent();
+				const bool  carried = dominates_fast(phi_blk, g_inst->PhiBlock(frame.arm));
+				if (frame.sub_req) {
+					frame.sub_req = false;
+					if (!last_ans) {
+						finish(frame, false, false);
+						continue;
+					}
+					frame.non_self = true;
+				} else if (carried && !last_ans) {
+					frame.sub_req = true;
+					stack.push_back({.guard = g_inst->Arg(frame.arm), .req = frame.req});
+					continue;
+				} else if (!carried) {
+					if (!last_ans) {
+						finish(frame, false, false);
+						continue;
+					}
+					frame.non_self = true;
+				}
+				if (++frame.arm < g_inst->NumArgs()) {
+					const bool next_carr = dominates_fast(phi_blk, g_inst->PhiBlock(frame.arm));
+					stack.push_back({.guard = g_inst->Arg(frame.arm),
+					                 .req   = next_carr ? frame.guard : frame.req});
+					continue;
+				}
+				finish(frame, frame.non_self, false);
 			}
-			if (r_inst != nullptr && (ans || depth == 0u)) {
-				implies_cache.emplace(std::pair {g_inst, r_inst}, ans);
-			}
-			return ans;
+			return last_ans;
 		};
 
 		std::map<std::pair<std::vector<const Inst*>, const Block*>, std::vector<const Inst*>>
@@ -2894,43 +3604,49 @@ private:
 			if (const auto found = inv_cache.find(key); found != inv_cache.end()) {
 				return found->second;
 			}
-			std::vector<const Inst*>       cand;
+			std::vector<const Inst*>        cand;
 			std::unordered_set<const Inst*> seen;
-			const auto                     collect = [&](auto&& self, const Inst* g) -> void {
-				if (g == nullptr || !seen.insert(g).second) return;
+			std::vector<const Inst*>        pending(pos.rbegin(), pos.rend());
+			while (!pending.empty()) {
+				const auto* g = pending.back();
+				pending.pop_back();
+				if (g == nullptr || !seen.insert(g).second) continue;
 				if (strictly_dominates(g->Parent(), target_blk)) {
 					cand.push_back(g);
-					return;
+					continue;
 				}
 				const auto op = g->GetOpcode();
 				if (op == ValueOpcode::LogicalAnd) {
-					self(self, g->Arg(0).Resolve().TryInstruction());
-					self(self, g->Arg(1).Resolve().TryInstruction());
+					pending.push_back(g->Arg(1).Resolve().TryInstruction());
+					pending.push_back(g->Arg(0).Resolve().TryInstruction());
 				} else if (op == ValueOpcode::Phi && g->NumArgs() != 0u &&
 				           g->NumPhiBlocks() == g->NumArgs()) {
 					for (size_t i = 0; i < g->NumArgs(); ++i) {
 						if (dominates_fast(g->Parent(), g->PhiBlock(i))) continue;
 						std::vector<const Inst*>        sub;
 						std::unordered_set<const Inst*> sub_seen;
-						const auto sub_collect = [&](auto&& sub_self, const Inst* x) -> void {
-							if (x == nullptr || !sub_seen.insert(x).second) return;
+						std::vector<const Inst*>        sub_pending {
+                            g->Arg(i).Resolve().TryInstruction()};
+						while (!sub_pending.empty()) {
+							const auto* x = sub_pending.back();
+							sub_pending.pop_back();
+							if (x == nullptr || !sub_seen.insert(x).second) continue;
 							if (strictly_dominates(x->Parent(), target_blk)) {
 								sub.push_back(x);
-								return;
+								continue;
 							}
 							const auto xop = x->GetOpcode();
 							if (xop == ValueOpcode::LogicalAnd) {
-								sub_self(sub_self, x->Arg(0).Resolve().TryInstruction());
-								sub_self(sub_self, x->Arg(1).Resolve().TryInstruction());
+								sub_pending.push_back(x->Arg(1).Resolve().TryInstruction());
+								sub_pending.push_back(x->Arg(0).Resolve().TryInstruction());
 							} else if (xop == ValueOpcode::Phi) {
-								for (size_t j = 0; j < x->NumArgs(); ++j) {
-									sub_self(sub_self, x->Arg(j).Resolve().TryInstruction());
+								for (size_t j = x->NumArgs(); j-- > 0;) {
+									sub_pending.push_back(x->Arg(j).Resolve().TryInstruction());
 								}
 							}
-						};
-						sub_collect(sub_collect, g->Arg(i).Resolve().TryInstruction());
+						}
 						for (const auto* s: sub) {
-							if (implies_guard(implies_guard, Value(const_cast<Inst*>(g)),
+							if (implies_guard(Value(const_cast<Inst*>(g)),
 							                  Value(const_cast<Inst*>(s)))) {
 								cand.push_back(s);
 							}
@@ -2938,12 +3654,11 @@ private:
 						break;
 					}
 				}
-			};
-			for (const auto* g: pos) collect(collect, g);
+			}
 			std::vector<const Inst*> out;
 			for (const auto* c: cand) {
 				const bool redundant = std::ranges::any_of(cand, [&](const Inst* o) {
-					return o != c && implies_guard(implies_guard, Value(const_cast<Inst*>(o)),
+					return o != c && implies_guard(Value(const_cast<Inst*>(o)),
 					                               Value(const_cast<Inst*>(c)));
 				});
 				if (!redundant && std::ranges::find(out, c) == out.end()) out.push_back(c);
@@ -3025,8 +3740,7 @@ private:
 					} else if (op == ValueOpcode::LogicalAnd) {
 						const auto pos_implies = [&](Value target) {
 							for (size_t pi = 0; pi < state.pos.size(); ++pi) {
-								if (implies_guard(implies_guard,
-								                  Value(const_cast<Inst*>(state.pos[pi])), target))
+								if (implies_guard(Value(const_cast<Inst*>(state.pos[pi])), target))
 									return true;
 							}
 							return false;
@@ -3072,231 +3786,547 @@ private:
 
 			auto operator<=>(const PhiKey&) const = default;
 		};
-		std::map<PhiKey, std::optional<Range>>                      phi_ranges;
-		std::vector<PhiKey>                                         phi_order;
+		std::map<PhiKey, std::optional<Range>>                             phi_ranges;
+		std::vector<PhiKey>                                                phi_order;
 		std::map<std::pair<const Inst*, GuardState>, std::optional<Range>> eval_memo;
-		std::set<std::pair<const Inst*, GuardState>>                visiting;
-
-		std::function<std::optional<Range>(Value, const GuardState&)> eval_range;
-		std::function<bool(Value, const GuardState&, bool)>           pred_false;
+		std::map<std::tuple<const Inst*, GuardState, bool>, bool>          pred_false_memo;
+		std::set<std::pair<const Inst*, GuardState>>                       visiting;
 
 		const auto pred_true = [&](Value cond, const GuardState& guards) {
 			cond = cond.Resolve();
 			if (cond.IsImmediate()) return cond.GetType() == Type::U1 && cond.U1();
 			for (const auto* p: guards.pos) {
-				if (implies_guard(implies_guard, Value(const_cast<Inst*>(p)), cond)) return true;
+				if (implies_guard(Value(const_cast<Inst*>(p)), cond)) return true;
 			}
 			return false;
 		};
 
-		const auto refine_with_guards = [&](Value v, Range r,
-		                                    const GuardState& guards) -> std::optional<Range> {
-			if (guards.contradictory) return std::nullopt;
-			const auto tighten_lt = [&](Value bound, bool strict) -> bool {
-				const auto br = eval_range(bound, guards);
-				if (!br) return false;
-				if (strict) {
-					if (br->high == 0u) return true;
-					r.high = std::min(r.high, br->high - 1u);
-				} else {
-					r.high = std::min(r.high, br->high);
-				}
-				return false;
-			};
-			const auto tighten_gt = [&](Value bound, bool strict) -> bool {
-				const auto br = eval_range(bound, guards);
-				if (!br) return false;
-				if (strict) {
-					if (br->low == UINT32_MAX) return true;
-					r.low = std::max(r.low, br->low + 1u);
-				} else {
-					r.low = std::max(r.low, br->low);
-				}
-				return false;
-			};
-			for (const auto* g: guards.pos) {
-				const auto op = g->GetOpcode();
-				if (op == ValueOpcode::ULessThan32 || op == ValueOpcode::ULessThanEqual32) {
-					const bool strict = op == ValueOpcode::ULessThan32;
-					if (equiv(equiv, g->Arg(0), v) && tighten_lt(g->Arg(1), strict)) return std::nullopt;
-					if (equiv(equiv, g->Arg(1), v) && tighten_gt(g->Arg(0), strict)) return std::nullopt;
-				} else if (op == ValueOpcode::UGreaterThan32 ||
-				           op == ValueOpcode::UGreaterThanEqual32) {
-					const bool strict = op == ValueOpcode::UGreaterThan32;
-					if (equiv(equiv, g->Arg(1), v) && tighten_lt(g->Arg(0), strict)) return std::nullopt;
-					if (equiv(equiv, g->Arg(0), v) && tighten_gt(g->Arg(1), strict)) return std::nullopt;
-				} else if (op == ValueOpcode::INotEqual32) {
-					if ((g->Arg(0).Resolve() == Value(0u) && equiv(equiv, g->Arg(1), v)) ||
-					    (g->Arg(1).Resolve() == Value(0u) && equiv(equiv, g->Arg(0), v))) {
-						r.low = std::max(r.low, 1u);
-					}
-				}
-			}
-			for (const auto* g: guards.neg) {
-				const auto op = g->GetOpcode();
-				if (op == ValueOpcode::UGreaterThanEqual32 || op == ValueOpcode::UGreaterThan32) {
-					const bool strict = op == ValueOpcode::UGreaterThanEqual32;
-					if (equiv(equiv, g->Arg(0), v) && tighten_lt(g->Arg(1), strict)) return std::nullopt;
-					if (equiv(equiv, g->Arg(1), v) && tighten_gt(g->Arg(0), strict)) return std::nullopt;
-				} else if (op == ValueOpcode::ULessThanEqual32 || op == ValueOpcode::ULessThan32) {
-					const bool strict = op == ValueOpcode::ULessThanEqual32;
-					if (equiv(equiv, g->Arg(1), v) && tighten_lt(g->Arg(0), strict)) return std::nullopt;
-					if (equiv(equiv, g->Arg(0), v) && tighten_gt(g->Arg(1), strict)) return std::nullopt;
-				} else if (op == ValueOpcode::IEqual32) {
-					if ((g->Arg(0).Resolve() == Value(0u) && equiv(equiv, g->Arg(1), v)) ||
-					    (g->Arg(1).Resolve() == Value(0u) && equiv(equiv, g->Arg(0), v))) {
-						r.low = std::max(r.low, 1u);
-					}
-				}
-			}
-			if (r.low > r.high) return std::nullopt;
-			return r;
+		enum class TaskStep : uint8_t {
+			EvalEnter,
+			EvalRefinePos,
+			EvalRefineNeg,
+			EvalBinaryLeft,
+			EvalBinaryRight,
+			EvalShiftArg,
+			EvalSelectPredFalse,
+			EvalSelectTrueArm,
+			EvalSelectFalseArm,
+			PredEnter,
+			PredAndLeft,
+			PredAndRight,
+			PredIEqRange,
+			PredULtRange,
+		};
+		struct Task {
+			TaskStep             step         = TaskStep::EvalEnter;
+			Value                v;
+			GuardState           guards;
+			const Inst*          inst         = nullptr;
+			bool                 optimistic   = false;
+			bool                 in_visiting  = false;
+			std::optional<Range> range_a;
+			std::optional<Range> range_b;
+			size_t               guard_idx    = 0u;
+			uint8_t              sub_side     = 0u; // 0=lhs match, 1=rhs match
+			bool                 tight_lt     = false;
+			bool                 tight_strict = false;
+			uint32_t             target_imm   = 0u;
 		};
 
-		pred_false = [&](Value cond, const GuardState& guards, bool optimistic) -> bool {
-			if (guards.contradictory) return optimistic;
-			cond = cond.Resolve();
-			if (cond.IsImmediate()) return cond.GetType() == Type::U1 && !cond.U1();
-			for (const auto* n: guards.neg) {
-				if (equiv(equiv, cond, Value(const_cast<Inst*>(n)))) return true;
-			}
-			const auto* inst = cond.TryInstruction();
-			if (inst == nullptr) return false;
-			const auto op = inst->GetOpcode();
-			if (op == ValueOpcode::LogicalAnd) {
-				return pred_false(inst->Arg(0), add_guard(guards, inst->Arg(1), Value {}), optimistic) ||
-				       pred_false(inst->Arg(1), add_guard(guards, inst->Arg(0), Value {}), optimistic);
-			}
-			if (op == ValueOpcode::IEqual32) {
-				for (uint32_t i = 0; i < 2u; ++i) {
-					uint32_t target = 0u;
-					if (ImmediateU32(inst->Arg(i), target)) {
-						const auto r = eval_range(inst->Arg(i ^ 1u), guards);
-						if (!r) return optimistic;
-						return target < r->low || target > r->high;
-					}
-				}
-			}
-			uint32_t target = 0u;
-			if (op == ValueOpcode::ULessThan32 && ImmediateU32(inst->Arg(0), target)) {
-				const auto r = eval_range(inst->Arg(1), guards);
-				if (!r) return optimistic;
-				return r->high <= target;
-			}
-			return false;
-		};
+		const auto run_inductive = [&](bool start_pred_false, Value root_v,
+		                               const GuardState& root_guards, bool root_opt,
+		                               std::optional<Range>& out_range, bool& out_bool) {
+			std::vector<Task> stack;
+			stack.push_back(Task {
+			    .step       = start_pred_false ? TaskStep::PredEnter : TaskStep::EvalEnter,
+			    .v          = root_v,
+			    .guards     = root_guards,
+			    .optimistic = root_opt,
+			});
+			std::optional<Range> last_range;
+			bool                 last_bool = false;
 
-		eval_range = [&](Value v, const GuardState& guards) -> std::optional<Range> {
-			if (guards.contradictory) return std::nullopt;
-			v = v.Resolve();
-			uint32_t imm = 0u;
-			if (ImmediateU32(v, imm)) return refine_with_guards(v, Range {imm, imm}, guards);
-			const auto* inst = v.TryInstruction();
-			if (inst == nullptr) return refine_with_guards(v, Range {}, guards);
-			const auto mk = std::pair {inst, guards};
-			if (const auto found = eval_memo.find(mk); found != eval_memo.end()) return found->second;
-			if (!visiting.insert(mk).second) return Range {};
+			const auto finish_eval = [&](Task& t, std::optional<Range> res) {
+				if (t.in_visiting) {
+					const auto mk = std::pair {t.inst, t.guards};
+					visiting.erase(mk);
+					eval_memo.emplace(mk, res);
+				}
+				last_range = res;
+				stack.pop_back();
+			};
+			const auto finish_pred = [&](Task& t, bool res) {
+				if (t.inst != nullptr && visiting.empty()) {
+					pred_false_memo.emplace(std::tuple {t.inst, t.guards, t.optimistic}, res);
+				}
+				last_bool = res;
+				stack.pop_back();
+			};
+			const auto push_eval = [&](Value v, const GuardState& g) {
+				stack.push_back(Task {.step = TaskStep::EvalEnter, .v = v, .guards = g});
+			};
+			const auto push_pred = [&](Value cond, const GuardState& g, bool opt) {
+				stack.push_back(
+				    Task {.step = TaskStep::PredEnter, .v = cond, .guards = g, .optimistic = opt});
+			};
+			const auto start_refine = [&](Task& t, std::optional<Range> base_r) {
+				if (!base_r || t.guards.contradictory) {
+					finish_eval(t, t.guards.contradictory ? std::nullopt : base_r);
+					return;
+				}
+				t.range_a   = base_r;
+				t.guard_idx = 0u;
+				t.sub_side  = 0u;
+				t.step      = TaskStep::EvalRefinePos;
+			};
 
-			std::optional<Range> res = Range {};
-			switch (inst->GetOpcode()) {
-				case ValueOpcode::Phi: {
-					const auto   inv     = invariant_guards(guards.pos, inst->Parent());
-					const auto   inv_neg = invariant_neg_guards(guards.neg, inst->Parent());
-					const PhiKey key {inst, inv, inv_neg};
-					const auto [it, inserted] = phi_ranges.try_emplace(key, std::nullopt);
-					if (inserted) phi_order.push_back(key);
-					res = it->second;
-					break;
-				}
-				case ValueOpcode::ReadFirstLane: {
-					if (inst->NumArgs() == 2u) {
-						const auto mask    = inst->Arg(1).Resolve();
-						const bool implied = mask == Value(true) ||
-						                     std::ranges::any_of(guards.pos, [&](const Inst* p) {
-							                     return implies_guard(implies_guard,
-							                                          Value(const_cast<Inst*>(p)), mask);
-						                     });
-						if (implied) {
-							res = eval_range(inst->Arg(0), add_guard(GuardState {}, mask, Value {}));
+			while (!stack.empty()) {
+				auto& t = stack.back();
+				switch (t.step) {
+					case TaskStep::EvalEnter: {
+						if (t.guards.contradictory) {
+							finish_eval(t, std::nullopt);
+							break;
 						}
-					}
-					break;
-				}
-				case ValueOpcode::SelectU32: {
-					const auto cond = inst->Arg(0);
-					if (pred_true(cond, guards)) {
-						res = eval_range(inst->Arg(1), guards);
-					} else if (pred_false(cond, guards, true)) {
-						res = eval_range(inst->Arg(2), guards);
-					} else {
-						const auto rt = eval_range(inst->Arg(1), add_guard(guards, cond, Value {}));
-						const auto rf = eval_range(inst->Arg(2), add_guard(guards, Value {}, cond));
-						if (!rt && !rf) res = std::nullopt;
-						else if (!rt) res = rf;
-						else if (!rf) res = rt;
-						else res = Range {std::min(rt->low, rf->low), std::max(rt->high, rf->high)};
-					}
-					break;
-				}
-				case ValueOpcode::BitFieldUExtract: {
-					uint32_t width = 0u;
-					if (ImmediateU32(inst->Arg(2), width) && width < 32u) {
-						res = Range {0u, width == 0u ? 0u : (1u << width) - 1u};
-					}
-					break;
-				}
-				case ValueOpcode::UMin32: {
-					const auto r0 = eval_range(inst->Arg(0), guards);
-					const auto r1 = eval_range(inst->Arg(1), guards);
-					if (!r0 || !r1) res = std::nullopt;
-					else res = Range {std::min(r0->low, r1->low), std::min(r0->high, r1->high)};
-					break;
-				}
-				case ValueOpcode::BitwiseAnd32: {
-					const auto r0 = eval_range(inst->Arg(0), guards);
-					const auto r1 = eval_range(inst->Arg(1), guards);
-					if (!r0 && !r1) res = std::nullopt;
-					else if (!r0) res = Range {0u, r1->high};
-					else if (!r1) res = Range {0u, r0->high};
-					else res = Range {0u, std::min(r0->high, r1->high)};
-					break;
-				}
-				case ValueOpcode::IAdd32: {
-					const auto r0 = eval_range(inst->Arg(0), guards);
-					const auto r1 = eval_range(inst->Arg(1), guards);
-					if (!r0 || !r1) {
-						res = std::nullopt;
-					} else {
-						const uint64_t lo_sum = uint64_t {r0->low} + r1->low;
-						const uint64_t hi_sum = uint64_t {r0->high} + r1->high;
-						constexpr uint64_t wrap = uint64_t {1} << 32u;
-						if (hi_sum <= UINT32_MAX || (lo_sum >= wrap && hi_sum < (wrap << 1u))) {
-							res = Range {static_cast<uint32_t>(lo_sum), static_cast<uint32_t>(hi_sum)};
+						t.v = t.v.Resolve();
+						uint32_t imm = 0u;
+						if (ImmediateU32(t.v, imm)) {
+							start_refine(t, Range {imm, imm});
+							break;
 						}
+						const auto* inst = t.v.TryInstruction();
+						if (inst == nullptr) {
+							start_refine(t, Range {});
+							break;
+						}
+						t.inst        = inst;
+						const auto mk = std::pair {inst, t.guards};
+						if (const auto found = eval_memo.find(mk); found != eval_memo.end()) {
+							finish_eval(t, found->second);
+							break;
+						}
+						if (!visiting.insert(mk).second) {
+							finish_eval(t, Range {});
+							break;
+						}
+						t.in_visiting = true;
+
+						switch (inst->GetOpcode()) {
+							case ValueOpcode::Phi: {
+								const auto   inv = invariant_guards(t.guards.pos, inst->Parent());
+								const auto   inv_neg =
+								    invariant_neg_guards(t.guards.neg, inst->Parent());
+								const PhiKey key {inst, inv, inv_neg};
+								const auto [it, inserted] =
+								    phi_ranges.try_emplace(key, std::nullopt);
+								if (inserted) phi_order.push_back(key);
+								start_refine(t, it->second);
+								break;
+							}
+							case ValueOpcode::ReadFirstLane: {
+								if (inst->NumArgs() == 2u) {
+									const auto mask = inst->Arg(1).Resolve();
+									const bool implied =
+									    mask == Value(true) ||
+									    std::ranges::any_of(t.guards.pos, [&](const Inst* p) {
+										    return implies_guard(Value(const_cast<Inst*>(p)), mask);
+									    });
+									if (implied) {
+										t.step = TaskStep::EvalShiftArg; // pass through range
+										push_eval(inst->Arg(0),
+										          add_guard(GuardState {}, mask, Value {}));
+										break;
+									}
+								}
+								start_refine(t, Range {});
+								break;
+							}
+							case ValueOpcode::SelectU32: {
+								const auto cond = inst->Arg(0);
+								if (pred_true(cond, t.guards)) {
+									t.step = TaskStep::EvalShiftArg;
+									push_eval(inst->Arg(1), t.guards);
+									break;
+								}
+								t.step = TaskStep::EvalSelectPredFalse;
+								push_pred(cond, t.guards, true);
+								break;
+							}
+							case ValueOpcode::BitFieldUExtract: {
+								uint32_t width = 0u;
+								if (ImmediateU32(inst->Arg(2), width) && width < 32u) {
+									start_refine(
+									    t, Range {0u, width == 0u ? 0u : (1u << width) - 1u});
+								} else {
+									start_refine(t, Range {});
+								}
+								break;
+							}
+							case ValueOpcode::UMin32:
+							case ValueOpcode::BitwiseAnd32:
+							case ValueOpcode::IAdd32:
+								t.step = TaskStep::EvalBinaryLeft;
+								push_eval(inst->Arg(0), t.guards);
+								break;
+							case ValueOpcode::ShiftRightLogical32:
+							case ValueOpcode::ShiftLeftLogical32: {
+								uint32_t shift = 0u;
+								if (ImmediateU32(inst->Arg(1), shift) && shift < 32u) {
+									t.target_imm = shift;
+									t.step       = TaskStep::EvalShiftArg;
+									push_eval(inst->Arg(0), t.guards);
+								} else {
+									start_refine(t, Range {});
+								}
+								break;
+							}
+							default: start_refine(t, Range {}); break;
+						}
+						break;
 					}
-					break;
-				}
-				case ValueOpcode::ShiftRightLogical32:
-				case ValueOpcode::ShiftLeftLogical32: {
-					uint32_t shift = 0u;
-					if (ImmediateU32(inst->Arg(1), shift) && shift < 32u) {
-						const auto r0 = eval_range(inst->Arg(0), guards);
+					case TaskStep::EvalSelectPredFalse: {
+						const auto* inst = t.inst;
+						if (last_bool) {
+							t.step = TaskStep::EvalShiftArg;
+							push_eval(inst->Arg(2), t.guards);
+							break;
+						}
+						t.step = TaskStep::EvalSelectTrueArm;
+						push_eval(inst->Arg(1), add_guard(t.guards, inst->Arg(0), Value {}));
+						break;
+					}
+					case TaskStep::EvalSelectTrueArm: {
+						t.range_a = last_range;
+						t.step    = TaskStep::EvalSelectFalseArm;
+						push_eval(t.inst->Arg(2), add_guard(t.guards, Value {}, t.inst->Arg(0)));
+						break;
+					}
+					case TaskStep::EvalSelectFalseArm: {
+						const auto& rt = t.range_a;
+						const auto& rf = last_range;
+						std::optional<Range> merged;
+						if (!rt && !rf) merged = std::nullopt;
+						else if (!rt) merged = rf;
+						else if (!rf) merged = rt;
+						else merged = Range {std::min(rt->low, rf->low), std::max(rt->high, rf->high)};
+						start_refine(t, merged);
+						break;
+					}
+					case TaskStep::EvalBinaryLeft:
+						t.range_a = last_range;
+						t.step    = TaskStep::EvalBinaryRight;
+						push_eval(t.inst->Arg(1), t.guards);
+						break;
+					case TaskStep::EvalBinaryRight: {
+						const auto& r0 = t.range_a;
+						const auto& r1 = last_range;
+						const auto  op = t.inst->GetOpcode();
+						std::optional<Range> res = Range {};
+						if (op == ValueOpcode::UMin32) {
+							if (!r0 || !r1) res = std::nullopt;
+							else res = Range {std::min(r0->low, r1->low), std::min(r0->high, r1->high)};
+						} else if (op == ValueOpcode::BitwiseAnd32) {
+							if (!r0 && !r1) res = std::nullopt;
+							else if (!r0) res = Range {0u, r1->high};
+							else if (!r1) res = Range {0u, r0->high};
+							else res = Range {0u, std::min(r0->high, r1->high)};
+						} else { // IAdd32
+							if (!r0 || !r1) {
+								res = std::nullopt;
+							} else {
+								const uint64_t lo_sum = uint64_t {r0->low} + r1->low;
+								const uint64_t hi_sum = uint64_t {r0->high} + r1->high;
+								constexpr uint64_t wrap = uint64_t {1} << 32u;
+								if (hi_sum <= UINT32_MAX ||
+								    (lo_sum >= wrap && hi_sum < (wrap << 1u))) {
+									res = Range {static_cast<uint32_t>(lo_sum),
+									             static_cast<uint32_t>(hi_sum)};
+								}
+							}
+						}
+						start_refine(t, res);
+						break;
+					}
+					case TaskStep::EvalShiftArg: {
+						const auto op = t.inst->GetOpcode();
+						if (op == ValueOpcode::ReadFirstLane || op == ValueOpcode::SelectU32) {
+							start_refine(t, last_range);
+							break;
+						}
+						const auto& r0 = last_range;
+						std::optional<Range> res = Range {};
 						if (!r0) {
 							res = std::nullopt;
-						} else if (inst->GetOpcode() == ValueOpcode::ShiftRightLogical32) {
-							res = Range {r0->low >> shift, r0->high >> shift};
-						} else if ((uint64_t {r0->high} << shift) <= UINT32_MAX) {
-							res = Range {r0->low << shift, r0->high << shift};
+						} else if (op == ValueOpcode::ShiftRightLogical32) {
+							res = Range {r0->low >> t.target_imm, r0->high >> t.target_imm};
+						} else if ((uint64_t {r0->high} << t.target_imm) <= UINT32_MAX) {
+							res = Range {r0->low << t.target_imm, r0->high << t.target_imm};
 						}
+						start_refine(t, res);
+						break;
 					}
-					break;
+					case TaskStep::EvalRefinePos:
+					case TaskStep::EvalRefineNeg: {
+						if (t.sub_side != 0u) {
+							// Returning from eval_range(bound, guards) triggered by previous guard check.
+							const auto& br = last_range;
+							if (br) {
+								if (t.tight_lt) {
+									if (t.tight_strict) {
+										if (br->high == 0u) {
+											finish_eval(t, std::nullopt);
+											break;
+										}
+										t.range_a->high = std::min(t.range_a->high, br->high - 1u);
+									} else {
+										t.range_a->high = std::min(t.range_a->high, br->high);
+									}
+								} else {
+									if (t.tight_strict) {
+										if (br->low == UINT32_MAX) {
+											finish_eval(t, std::nullopt);
+											break;
+										}
+										t.range_a->low = std::max(t.range_a->low, br->low + 1u);
+									} else {
+										t.range_a->low = std::max(t.range_a->low, br->low);
+									}
+								}
+							}
+						}
+						bool waiting_bound = false;
+						if (t.step == TaskStep::EvalRefinePos) {
+							while (t.guard_idx < t.guards.pos.size()) {
+								const auto* g  = t.guards.pos[t.guard_idx];
+								const auto  op = g->GetOpcode();
+								if (op == ValueOpcode::ULessThan32 ||
+								    op == ValueOpcode::ULessThanEqual32) {
+									const bool strict = op == ValueOpcode::ULessThan32;
+									if (t.sub_side == 0u) {
+										t.sub_side = 1u;
+										if (equiv(equiv, g->Arg(0), t.v)) {
+											t.tight_lt     = true;
+											t.tight_strict = strict;
+											push_eval(g->Arg(1), t.guards);
+											waiting_bound = true;
+											break;
+										}
+									}
+									if (t.sub_side == 1u) {
+										t.sub_side = 2u;
+										if (equiv(equiv, g->Arg(1), t.v)) {
+											t.tight_lt     = false;
+											t.tight_strict = strict;
+											push_eval(g->Arg(0), t.guards);
+											waiting_bound = true;
+											break;
+										}
+									}
+								} else if (op == ValueOpcode::UGreaterThan32 ||
+								           op == ValueOpcode::UGreaterThanEqual32) {
+									const bool strict = op == ValueOpcode::UGreaterThan32;
+									if (t.sub_side == 0u) {
+										t.sub_side = 1u;
+										if (equiv(equiv, g->Arg(1), t.v)) {
+											t.tight_lt     = true;
+											t.tight_strict = strict;
+											push_eval(g->Arg(0), t.guards);
+											waiting_bound = true;
+											break;
+										}
+									}
+									if (t.sub_side == 1u) {
+										t.sub_side = 2u;
+										if (equiv(equiv, g->Arg(0), t.v)) {
+											t.tight_lt     = false;
+											t.tight_strict = strict;
+											push_eval(g->Arg(1), t.guards);
+											waiting_bound = true;
+											break;
+										}
+									}
+								} else if (op == ValueOpcode::INotEqual32) {
+									if ((g->Arg(0).Resolve() == Value(0u) &&
+									     equiv(equiv, g->Arg(1), t.v)) ||
+									    (g->Arg(1).Resolve() == Value(0u) &&
+									     equiv(equiv, g->Arg(0), t.v))) {
+										t.range_a->low = std::max(t.range_a->low, 1u);
+									}
+								}
+								++t.guard_idx;
+								t.sub_side = 0u;
+							}
+							if (waiting_bound) break;
+							t.step      = TaskStep::EvalRefineNeg;
+							t.guard_idx = 0u;
+							t.sub_side  = 0u;
+						}
+						while (t.guard_idx < t.guards.neg.size()) {
+							const auto* g  = t.guards.neg[t.guard_idx];
+							const auto  op = g->GetOpcode();
+							if (op == ValueOpcode::UGreaterThanEqual32 ||
+							    op == ValueOpcode::UGreaterThan32) {
+								const bool strict = op == ValueOpcode::UGreaterThanEqual32;
+								if (t.sub_side == 0u) {
+									t.sub_side = 1u;
+									if (equiv(equiv, g->Arg(0), t.v)) {
+										t.tight_lt     = true;
+										t.tight_strict = strict;
+										push_eval(g->Arg(1), t.guards);
+										waiting_bound = true;
+										break;
+									}
+								}
+								if (t.sub_side == 1u) {
+									t.sub_side = 2u;
+									if (equiv(equiv, g->Arg(1), t.v)) {
+										t.tight_lt     = false;
+										t.tight_strict = strict;
+										push_eval(g->Arg(0), t.guards);
+										waiting_bound = true;
+										break;
+									}
+								}
+							} else if (op == ValueOpcode::ULessThanEqual32 ||
+							           op == ValueOpcode::ULessThan32) {
+								const bool strict = op == ValueOpcode::ULessThanEqual32;
+								if (t.sub_side == 0u) {
+									t.sub_side = 1u;
+									if (equiv(equiv, g->Arg(1), t.v)) {
+										t.tight_lt     = true;
+										t.tight_strict = strict;
+										push_eval(g->Arg(0), t.guards);
+										waiting_bound = true;
+										break;
+									}
+								}
+								if (t.sub_side == 1u) {
+									t.sub_side = 2u;
+									if (equiv(equiv, g->Arg(0), t.v)) {
+										t.tight_lt     = false;
+										t.tight_strict = strict;
+										push_eval(g->Arg(1), t.guards);
+										waiting_bound = true;
+										break;
+									}
+								}
+							} else if (op == ValueOpcode::IEqual32) {
+								if ((g->Arg(0).Resolve() == Value(0u) &&
+								     equiv(equiv, g->Arg(1), t.v)) ||
+								    (g->Arg(1).Resolve() == Value(0u) &&
+								     equiv(equiv, g->Arg(0), t.v))) {
+									t.range_a->low = std::max(t.range_a->low, 1u);
+								}
+							}
+							++t.guard_idx;
+							t.sub_side = 0u;
+						}
+						if (waiting_bound) break;
+						if (t.range_a->low > t.range_a->high) finish_eval(t, std::nullopt);
+						else finish_eval(t, t.range_a);
+						break;
+					}
+					case TaskStep::PredEnter: {
+						if (t.guards.contradictory) {
+							finish_pred(t, t.optimistic);
+							break;
+						}
+						const auto cond = t.v.Resolve();
+						if (cond.IsImmediate()) {
+							finish_pred(t, cond.GetType() == Type::U1 && !cond.U1());
+							break;
+						}
+						bool negated_in_guard = false;
+						for (const auto* n: t.guards.neg) {
+							if (equiv(equiv, cond, Value(const_cast<Inst*>(n)))) {
+								negated_in_guard = true;
+								break;
+							}
+						}
+						if (negated_in_guard) {
+							finish_pred(t, true);
+							break;
+						}
+						const auto* inst = cond.TryInstruction();
+						if (inst == nullptr) {
+							finish_pred(t, false);
+							break;
+						}
+						if (const auto found =
+						        pred_false_memo.find({inst, t.guards, t.optimistic});
+						    found != pred_false_memo.end()) {
+							last_bool = found->second;
+							stack.pop_back();
+							break;
+						}
+						t.inst        = inst;
+						const auto op = inst->GetOpcode();
+						if (op == ValueOpcode::LogicalAnd) {
+							t.step = TaskStep::PredAndLeft;
+							push_pred(inst->Arg(0), add_guard(t.guards, inst->Arg(1), Value {}),
+							          t.optimistic);
+							break;
+						}
+						if (op == ValueOpcode::IEqual32) {
+							bool matched = false;
+							for (uint32_t i = 0; i < 2u; ++i) {
+								uint32_t target = 0u;
+								if (ImmediateU32(inst->Arg(i), target)) {
+									t.target_imm = target;
+									t.step       = TaskStep::PredIEqRange;
+									push_eval(inst->Arg(i ^ 1u), t.guards);
+									matched = true;
+									break;
+								}
+							}
+							if (matched) break;
+						}
+						uint32_t target = 0u;
+						if (op == ValueOpcode::ULessThan32 && ImmediateU32(inst->Arg(0), target)) {
+							t.target_imm = target;
+							t.step       = TaskStep::PredULtRange;
+							push_eval(inst->Arg(1), t.guards);
+							break;
+						}
+						finish_pred(t, false);
+						break;
+					}
+					case TaskStep::PredAndLeft:
+						if (last_bool) {
+							finish_pred(t, true);
+							break;
+						}
+						t.step = TaskStep::PredAndRight;
+						push_pred(t.inst->Arg(1), add_guard(t.guards, t.inst->Arg(0), Value {}),
+						          t.optimistic);
+						break;
+					case TaskStep::PredAndRight: finish_pred(t, last_bool); break;
+					case TaskStep::PredIEqRange:
+						if (!last_range) finish_pred(t, t.optimistic);
+						else finish_pred(t, t.target_imm < last_range->low ||
+						                        t.target_imm > last_range->high);
+						break;
+					case TaskStep::PredULtRange:
+						if (!last_range) finish_pred(t, t.optimistic);
+						else finish_pred(t, last_range->high <= t.target_imm);
+						break;
 				}
-				default: break;
 			}
-			if (res) res = refine_with_guards(v, *res, guards);
-			visiting.erase(mk);
-			eval_memo.emplace(mk, res);
-			return res;
+			out_range = last_range;
+			out_bool  = last_bool;
+		};
+
+		const auto pred_false = [&](Value cond, const GuardState& guards, bool optimistic) {
+			std::optional<Range> dummy_range;
+			bool                 ans = false;
+			run_inductive(true, cond, guards, optimistic, dummy_range, ans);
+			return ans;
+		};
+		const auto eval_range = [&](Value v, const GuardState& guards) {
+			std::optional<Range> ans;
+			bool                 dummy_bool = false;
+			run_inductive(false, v, guards, false, ans, dummy_bool);
+			return ans;
 		};
 
 		const GuardState empty_guards;
@@ -3305,9 +4335,10 @@ private:
 		}
 
 		std::map<PhiKey, std::pair<uint32_t, uint32_t>> widen_counts;
-		bool                                           changed = true;
+		bool                                            changed = true;
 		while (changed) {
 			eval_memo.clear();
+			pred_false_memo.clear();
 			changed = false;
 			for (size_t idx = 0; idx < phi_order.size(); ++idx) {
 				const auto  key = phi_order[idx];
@@ -3364,6 +4395,7 @@ private:
 		}
 
 		eval_memo.clear();
+		pred_false_memo.clear();
 		bool folded_any = false;
 		for (auto* select: candidate_selects) {
 			if (pred_false(select->Arg(0), empty_guards, false)) {
@@ -4746,80 +5778,120 @@ private:
 			Value key;
 		};
 		std::vector<Choice> choices;
-		const auto visit = [&](const auto& self, DescriptorSource descriptor) -> uint32_t {
-			for (auto& word: descriptor.dwords) word = word.Resolve();
-			for (uint32_t i = 0; i < choices.size(); ++i)
-				if (choices[i].descriptor.dwords == descriptor.dwords) return i;
-			const auto index = static_cast<uint32_t>(choices.size());
-			choices.push_back({descriptor});
-			uint32_t bad = 0;
-			if (ValidateSource(descriptor, bad)) {
-				// Finite inline samplers have literal leaves; live descriptor tables use the
-				// existing direct sampler planning path.
-				if (sampler && !std::ranges::all_of(
-				    std::span(descriptor.dwords).first(descriptor.dword_count),
-				    [](Value word) { return word.IsImmediate() && word.GetType() == Type::U32; }))
-					return UINT32_MAX;
-				return index;
-			}
-			const auto* branch = descriptor.dwords[bad].TryInstruction();
-			if (branch == nullptr || branch->Parent() == nullptr) return UINT32_MAX;
-			const auto op = branch->GetOpcode();
-			const bool phi = op == ValueOpcode::Phi;
-			const bool lane = op == ValueOpcode::ReadFirstLane;
-			if ((!phi && !lane && op != ValueOpcode::SelectU32) ||
-			    (phi && branch->NumPhiBlocks() != branch->NumArgs())) return UINT32_MAX;
-			if (lane && !std::ranges::all_of(handle.Uses(), [&](const Use& use) {
-				    return Implies(use.user->Arg(use.user->NumArgs() - 1u), branch->Arg(1));
-			    })) return UINT32_MAX;
-			const auto count = phi ? branch->NumArgs() : lane ? 1u : 2u;
-			std::array<const Inst*, 8> selected_words {};
-			const auto* anchor = branch;
-			for (uint32_t word = 0; word < descriptor.dword_count; ++word) {
-				const auto* selected = descriptor.dwords[word].TryInstruction();
-				if (selected == nullptr || selected->GetOpcode() != op ||
-				    selected->Parent() != branch->Parent()) {
-					if (!ValidateRuntimeValue(m_program, descriptor.dwords[word])) return UINT32_MAX;
-					continue;
-				}
-				if (phi ? selected->NumArgs() != count || selected->NumPhiBlocks() != count
-				        : !EquivalentValue(m_program, selected->Arg(lane ? 1u : 0u),
-				                            branch->Arg(lane ? 1u : 0u))) return UINT32_MAX;
-				selected_words[word] = selected;
-				if (!phi && AvailableBefore(*anchor, *selected)) anchor = selected;
-			}
-			// Later words may depend on choices computed after the first descriptor word.
-			choices[index].branch = anchor;
-			for (uint32_t arm = 0; arm < count; ++arm) {
-				// A nonzero bit scan cannot choose its zero-input switch sentinel.
-				// Preserve the Phi edge; its ordinal is never observed at runtime.
-				if (phi && ImpossibleSwitchEdge(anchor->PhiBlock(arm), anchor->Parent())) {
-					choices[index].children.push_back(UINT32_MAX);
-					continue;
-				}
-				auto child = descriptor;
-				for (uint32_t word = 0; word < child.dword_count; ++word) {
-					const auto* selected = selected_words[word];
-					if (selected == nullptr) continue;
-					uint32_t incoming = lane ? 0u : arm + 1u;
-					if (phi) {
-						incoming = 0u;
-						while (incoming < count && selected->PhiBlock(incoming) != anchor->PhiBlock(arm))
-							++incoming;
-						if (incoming == count) return UINT32_MAX;
+		struct VisitItem {
+			uint32_t         parent_index = UINT32_MAX;
+			uint32_t         child_slot   = 0u;
+			DescriptorSource descriptor;
+		};
+		const auto run_visit = [&](DescriptorSource initial_descriptor) -> bool {
+			std::vector<VisitItem> work {
+			    {.parent_index = UINT32_MAX, .child_slot = 0u, .descriptor = std::move(initial_descriptor)}};
+			while (!work.empty()) {
+				auto item = std::move(work.back());
+				work.pop_back();
+				for (auto& word: item.descriptor.dwords) word = word.Resolve();
+				uint32_t existing = UINT32_MAX;
+				for (uint32_t i = 0; i < choices.size(); ++i) {
+					if (choices[i].descriptor.dwords == item.descriptor.dwords) {
+						existing = i;
+						break;
 					}
-					child.dwords[word] = selected->Arg(incoming);
 				}
-				const auto next = self(self, child);
-				if (next == UINT32_MAX) return UINT32_MAX;
-				choices[index].children.push_back(next);
+				if (existing != UINT32_MAX) {
+					if (item.parent_index != UINT32_MAX) {
+						choices[item.parent_index].children[item.child_slot] = existing;
+					}
+					continue;
+				}
+				const auto index = static_cast<uint32_t>(choices.size());
+				choices.push_back({std::move(item.descriptor)});
+				if (item.parent_index != UINT32_MAX) {
+					choices[item.parent_index].children[item.child_slot] = index;
+				}
+				const auto& descriptor = choices[index].descriptor;
+				uint32_t    bad        = 0;
+				if (ValidateSource(descriptor, bad)) {
+					// Finite inline samplers have literal leaves; live descriptor tables use the
+					// existing direct sampler planning path.
+					if (sampler &&
+					    !std::ranges::all_of(
+					        std::span(descriptor.dwords).first(descriptor.dword_count),
+					        [](Value word) { return word.IsImmediate() && word.GetType() == Type::U32; })) {
+						return false;
+					}
+					continue;
+				}
+				const auto* branch = descriptor.dwords[bad].TryInstruction();
+				if (branch == nullptr || branch->Parent() == nullptr) return false;
+				const auto op   = branch->GetOpcode();
+				const bool phi  = op == ValueOpcode::Phi;
+				const bool lane = op == ValueOpcode::ReadFirstLane;
+				if ((!phi && !lane && op != ValueOpcode::SelectU32) ||
+				    (phi && branch->NumPhiBlocks() != branch->NumArgs())) {
+					return false;
+				}
+				if (lane && !std::ranges::all_of(handle.Uses(), [&](const Use& use) {
+					    return Implies(use.user->Arg(use.user->NumArgs() - 1u), branch->Arg(1));
+				    })) {
+					return false;
+				}
+				const auto count = phi ? branch->NumArgs() : lane ? 1u : 2u;
+				std::array<const Inst*, 8> selected_words {};
+				const auto*                anchor = branch;
+				for (uint32_t word = 0; word < descriptor.dword_count; ++word) {
+					const auto* selected = descriptor.dwords[word].TryInstruction();
+					if (selected == nullptr || selected->GetOpcode() != op ||
+					    selected->Parent() != branch->Parent()) {
+						if (!ValidateRuntimeValue(m_program, descriptor.dwords[word])) return false;
+						continue;
+					}
+					if (phi ? selected->NumArgs() != count || selected->NumPhiBlocks() != count
+					        : !EquivalentValue(m_program, selected->Arg(lane ? 1u : 0u),
+					                           branch->Arg(lane ? 1u : 0u))) {
+						return false;
+					}
+					selected_words[word] = selected;
+					if (!phi && AvailableBefore(*anchor, *selected)) anchor = selected;
+				}
+				// Later words may depend on choices computed after the first descriptor word.
+				choices[index].branch = anchor;
+				choices[index].children.assign(count, UINT32_MAX);
+				std::vector<VisitItem> children_to_push;
+				children_to_push.reserve(count);
+				for (uint32_t arm = 0; arm < count; ++arm) {
+					// A nonzero bit scan cannot choose its zero-input switch sentinel.
+					// Preserve the Phi edge; its ordinal is never observed at runtime.
+					if (phi && ImpossibleSwitchEdge(anchor->PhiBlock(arm), anchor->Parent())) {
+						continue;
+					}
+					auto child = descriptor;
+					for (uint32_t word = 0; word < child.dword_count; ++word) {
+						const auto* selected = selected_words[word];
+						if (selected == nullptr) continue;
+						uint32_t incoming = lane ? 0u : arm + 1u;
+						if (phi) {
+							incoming = 0u;
+							while (incoming < count &&
+							       selected->PhiBlock(incoming) != anchor->PhiBlock(arm)) {
+								++incoming;
+							}
+							if (incoming == count) return false;
+						}
+						child.dwords[word] = selected->Arg(incoming);
+					}
+					children_to_push.push_back(
+					    {.parent_index = index, .child_slot = arm, .descriptor = std::move(child)});
+				}
+				for (size_t i = children_to_push.size(); i-- > 0;) {
+					work.push_back(std::move(children_to_push[i]));
+				}
 			}
-			return index;
+			return true;
 		};
 		DescriptorSource root;
 		root.dword_count = handle.NumArgs();
 		for (uint32_t word = 0; word < root.dword_count; ++word) root.dwords[word] = handle.Arg(word);
-		if (visit(visit, root) == UINT32_MAX || choices.front().branch == nullptr) return false;
+		if (!run_visit(std::move(root)) || choices.front().branch == nullptr) return false;
 		DescriptorSource finite_source;
 		finite_source.dword_count = root.dword_count;
 		finite_source.dwords.fill(Value(0u));

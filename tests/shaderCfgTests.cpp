@@ -37,6 +37,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -47,12 +48,17 @@
 #include <span>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#define WIN32_LEAN_AND_MEAN
+#include <process.h>
+#include <windows.h>
+#else
 #include <cerrno>
 #include <pthread.h>
 #include <sys/wait.h>
@@ -14414,6 +14420,180 @@ void TestMergedHsProgramSplittingAndReflection() {
   }
 }
 
+void RunOn1MbStack(void (*fn)()) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  struct Context {
+    void (*fn)();
+  } ctx{fn};
+  const uintptr_t handle = ::_beginthreadex(
+      nullptr, 1024u * 1024u,
+      [](void *arg) -> unsigned {
+        static_cast<Context *>(arg)->fn();
+        return 0u;
+      },
+      &ctx, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
+  Check(handle != 0u, "_beginthreadex failed for 1MB stack test");
+  const DWORD waited =
+      ::WaitForSingleObject(reinterpret_cast<HANDLE>(handle), INFINITE);
+  ::CloseHandle(reinterpret_cast<HANDLE>(handle));
+  Check(waited == WAIT_OBJECT_0, "WaitForSingleObject failed for 1MB stack test");
+#else
+  std::thread t(fn);
+  t.join();
+#endif
+}
+
+void TestDeepSsaAndPredicateDagOn1MbStack() {
+  RunOn1MbStack([] {
+    using namespace ShaderRecompiler;
+    const auto begin = std::chrono::steady_clock::now();
+
+    // 1. 4,096-deep SSA ALU dependency chain feeding a buffer descriptor & SMEM read.
+    static std::array<uint32_t, 16> backing_words{};
+    std::array<uint32_t, 16> user_data{};
+    const uint64_t addr = reinterpret_cast<uint64_t>(backing_words.data());
+    user_data[0] = static_cast<uint32_t>(addr);
+    user_data[1] = static_cast<uint32_t>(addr >> 32u);
+    user_data[2] = 64u;
+    user_data[3] = 3u << 28u;
+    user_data[4] = static_cast<uint32_t>(addr);
+    user_data[5] = static_cast<uint32_t>(addr >> 32u);
+    user_data[6] = 64u;
+    user_data[7] = (3u << 28u) | (static_cast<uint32_t>(Prospero::BufferFormat::k32UInt) << 12u) |
+                   DstSel(4, 0, 0, 0);
+    user_data[8] = 0u; // Zero stride / increment added symbolically via s8.
+
+    std::vector<uint32_t> code;
+    code.push_back(EncodeSop1(0x04u, 126u, 193u)); // s_mov_b64 exec, -1
+    code.push_back(EncodeSMovB32(10u, 4u));        // s10 = s4 (base low)
+    code.push_back(EncodeSMovB32(11u, 5u));        // s11 = s5 (base high)
+    code.push_back(EncodeSMovB32(12u, 6u));        // s12 = s6 (num_records)
+    code.push_back(EncodeSMovB32(13u, 7u));        // s13 = s7 (format/oob)
+    for (uint32_t i = 0; i < 4096u; ++i) {
+      // Alternate ops so SSA builds a 4096-deep chain with non-constant s8.
+      code.push_back(EncodeSop2(0x00u, 10u, 10u, 8u)); // s_add_u32 s10, s10, s8
+    }
+    code.push_back(EncodeVop1(0x01u, 0u, 10u));        // v_mov_b32 v0, s10
+    code.push_back(EncodeVop1(0x01u, 1u, 128u));       // v_mov_b32 v1, 0
+    code.push_back(EncodeMubuf0(0x1cu, 0u, true));     // buffer_store_dword
+    code.push_back(EncodeMubuf1(0u, 10u >> 2u, 1u));   // srsrc=s[10:13]? wait: use s[8:11] -> shift!
+    // Replace above srsrc index carefully: use s[12:15] (12>>2 = 3): keep chain in s12!
+    code.clear();
+    code.push_back(EncodeSop1(0x04u, 126u, 193u)); // s_mov_b64 exec, -1
+    code.push_back(EncodeSMovB32(12u, 4u));        // s12 = s4
+    code.push_back(EncodeSMovB32(13u, 5u));        // s13 = s5
+    code.push_back(EncodeSMovB32(14u, 6u));        // s14 = s6
+    code.push_back(EncodeSMovB32(15u, 7u));        // s15 = s7
+    for (uint32_t i = 0; i < 4096u; ++i) {
+      code.push_back(EncodeSop2(0x00u, 12u, 12u, 8u)); // s_add_u32 s12, s12, s8
+    }
+    code.push_back(EncodeVop1(0x01u, 0u, 12u));      // v_mov_b32 v0, s12
+    code.push_back(EncodeVop1(0x01u, 1u, 128u));     // v_mov_b32 v1, 0
+    code.push_back(EncodeMubuf0(0x1cu, 0u, true));   // buffer_store_dword
+    code.push_back(EncodeMubuf1(0u, 12u >> 2u, 1u)); // srsrc=s[12:15]
+    code.push_back(EncodeSopp(0x01u, 0u));           // s_endpgm
+
+    ShaderComputeInputInfo compute{};
+    compute.wave_size = 64u;
+    compute.threads_num[0] = 64u;
+    compute.threads_num[1] = 1u;
+    compute.threads_num[2] = 1u;
+    CompileOptions options{
+        .stage = ShaderType::Compute,
+        .wave_size = 64u,
+        .user_data_base = 0u,
+        .emit_debug_info = true,
+        .user_data = user_data,
+    };
+    options.input_info.compute = &compute;
+    const auto deep_alu = RecompileForTest(code, options);
+    CheckSpirvBinaryValidates(deep_alu.spirv);
+
+    // 2. 512-deep reconvergent LogicalAnd predicate DAG + SelectU32 chain in synthetic IR.
+    IR::Program ir;
+    ir.stage = ShaderType::Compute;
+    ir.wave_size = 64u;
+    ir.user_data_base = 0u;
+    ir.user_data_count = static_cast<uint32_t>(user_data.size());
+
+    auto *entry = ir.block_storage.emplace_back(std::make_unique<IR::Block>()).get();
+    entry->id = 0u;
+    ir.blocks.push_back(entry);
+    entry->terminator.kind = CFG::TerminatorKind::Return;
+
+    auto emit = [&](IR::ValueOpcode op, std::initializer_list<IR::Value> args,
+                    uint64_t flags = 0u) -> IR::Inst * {
+      return &entry->AppendNewInst(op, args, flags);
+    };
+
+    std::array<IR::Value, 4> buf_words;
+    for (uint32_t i = 0; i < 4u; ++i) {
+      buf_words[i] = IR::Value(emit(IR::ValueOpcode::GetUserData,
+                                    {IR::Value(static_cast<IR::ScalarReg>(4u + i))}));
+    }
+    auto *buf_handle = emit(IR::ValueOpcode::GetBufferResource,
+                            {buf_words[0], buf_words[1], buf_words[2], buf_words[3]});
+    auto *tid = emit(IR::ValueOpcode::GetBuiltin,
+                     {IR::Value(static_cast<uint32_t>(IR::StageInputKind::LocalInvocationId)),
+                      IR::Value(0u)});
+    auto *dyn_val = emit(IR::ValueOpcode::GetUserData,
+                         {IR::Value(static_cast<IR::ScalarReg>(8u))});
+    auto *cmp_lt = emit(IR::ValueOpcode::ULessThan32, {IR::Value(tid), IR::Value(16u)});
+    auto *cmp_nz = emit(IR::ValueOpcode::INotEqual32, {IR::Value(dyn_val), IR::Value(0u)});
+
+    // Build a diamond DAG: d_{k+1} = LogicalAnd(d_k, d_k) interleaved with SelectU32, depth 512.
+    IR::Value dag_pred(cmp_lt);
+    IR::Value dyn_pred(cmp_nz);
+    IR::Value val(dyn_val);
+    for (uint32_t i = 0; i < 512u; ++i) {
+      auto *next_dag = emit(IR::ValueOpcode::LogicalAnd, {dag_pred, dag_pred});
+      auto *next_dyn = emit(IR::ValueOpcode::LogicalAnd, {dyn_pred, IR::Value(next_dag)});
+      auto *next_val = emit(IR::ValueOpcode::SelectU32, {IR::Value(next_dyn), val, IR::Value(0u)});
+      dag_pred = IR::Value(next_dag);
+      dyn_pred = IR::Value(next_dyn);
+      val = IR::Value(next_val);
+    }
+
+    IR::MemoryFlags mem_flags{};
+    mem_flags.index = static_cast<uint32_t>(ir.memory_info.size());
+    ir.memory_info.push_back(IR::MemoryInfo{
+        .kind = IR::ResourceKind::Buffer,
+        .resource = 1u,
+        .data_bits = 32u,
+        .data_dwords = 1u,
+        .idxen = true,
+    });
+    auto &store = entry->AppendNewInst(
+        IR::ValueOpcode::StoreBufferU32,
+        {IR::Value(buf_handle), IR::Value(tid), IR::Value(0u), IR::Value(0u), val, dyn_pred});
+    store.SetFlags(mem_flags);
+
+    const Decoder::Program empty_decoded{};
+    const CFG::Graph empty_cfg{};
+    IR::TrackResources(ir, empty_decoded, empty_cfg, options.input_info);
+    auto plan = IR::ExtractResourcePlan(ir);
+    IR::ResourceSnapshot res;
+    IR::ResourceSpecialization spec;
+    const IR::SrtRuntime runtime{
+        .user_data = user_data,
+        .shader_base = reinterpret_cast<uint64_t>(code.data()),
+        .read_specialization_memory = ReadHostTestMemory,
+    };
+    Check(IR::MaterializeResources(plan, runtime, res, spec),
+          "deep predicate DAG resources did not materialize");
+    TranslateResult tr;
+    tr.program = std::move(ir);
+    auto dag_compiled = CompileProgram(std::move(tr), options, spec);
+    CheckSpirvBinaryValidates(dag_compiled.spirv);
+
+    const auto elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - begin)
+            .count();
+    Check(elapsed_ms < 5000, "deep SSA / predicate DAG exceeded 5s compile budget");
+  });
+}
+
 #include "ShaderRayTracingTests.inc"
 
 } // namespace
@@ -14644,6 +14824,7 @@ int main() {
   TestLargeMixedIndirectBufferAndImageUsesCompactShaderDataMap();
   TestDynamicIndirectBufferCollapsesStridesAndPadsCapacity();
   TestMergedHsProgramSplittingAndReflection();
+  TestDeepSsaAndPredicateDagOn1MbStack();
 
   return 0;
 }

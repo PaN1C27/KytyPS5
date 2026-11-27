@@ -224,15 +224,20 @@ thread_local const Xbyak::CodeGenerator* t_running_walker = nullptr;
 bool MaskImplies(Value mask, Value target) {
 	target = target.Resolve();
 	if (mask.IsEmpty() || target.IsEmpty() || target.IsImmediate()) return false;
-	mask = mask.Resolve();
-	if (mask == target) return true;
-	const auto* inst = mask.TryInstruction();
-	if (inst == nullptr) return false;
-	if (inst->GetOpcode() == ValueOpcode::ConditionRef && inst->NumArgs() == 1u) {
-		return MaskImplies(inst->Arg(0), target);
-	}
-	if (inst->GetOpcode() == ValueOpcode::LogicalAnd && inst->NumArgs() == 2u) {
-		return MaskImplies(inst->Arg(0), target) || MaskImplies(inst->Arg(1), target);
+	std::vector<Value>              pending {mask};
+	std::unordered_set<const Inst*> visited;
+	while (!pending.empty()) {
+		const auto current = pending.back().Resolve();
+		pending.pop_back();
+		if (current == target) return true;
+		const auto* inst = current.TryInstruction();
+		if (inst == nullptr || !visited.insert(inst).second) continue;
+		if (inst->GetOpcode() == ValueOpcode::ConditionRef && inst->NumArgs() == 1u) {
+			pending.push_back(inst->Arg(0));
+		} else if (inst->GetOpcode() == ValueOpcode::LogicalAnd && inst->NumArgs() == 2u) {
+			pending.push_back(inst->Arg(1));
+			pending.push_back(inst->Arg(0));
+		}
 	}
 	return false;
 }
@@ -243,215 +248,441 @@ public:
 	                          bool wave_uniform = false)
 	    : m_program(program), m_type(type), m_wave_uniform(wave_uniform) {}
 
-	bool Run(Value value) { return Validate(value); }
+	bool Run(Value value) { return ValidateIterative(value); }
 
 private:
-	bool ValidateArguments(const Inst& inst, bool require_uniform) {
-		for (size_t index = 0; index < inst.NumArgs(); index++) {
-			if (!Validate(inst.Arg(index), require_uniform)) return false;
-		}
-		return true;
+	struct ValidateFrame {
+		enum class Step : uint8_t {
+			Enter,
+			AfterReadConstSlot,
+			AfterSelectAnyCheck,
+			AfterSelectFalseArm,
+			AfterPhiArm,
+			AfterReadFirstLaneMask,
+			AfterArgs,
+		};
+
+		Step             step             = Step::Enter;
+		Value            value;
+		const Inst*      inst             = nullptr;
+		bool             require_uniform  = true;
+		RuntimeValueType type             = RuntimeValueType::Integer;
+		Value            saved_mask;
+		bool             has_saved_mask   = false;
+		size_t           saved_lane_reads = 0;
+		size_t           arg_index        = 0;
+		bool             in_visiting      = false;
+		bool             tail_only        = false;
+	};
+
+	std::unordered_set<const Inst*>& VisitingSet(RuntimeValueType type) {
+		return type == RuntimeValueType::Any ? m_visiting_any : m_visiting;
 	}
 
-	bool Validate(Value value, bool require_uniform = true) {
-		value = value.Resolve();
-		// Host floating-point evaluation does not model shader rounding/denormal modes.
-		if (m_type != RuntimeValueType::Any &&
-		    TypesOverlap(value.GetType(), Type::F16 | Type::F32 | Type::F32x2)) {
-			return false;
+	std::unordered_set<const Inst*>& ValidatedSet(RuntimeValueType type, bool require_uniform) {
+		if (type == RuntimeValueType::Any) {
+			return require_uniform ? m_validated_any_uniform : m_validated_any_deps;
 		}
-		const auto* inst = value.TryInstruction();
-		if (inst == nullptr) {
-			if (!require_uniform) return true;
-			switch (value.GetType()) {
-				case Type::U1:
-				case Type::U8:
-				case Type::U16:
-				case Type::U32:
-				case Type::U64:
-				case Type::F32: return true;
-				default: return false;
+		return require_uniform ? m_validated_uniform : m_validated_dependencies;
+	}
+
+	bool ValidateIterative(Value root) {
+		std::vector<ValidateFrame> stack;
+		stack.push_back(ValidateFrame {
+		    .step            = ValidateFrame::Step::Enter,
+		    .value           = root,
+		    .require_uniform = true,
+		    .type            = m_type,
+		});
+		bool last_result = false;
+
+		const auto finish_frame = [&](ValidateFrame& frame, bool valid) {
+			if (frame.has_saved_mask) {
+				m_active_mask = frame.saved_mask;
 			}
-		}
-		if (require_uniform && MaskImplies(m_active_mask, value)) return true;
-		auto& validated = require_uniform ? m_validated_uniform : m_validated_dependencies;
-		const bool cacheable = !require_uniform || m_active_mask.IsEmpty();
-		if (cacheable && validated.contains(inst)) return true;
-		if (!m_visiting.insert(inst).second) {
-			return !require_uniform;
-		}
-		const auto lane_reads = m_lane_reads;
-		const auto finish = [&](bool valid) {
-			m_visiting.erase(inst);
-			// A lane read can skip a cyclic operand under its own EXEC mask. Only
-			// reuse uniform proofs which traversed the whole unmasked expression.
-			if (valid && cacheable && (!require_uniform || lane_reads == m_lane_reads))
-				validated.insert(inst);
-			return valid;
-		};
-		const auto op = inst->GetOpcode();
-		if (m_type == RuntimeValueType::ImmutableInteger &&
-		    (op == ValueOpcode::ReadConst || BufferAccessOf(op) != BufferAccess::None ||
-		     AddressOpcodeInfoOf(op).access != AddressAccess::None ||
-		     ImageOpcodeInfoOf(op).access != ImageAccess::None ||
-		     SharedAccessOf(op) != SharedAccess::None)) {
-			return finish(false);
-		}
-		if (m_type == RuntimeValueType::ScalarInteger) {
-			const bool scalar_read =
-			    op == ValueOpcode::LoadAddressU32 &&
-			    inst->Flags<MemoryFlags>().index < m_program.memory_info.size() &&
-			    m_program.memory_info[inst->Flags<MemoryFlags>().index].kind ==
-			        ResourceKind::ScalarAddress;
-			if (!scalar_read &&
-			    (BufferAccessOf(op) != BufferAccess::None ||
-			     AddressOpcodeInfoOf(op).access != AddressAccess::None ||
-			     ImageOpcodeInfoOf(op).access != ImageAccess::None ||
-			     SharedAccessOf(op) != SharedAccess::None)) {
-				return finish(false);
-			}
-		}
-		if (op == ValueOpcode::ReadConst) {
-			const auto slot = inst->NumArgs() == 2 ? inst->Arg(1).Resolve() : Value {};
-			if (inst->NumArgs() != 2 || inst->Arg(0).Resolve().TryInstruction() == nullptr ||
-			    inst->Arg(0).Resolve().TryInstruction()->GetOpcode() !=
-			        ValueOpcode::GetSrtResource ||
-			    !slot.IsImmediate() || slot.GetType() != Type::U32 ||
-			    slot.U32() >= m_program.srt_reads.size()) {
-				return finish(false);
-			}
-			if (m_type != RuntimeValueType::Any) {
-				const auto active_mask = m_active_mask;
-				m_active_mask          = {};
-				const bool valid       = Validate(m_program.srt_reads[slot.U32()].value);
-				m_active_mask          = active_mask;
-				if (!valid) return finish(false);
-			}
-		}
-		if (!require_uniform) return finish(ValidateArguments(*inst, false));
-		if (!m_active_mask.IsEmpty() && IsRuntimeSelect(op) && inst->NumArgs() == 3 &&
-		    MaskImplies(m_active_mask, inst->Arg(0)) &&
-		    (inst->Arg(0).Resolve() == m_active_mask ||
-		     !RuntimeValidator(m_program, RuntimeValueType::Any).Run(inst->Arg(0)))) {
-			// Empty EXEC reads lane zero, so ignored operands still require integer types.
-			if (m_type != RuntimeValueType::Any && !Validate(inst->Arg(2), false)) {
-				return finish(false);
-			}
-			return finish(Validate(inst->Arg(1)));
-		}
-		if (op == ValueOpcode::UndefU1 || op == ValueOpcode::UndefU32 || op == ValueOpcode::Void) {
-			return finish(false);
-		}
-		if (op == ValueOpcode::GetUserData) {
-			if (inst->NumArgs() != 1 || inst->Arg(0).GetType() != Type::ScalarReg) {
-				return finish(false);
-			}
-			const auto reg = RegIndex(inst->Arg(0).ScalarRegister());
-			if (reg < m_program.user_data_base ||
-			    reg - m_program.user_data_base >= m_program.user_data_count) {
-				return finish(false);
-			}
-			return finish(true);
-		}
-		if (op == ValueOpcode::GetShaderBase) {
-			if (inst->NumArgs() != 0) {
-				return finish(false);
-			}
-			return finish(true);
-		}
-		if (m_wave_uniform && op == ValueOpcode::GetBuiltin) {
-			const auto axis = inst->NumArgs() == 2u ? inst->Arg(1).Resolve() : Value {};
-			return finish(m_program.stage == ShaderType::Compute && inst->NumArgs() == 2u &&
-			              inst->Arg(0) == Value(static_cast<uint32_t>(StageInputKind::WorkgroupId)) &&
-			              axis.IsImmediate() && axis.GetType() == Type::U32 && axis.U32() < 3u);
-		}
-		if (op == ValueOpcode::Phi) {
-			if (m_type != RuntimeValueType::Any) {
-				const auto* merge = inst->Parent();
-				for (size_t index = 0; index < inst->NumArgs(); ++index) {
-					if (merge != nullptr && index < inst->NumPhiBlocks() &&
-					    IsUnreachablePhiEdge(inst->PhiBlock(index), merge)) {
-						continue;
-					}
-					if (!Validate(inst->Arg(index), false)) {
-						return finish(false);
-					}
+			if (frame.in_visiting) {
+				VisitingSet(frame.type).erase(frame.inst);
+				const bool cacheable = !frame.require_uniform || m_active_mask.IsEmpty();
+				if (valid && cacheable &&
+				    (!frame.require_uniform || frame.saved_lane_reads == m_lane_reads)) {
+					ValidatedSet(frame.type, frame.require_uniform).insert(frame.inst);
 				}
 			}
-			const auto invariant = ResolveInvariantPhi(m_program, value);
-			if (invariant.IsEmpty()) {
-				return finish(false);
+			last_result = valid;
+			stack.pop_back();
+		};
+
+		const auto push_child = [&](Value v, bool req_unif, RuntimeValueType ty) {
+			stack.push_back(ValidateFrame {
+			    .step            = ValidateFrame::Step::Enter,
+			    .value           = v,
+			    .require_uniform = req_unif,
+			    .type            = ty,
+			});
+		};
+
+		while (!stack.empty()) {
+			auto& frame = stack.back();
+			if (frame.tail_only) {
+				finish_frame(frame, last_result);
+				continue;
 			}
-			return finish(Validate(invariant));
+			if (frame.step == ValidateFrame::Step::Enter) {
+				const auto value = frame.value.Resolve();
+				// Host floating-point evaluation does not model shader rounding/denormal modes.
+				if (frame.type != RuntimeValueType::Any &&
+				    TypesOverlap(value.GetType(), Type::F16 | Type::F32 | Type::F32x2)) {
+					finish_frame(frame, false);
+					continue;
+				}
+				const auto* inst = value.TryInstruction();
+				if (inst == nullptr) {
+					if (!frame.require_uniform) {
+						finish_frame(frame, true);
+						continue;
+					}
+					bool ok = false;
+					switch (value.GetType()) {
+						case Type::U1:
+						case Type::U8:
+						case Type::U16:
+						case Type::U32:
+						case Type::U64:
+						case Type::F32: ok = true; break;
+						default: break;
+					}
+					finish_frame(frame, ok);
+					continue;
+				}
+				frame.value = value;
+				frame.inst  = inst;
+				if (frame.require_uniform && MaskImplies(m_active_mask, value)) {
+					finish_frame(frame, true);
+					continue;
+				}
+				const bool cacheable = !frame.require_uniform || m_active_mask.IsEmpty();
+				if (cacheable && ValidatedSet(frame.type, frame.require_uniform).contains(inst)) {
+					finish_frame(frame, true);
+					continue;
+				}
+				if (!VisitingSet(frame.type).insert(inst).second) {
+					finish_frame(frame, !frame.require_uniform);
+					continue;
+				}
+				frame.in_visiting      = true;
+				frame.saved_lane_reads = m_lane_reads;
+
+				const auto op = inst->GetOpcode();
+				if (frame.type == RuntimeValueType::ImmutableInteger &&
+				    (op == ValueOpcode::ReadConst || BufferAccessOf(op) != BufferAccess::None ||
+				     AddressOpcodeInfoOf(op).access != AddressAccess::None ||
+				     ImageOpcodeInfoOf(op).access != ImageAccess::None ||
+				     SharedAccessOf(op) != SharedAccess::None)) {
+					finish_frame(frame, false);
+					continue;
+				}
+				if (frame.type == RuntimeValueType::ScalarInteger) {
+					const bool scalar_read =
+					    op == ValueOpcode::LoadAddressU32 &&
+					    inst->Flags<MemoryFlags>().index < m_program.memory_info.size() &&
+					    m_program.memory_info[inst->Flags<MemoryFlags>().index].kind ==
+					        ResourceKind::ScalarAddress;
+					if (!scalar_read &&
+					    (BufferAccessOf(op) != BufferAccess::None ||
+					     AddressOpcodeInfoOf(op).access != AddressAccess::None ||
+					     ImageOpcodeInfoOf(op).access != ImageAccess::None ||
+					     SharedAccessOf(op) != SharedAccess::None)) {
+						finish_frame(frame, false);
+						continue;
+					}
+				}
+				if (op == ValueOpcode::ReadConst) {
+					const auto slot = inst->NumArgs() == 2 ? inst->Arg(1).Resolve() : Value {};
+					if (inst->NumArgs() != 2 ||
+					    inst->Arg(0).Resolve().TryInstruction() == nullptr ||
+					    inst->Arg(0).Resolve().TryInstruction()->GetOpcode() !=
+					        ValueOpcode::GetSrtResource ||
+					    !slot.IsImmediate() || slot.GetType() != Type::U32 ||
+					    slot.U32() >= m_program.srt_reads.size()) {
+						finish_frame(frame, false);
+						continue;
+					}
+					if (frame.type != RuntimeValueType::Any) {
+						frame.saved_mask     = m_active_mask;
+						frame.has_saved_mask = true;
+						m_active_mask        = {};
+						frame.step           = ValidateFrame::Step::AfterReadConstSlot;
+						push_child(m_program.srt_reads[slot.U32()].value, true, frame.type);
+						continue;
+					}
+				}
+				if (!frame.require_uniform) {
+					if (inst->NumArgs() == 0) {
+						finish_frame(frame, true);
+						continue;
+					}
+					frame.step      = ValidateFrame::Step::AfterArgs;
+					frame.arg_index = 1;
+					push_child(inst->Arg(0), false, frame.type);
+					continue;
+				}
+				if (!m_active_mask.IsEmpty() && IsRuntimeSelect(op) && inst->NumArgs() == 3 &&
+				    MaskImplies(m_active_mask, inst->Arg(0))) {
+					if (inst->Arg(0).Resolve() == m_active_mask) {
+						if (frame.type != RuntimeValueType::Any) {
+							frame.step = ValidateFrame::Step::AfterSelectFalseArm;
+							push_child(inst->Arg(2), false, frame.type);
+						} else {
+							frame.tail_only = true;
+							push_child(inst->Arg(1), true, frame.type);
+						}
+						continue;
+					}
+					frame.saved_mask     = m_active_mask;
+					frame.has_saved_mask = true;
+					m_active_mask        = {};
+					frame.step           = ValidateFrame::Step::AfterSelectAnyCheck;
+					push_child(inst->Arg(0), true, RuntimeValueType::Any);
+					continue;
+				}
+				if (op == ValueOpcode::UndefU1 || op == ValueOpcode::UndefU32 ||
+				    op == ValueOpcode::Void) {
+					finish_frame(frame, false);
+					continue;
+				}
+				if (op == ValueOpcode::GetUserData) {
+					if (inst->NumArgs() != 1 || inst->Arg(0).GetType() != Type::ScalarReg) {
+						finish_frame(frame, false);
+						continue;
+					}
+					const auto reg = RegIndex(inst->Arg(0).ScalarRegister());
+					finish_frame(frame, reg >= m_program.user_data_base &&
+					                        reg - m_program.user_data_base < m_program.user_data_count);
+					continue;
+				}
+				if (op == ValueOpcode::GetShaderBase) {
+					finish_frame(frame, inst->NumArgs() == 0);
+					continue;
+				}
+				if (m_wave_uniform && op == ValueOpcode::GetBuiltin) {
+					const auto axis = inst->NumArgs() == 2u ? inst->Arg(1).Resolve() : Value {};
+					finish_frame(
+					    frame,
+					    m_program.stage == ShaderType::Compute && inst->NumArgs() == 2u &&
+					        inst->Arg(0) ==
+					            Value(static_cast<uint32_t>(StageInputKind::WorkgroupId)) &&
+					        axis.IsImmediate() && axis.GetType() == Type::U32 && axis.U32() < 3u);
+					continue;
+				}
+				if (op == ValueOpcode::Phi) {
+					frame.step      = ValidateFrame::Step::AfterPhiArm;
+					frame.arg_index = 0;
+					last_result     = true;
+					continue;
+				}
+				if (op == ValueOpcode::ReadFirstLane) {
+					++m_lane_reads;
+					if (inst->NumArgs() != 2 || inst->Arg(0).GetType() != Type::U32 ||
+					    inst->Arg(1).GetType() != Type::U1) {
+						finish_frame(frame, false);
+						continue;
+					}
+					if (frame.type != RuntimeValueType::Any) {
+						frame.step = ValidateFrame::Step::AfterReadFirstLaneMask;
+						push_child(inst->Arg(1), false, frame.type);
+						continue;
+					}
+					frame.saved_mask     = m_active_mask;
+					frame.has_saved_mask = true;
+					m_active_mask        = inst->Arg(1).Resolve();
+					frame.tail_only      = true;
+					push_child(inst->Arg(0), true, frame.type);
+					continue;
+				}
+				if (op == ValueOpcode::GetSrtResource) {
+					finish_frame(frame, inst->NumArgs() == 0);
+					continue;
+				}
+				const auto vector_dwords = VectorBufferReadDwords(op);
+				if (op == ValueOpcode::LoadAddressU32 || op == ValueOpcode::ReadConstBuffer ||
+				    vector_dwords != 0u) {
+					const auto  expected = op == ValueOpcode::LoadAddressU32
+					                           ? ValueOpcode::GetAddressResource
+					                           : ValueOpcode::GetBufferResource;
+					const auto* handle =
+					    inst->NumArgs() != 0 ? inst->Arg(0).Resolve().TryInstruction() : nullptr;
+					if (!IsRawRead(m_program, *inst) || handle == nullptr ||
+					    handle->GetOpcode() != expected) {
+						finish_frame(frame, false);
+						continue;
+					}
+					if (vector_dwords != 0u) {
+						frame.step      = ValidateFrame::Step::AfterArgs;
+						frame.arg_index = 1;
+						push_child(inst->Arg(0), true, frame.type);
+						continue;
+					}
+				} else if (op == ValueOpcode::CompositeExtractU64) {
+					const auto index = inst->NumArgs() == 2 ? inst->Arg(1).Resolve() : Value {};
+					if (!index.IsImmediate() || index.GetType() != Type::U32 || index.U32() >= 2u) {
+						finish_frame(frame, false);
+						continue;
+					}
+				} else if (const auto dwords = CompositeExtractDwords(op); dwords != 0u) {
+					const auto* source =
+					    inst->NumArgs() == 2 ? inst->Arg(0).Resolve().TryInstruction() : nullptr;
+					const auto index = inst->NumArgs() == 2 ? inst->Arg(1).Resolve() : Value {};
+					if (source == nullptr || !index.IsImmediate() ||
+					    index.GetType() != Type::U32 || index.U32() >= dwords ||
+					    (source->GetOpcode() != CompositeConstructForDwords(dwords) &&
+					     VectorBufferReadDwords(source->GetOpcode()) != dwords)) {
+						finish_frame(frame, false);
+						continue;
+					}
+				}
+				if (IsDescriptorHandle(op)) {
+					size_t expected = 4u;
+					if (op == ValueOpcode::GetImageResource) {
+						expected = 8u;
+					} else if (op == ValueOpcode::GetAddressResource) {
+						expected = 2u;
+					}
+					if (inst->NumArgs() != expected) {
+						finish_frame(frame, false);
+						continue;
+					}
+				} else if (op != ValueOpcode::ReadConst && op != ValueOpcode::ReadConstBuffer &&
+				           op != ValueOpcode::LoadAddressU32 && !IsRuntimeUniformOp(op)) {
+					finish_frame(frame, false);
+					continue;
+				}
+				if (inst->NumArgs() == 0) {
+					finish_frame(frame, true);
+					continue;
+				}
+				frame.step      = ValidateFrame::Step::AfterArgs;
+				frame.arg_index = 1;
+				push_child(inst->Arg(0), true, frame.type);
+				continue;
+			}
+
+			switch (frame.step) {
+				case ValidateFrame::Step::AfterReadConstSlot: {
+					m_active_mask        = frame.saved_mask;
+					frame.has_saved_mask = false;
+					if (!last_result) {
+						finish_frame(frame, false);
+						break;
+					}
+					if (frame.inst->NumArgs() == 0) {
+						finish_frame(frame, true);
+						break;
+					}
+					frame.step      = ValidateFrame::Step::AfterArgs;
+					frame.arg_index = 1;
+					push_child(frame.inst->Arg(0), true, frame.type);
+					break;
+				}
+				case ValidateFrame::Step::AfterSelectAnyCheck: {
+					m_active_mask        = frame.saved_mask;
+					frame.has_saved_mask = false;
+					if (!last_result) {
+						// Condition is not unmasked uniform; active mask proves Arg(1) runs.
+						if (frame.type != RuntimeValueType::Any) {
+							frame.step = ValidateFrame::Step::AfterSelectFalseArm;
+							push_child(frame.inst->Arg(2), false, frame.type);
+						} else {
+							frame.step      = ValidateFrame::Step::Enter;
+							frame.tail_only = true;
+							push_child(frame.inst->Arg(1), true, frame.type);
+						}
+						break;
+					}
+					frame.step      = ValidateFrame::Step::AfterArgs;
+					frame.arg_index = 1;
+					push_child(frame.inst->Arg(0), true, frame.type);
+					break;
+				}
+				case ValidateFrame::Step::AfterSelectFalseArm: {
+					if (!last_result) {
+						finish_frame(frame, false);
+						break;
+					}
+					frame.step      = ValidateFrame::Step::Enter;
+					frame.tail_only = true;
+					push_child(frame.inst->Arg(1), true, frame.type);
+					break;
+				}
+				case ValidateFrame::Step::AfterPhiArm: {
+					if (!last_result) {
+						finish_frame(frame, false);
+						break;
+					}
+					const auto* inst  = frame.inst;
+					const auto* merge = inst->Parent();
+					bool        pushed = false;
+					if (frame.type != RuntimeValueType::Any) {
+						while (frame.arg_index < inst->NumArgs()) {
+							const size_t idx = frame.arg_index++;
+							if (merge != nullptr && idx < inst->NumPhiBlocks() &&
+							    IsUnreachablePhiEdge(inst->PhiBlock(idx), merge)) {
+								continue;
+							}
+							push_child(inst->Arg(idx), false, frame.type);
+							pushed = true;
+							break;
+						}
+					}
+					if (pushed) break;
+					const auto invariant = ResolveInvariantPhi(m_program, frame.value);
+					if (invariant.IsEmpty()) {
+						finish_frame(frame, false);
+						break;
+					}
+					frame.step      = ValidateFrame::Step::Enter;
+					frame.tail_only = true;
+					push_child(invariant, true, frame.type);
+					break;
+				}
+				case ValidateFrame::Step::AfterReadFirstLaneMask: {
+					if (!last_result) {
+						finish_frame(frame, false);
+						break;
+					}
+					frame.saved_mask     = m_active_mask;
+					frame.has_saved_mask = true;
+					m_active_mask        = frame.inst->Arg(1).Resolve();
+					frame.step           = ValidateFrame::Step::Enter;
+					frame.tail_only      = true;
+					push_child(frame.inst->Arg(0), true, frame.type);
+					break;
+				}
+				case ValidateFrame::Step::AfterArgs: {
+					if (!last_result) {
+						finish_frame(frame, false);
+						break;
+					}
+					const auto* inst          = frame.inst;
+					const bool  vector_dwords = VectorBufferReadDwords(inst->GetOpcode()) != 0u;
+					if (vector_dwords && frame.arg_index == 4u) {
+						const auto guard = inst->Arg(4).Resolve();
+						if (!m_active_mask.IsEmpty() && guard == m_active_mask) {
+							finish_frame(frame, true);
+							break;
+						}
+					}
+					if (frame.arg_index >= inst->NumArgs()) {
+						finish_frame(frame, true);
+						break;
+					}
+					const size_t idx = frame.arg_index++;
+					push_child(inst->Arg(idx), frame.require_uniform, frame.type);
+					break;
+				}
+				default: finish_frame(frame, false); break;
+			}
 		}
-		if (op == ValueOpcode::ReadFirstLane) {
-			++m_lane_reads;
-			if (inst->NumArgs() != 2 || inst->Arg(0).GetType() != Type::U32 ||
-			    inst->Arg(1).GetType() != Type::U1) {
-				return finish(false);
-			}
-			if (m_type != RuntimeValueType::Any && !Validate(inst->Arg(1), false)) {
-				return finish(false);
-			}
-			const auto active_mask = m_active_mask;
-			m_active_mask          = inst->Arg(1).Resolve();
-			const bool valid       = Validate(inst->Arg(0));
-			m_active_mask          = active_mask;
-			return finish(valid);
-		}
-		if (op == ValueOpcode::GetSrtResource) {
-			if (inst->NumArgs() != 0) {
-				return finish(false);
-			}
-			return finish(true);
-		}
-		const auto vector_dwords = VectorBufferReadDwords(op);
-		if (op == ValueOpcode::LoadAddressU32 || op == ValueOpcode::ReadConstBuffer ||
-		    vector_dwords != 0u) {
-			const auto  expected = op == ValueOpcode::LoadAddressU32
-			                           ? ValueOpcode::GetAddressResource
-			                           : ValueOpcode::GetBufferResource;
-			const auto* handle = inst->NumArgs() != 0 ? inst->Arg(0).Resolve().TryInstruction() : nullptr;
-			if (!IsRawRead(m_program, *inst) || handle == nullptr ||
-			    handle->GetOpcode() != expected) {
-				return finish(false);
-			}
-			if (vector_dwords != 0u) {
-				const auto guard = inst->Arg(4).Resolve();
-				return finish(Validate(inst->Arg(0)) && Validate(inst->Arg(1)) &&
-				              Validate(inst->Arg(2)) && Validate(inst->Arg(3)) &&
-				              ((!m_active_mask.IsEmpty() && guard == m_active_mask) || Validate(guard)));
-			}
-		} else if (op == ValueOpcode::CompositeExtractU64) {
-			const auto index = inst->NumArgs() == 2 ? inst->Arg(1).Resolve() : Value {};
-			if (!index.IsImmediate() || index.GetType() != Type::U32 || index.U32() >= 2u) {
-				return finish(false);
-			}
-		} else if (const auto dwords = CompositeExtractDwords(op); dwords != 0u) {
-			const auto* source = inst->NumArgs() == 2 ? inst->Arg(0).Resolve().TryInstruction() : nullptr;
-			const auto  index  = inst->NumArgs() == 2 ? inst->Arg(1).Resolve() : Value {};
-			if (source == nullptr || !index.IsImmediate() || index.GetType() != Type::U32 ||
-			    index.U32() >= dwords ||
-			    (source->GetOpcode() != CompositeConstructForDwords(dwords) &&
-			     VectorBufferReadDwords(source->GetOpcode()) != dwords)) {
-				return finish(false);
-			}
-		}
-		if (IsDescriptorHandle(op)) {
-			size_t expected = 4u;
-			if (op == ValueOpcode::GetImageResource) {
-				expected = 8u;
-			} else if (op == ValueOpcode::GetAddressResource) {
-				expected = 2u;
-			}
-			if (inst->NumArgs() != expected) {
-				return finish(false);
-			}
-		} else if (op != ValueOpcode::ReadConst && op != ValueOpcode::ReadConstBuffer &&
-		           op != ValueOpcode::LoadAddressU32 && !IsRuntimeUniformOp(op)) {
-			return finish(false);
-		}
-		return finish(ValidateArguments(*inst, true));
+		return last_result;
 	}
 
 	const ResourcePlan&             m_program;
@@ -459,8 +690,11 @@ private:
 	bool                            m_wave_uniform;
 	Value                           m_active_mask;
 	std::unordered_set<const Inst*> m_visiting;
+	std::unordered_set<const Inst*> m_visiting_any;
 	std::unordered_set<const Inst*> m_validated_dependencies;
 	std::unordered_set<const Inst*> m_validated_uniform;
+	std::unordered_set<const Inst*> m_validated_any_deps;
+	std::unordered_set<const Inst*> m_validated_any_uniform;
 	size_t                          m_lane_reads = 0;
 };
 
@@ -529,8 +763,6 @@ private:
 	void AddOutput(Value value, uint32_t gate);
 	void Consume(std::vector<std::vector<uint32_t>>& gates);
 	Ref Evaluate(Value value, uint32_t context);
-	Operand Analyze(uint32_t index);
-	Operand AnalyzeRead(Node& node, const auto& arg, Operand self);
 	void Layout();
 	void Gate(std::vector<uint32_t>& gates, const Xbyak::Label& skip);
 	void Zero(uint32_t offset, uint32_t size);
@@ -618,222 +850,598 @@ void WalkerCompiler::Consume(std::vector<std::vector<uint32_t>>& gates) {
 	}
 }
 
-WalkerCompiler::Ref WalkerCompiler::Evaluate(Value value, uint32_t context) {
-	value = value.Resolve();
-	if (value.IsEmpty()) return {};
-	if (value.IsImmediate()) {
-		uint64_t bits = 0;
-		return ImmediateBits(value, bits) ? Ref {{Kind::Constant, bits}} : Ref {};
-	}
-	const auto mask = m_masks[context];
-	if (context != 0 && value == mask) return {{Kind::Constant, 1u}, true};
-	if (context != 0 && MaskImplies(mask, value)) {
-		if (const auto unmasked = Evaluate(value, 0); unmasked.operand.kind != Kind::Unknown) {
-			return unmasked;
+WalkerCompiler::Ref WalkerCompiler::Evaluate(Value root, uint32_t root_context) {
+	enum class FrameStep : uint8_t {
+		Enter,
+		DispatchNode,
+		ReturnForceMasked,
+		ReturnUnmaskedOperand,
+		AfterMaskImpliesUnmasked,
+		AfterSelectCondCheck,
+		AfterUnmaskedRetry,
+		AnalyzePhiArg,
+		AnalyzeSelectCond,
+		AnalyzeSelectChosen,
+		AnalyzeSelectTrue,
+		AnalyzeSelectFalse,
+		AnalyzeUCmpBound,
+		AnalyzeUCmpOther,
+		AnalyzeLogicalFirst,
+		AnalyzeLogicalSecond,
+		AnalyzeLogicalRefined,
+		AnalyzeDefaultArg,
+		AnalyzeReadGuard,
+		AnalyzeReadWord,
+	};
+
+	struct Frame {
+		FrameStep            step       = FrameStep::Enter;
+		Value                value;
+		uint32_t             context    = 0;
+		uint32_t             node_index = UINT32_MAX;
+		size_t               arg_index  = 0;
+		bool                 known      = false;
+		bool                 failed     = false;
+		bool                 read_buf   = false;
+		bool                 read_vec   = false;
+		Operand              op_a {};
+		Operand              op_b {};
+		std::array<Value, 7> read_words {};
+		uint8_t              read_count = 0;
+	};
+
+	const auto constant = [](uint64_t val) { return Operand {Kind::Constant, val}; };
+
+	std::vector<Frame> stack;
+	stack.push_back(Frame {.step = FrameStep::Enter, .value = root, .context = root_context});
+	Ref last_ref {};
+
+	const auto finish_frame = [&](Ref ref) {
+		last_ref = ref;
+		stack.pop_back();
+	};
+
+	const auto finish_node = [&](Frame& frame, Operand op_res) {
+		auto& node   = m_nodes[frame.node_index];
+		node.result  = op_res;
+		node.pending = false;
+		if (node.context != 0 && !node.masked && !node.referenced) {
+			frame.step = FrameStep::AfterUnmaskedRetry;
+			stack.push_back(
+			    Frame {.step = FrameStep::Enter, .value = frame.value, .context = 0u});
+			return;
 		}
-		return {{Kind::Constant, 1u}, true};
-	}
-	const auto* inst = value.TryInstruction();
-	if (inst == nullptr) return {};
-	const auto op = inst->GetOpcode();
-	if (context != 0 && IsRuntimeSelect(op) && inst->NumArgs() == 3 &&
-	    MaskImplies(mask, inst->Arg(0)) &&
-	    (inst->Arg(0).Resolve() == mask ||
-	     Evaluate(inst->Arg(0), 0).operand.kind == Kind::Unknown)) {
-		return {Evaluate(inst->Arg(1), context).operand, true};
-	}
-	switch (op) {
-		case ValueOpcode::BitCastU32F32:
-		case ValueOpcode::BitCastF32U32:
-		case ValueOpcode::ConditionRef: return Evaluate(inst->Arg(0), context);
-		case ValueOpcode::CompositeExtractU32x2:
-		case ValueOpcode::CompositeExtractU32x3:
-		case ValueOpcode::CompositeExtractU32x4: {
-			const auto  dwords = CompositeExtractDwords(op);
-			const auto* source = inst->NumArgs() == 2 ? inst->Arg(0).Resolve().TryInstruction() : nullptr;
-			const auto  index  = inst->NumArgs() == 2 ? inst->Arg(1).Resolve() : Value {};
-			if (source == nullptr || !index.IsImmediate() || index.GetType() != Type::U32 ||
-			    index.U32() >= dwords) {
-				return {};
-			}
-			if (source->GetOpcode() == CompositeConstructForDwords(dwords)) {
-				return Evaluate(source->Arg(index.U32()), context);
-			}
-			if (VectorBufferReadDwords(source->GetOpcode()) == dwords) {
+		finish_frame({node.result, node.masked});
+	};
+
+	const auto push_eval = [&](Value v, uint32_t ctx) {
+		stack.push_back(Frame {.step = FrameStep::Enter, .value = v, .context = ctx});
+	};
+
+	while (!stack.empty()) {
+		auto& frame = stack.back();
+		switch (frame.step) {
+			case FrameStep::ReturnForceMasked:
+				finish_frame({last_ref.operand, true});
+				break;
+			case FrameStep::ReturnUnmaskedOperand:
+				finish_frame({last_ref.operand, false});
+				break;
+			case FrameStep::AfterMaskImpliesUnmasked:
+				if (last_ref.operand.kind != Kind::Unknown) {
+					finish_frame(last_ref);
+				} else {
+					finish_frame({{Kind::Constant, 1u}, true});
+				}
+				break;
+			case FrameStep::AfterUnmaskedRetry: {
+				auto& node  = m_nodes[frame.node_index];
+				node.result = last_ref.operand;
+				finish_frame({node.result, false});
 				break;
 			}
-			return {};
-		}
-		case ValueOpcode::ReadFirstLane:
-			// The lane read does not depend on the EXEC mask it is read under.
-			return {Evaluate(inst->Arg(0), Context(inst->Arg(1))).operand};
-		case ValueOpcode::GetUserData: {
-			const auto reg = RegIndex(inst->Arg(0).ScalarRegister());
-			if (reg < m_plan.user_data_base || reg - m_plan.user_data_base >= m_plan.user_data_count) return {};
-			return {{Kind::UserData, reg - m_plan.user_data_base}};
-		}
-		case ValueOpcode::GetShaderBase: return {{Kind::ShaderBase}};
-		case ValueOpcode::Phi:
-			if (!m_plan.control_phi_predecessors.contains(inst)) {
-				const auto invariant = ResolveInvariantPhi(m_plan, value);
-				return invariant.IsEmpty() ? Ref {} : Evaluate(invariant, context);
-			}
-			break;
-		default: break;
-	}
-	const auto [found, inserted] = m_memo.try_emplace({inst, context}, static_cast<uint32_t>(m_nodes.size()));
-	const auto index = found->second;
-	if (!inserted) {
-		auto& node = m_nodes[index];
-		if (!node.pending) return {node.result, node.masked};
-		// A cycle: the thunk reads as unknown while it runs.
-		node.referenced = true;
-		return {{Kind::Node, index}, context != 0};
-	}
-	auto& node   = m_nodes.emplace_back();
-	node.inst    = inst;
-	node.context = context;
-	node.result  = Analyze(index);
-	node.pending = false;
-	if (context != 0 && !node.masked && !node.referenced) {
-		node.result = Evaluate(value, 0).operand;
-		return {node.result};
-	}
-	return {node.result, node.masked};
-}
+			case FrameStep::Enter:
+			case FrameStep::AfterSelectCondCheck: {
+				const bool skip_select_check = frame.step == FrameStep::AfterSelectCondCheck;
+				bool       done_or_pushed    = false;
+				for (;;) {
+					if (!skip_select_check || frame.step == FrameStep::Enter) {
+						frame.value = frame.value.Resolve();
+						if (frame.value.IsEmpty()) {
+							finish_frame({});
+							done_or_pushed = true;
+							break;
+						}
+						if (frame.value.IsImmediate()) {
+							uint64_t bits = 0;
+							finish_frame(ImmediateBits(frame.value, bits)
+							                 ? Ref {{Kind::Constant, bits}}
+							                 : Ref {});
+							done_or_pushed = true;
+							break;
+						}
+						const auto mask = m_masks[frame.context];
+						if (frame.context != 0 && frame.value == mask) {
+							finish_frame({{Kind::Constant, 1u}, true});
+							done_or_pushed = true;
+							break;
+						}
+						if (frame.context != 0 && MaskImplies(mask, frame.value)) {
+							frame.step = FrameStep::AfterMaskImpliesUnmasked;
+							push_eval(frame.value, 0u);
+							done_or_pushed = true;
+							break;
+						}
+					} else if (last_ref.operand.kind == Kind::Unknown) {
+						const auto* select_inst = frame.value.TryInstruction();
+						frame.step              = FrameStep::ReturnForceMasked;
+						push_eval(select_inst->Arg(1), frame.context);
+						done_or_pushed = true;
+						break;
+					}
 
-WalkerCompiler::Operand WalkerCompiler::Analyze(uint32_t index) {
-	auto&       node = m_nodes[index];
-	const auto& inst = *node.inst;
-	const auto  self = Operand {Kind::Node, index};
-	const auto  arg  = [&](Value value) {
-		const auto ref = Evaluate(value, node.context);
-		node.masked |= ref.masked;
-		return ref.operand;
-	};
-	const auto constant = [](uint64_t value) { return Operand {Kind::Constant, value}; };
-	switch (inst.GetOpcode()) {
-		case ValueOpcode::Phi: {
-			bool known = false;
-			for (size_t i = 0; i < inst.NumArgs(); ++i) {
-				node.args.push_back(arg(inst.Arg(i)));
-				known |= node.args.back().kind != Kind::Unknown;
-			}
-			return known ? self : Operand {};
-		}
-		case ValueOpcode::LoadAddressU32:
-		case ValueOpcode::ReadConstBuffer:
-		case ValueOpcode::LoadBufferU32:
-		case ValueOpcode::CompositeExtractU32x2:
-		case ValueOpcode::CompositeExtractU32x3:
-		case ValueOpcode::CompositeExtractU32x4: return AnalyzeRead(node, arg, self);
-		case ValueOpcode::SelectU1:
-		case ValueOpcode::SelectU32:
-		case ValueOpcode::SelectF32: {
-			const auto predicate = arg(inst.Arg(0));
-			if (predicate.kind == Kind::Unknown) return {};
-			if (predicate.kind == Kind::Constant) return arg(inst.Arg(predicate.value != 0u ? 1 : 2));
-			node.args = {predicate, arg(inst.Arg(1)), arg(inst.Arg(2))};
-			return node.args[1].kind == Kind::Unknown && node.args[2].kind == Kind::Unknown ? Operand {} : self;
-		}
-		case ValueOpcode::ULessThan32:
-		case ValueOpcode::ULessThanEqual32:
-		case ValueOpcode::UGreaterThanEqual32: {
-			// No U32 is below zero and every U32 is at least zero, including an unknown loop-carried
-			// or varying lane value. args[0] is that zero-tested bound.
-			const auto op          = inst.GetOpcode();
-			const bool less        = op == ValueOpcode::ULessThan32;
-			const bool bound_right = less || op == ValueOpcode::UGreaterThanEqual32;
-			const auto bound       = arg(inst.Arg(bound_right ? 1 : 0));
-			if (bound.kind == Kind::Unknown) return {};
-			if (bound.kind == Kind::Constant && static_cast<uint32_t>(bound.value) == 0u) return constant(!less);
-			node.args = {bound, arg(inst.Arg(bound_right ? 0 : 1))};
-			return node.args[1].kind == Kind::Unknown && bound.kind == Kind::Constant ? Operand {} : self;
-		}
-		case ValueOpcode::LogicalOr:
-		case ValueOpcode::LogicalAnd: {
-			// A deciding operand, nonzero for Or and zero for And, fixes the result.
-			const bool conjunction = inst.GetOpcode() == ValueOpcode::LogicalAnd;
-			const auto decides     = [&](const Operand& x) {
-				return x.kind == Kind::Constant && (x.value == 0u) == conjunction;
-			};
-			const auto a = arg(inst.Arg(0));
-			if (decides(a)) return constant(!conjunction);
-			const auto b = arg(inst.Arg(1));
-			if (decides(b)) return constant(!conjunction);
-			if (a.kind == Kind::Constant && b.kind == Kind::Constant) return constant(conjunction);
-			if (a.kind == Kind::Constant && b.kind == Kind::Unknown) return {};
-			// Only lanes satisfying the left EXEC factor can make a conjunction true, so an
-			// unknown left side retries the right one under that factor as its mask.
-			Operand refined;
-			if (conjunction && MayBeUnknown(a)) {
-				refined = Evaluate(inst.Arg(1), Context(inst.Arg(0))).operand;
-				if (refined == b || (refined.kind == Kind::Constant && refined.value != 0u)) refined = {};
-				if (a.kind == Kind::Unknown && refined.kind == Kind::Constant) return constant(0u);
-			}
-			if (a.kind == Kind::Unknown && refined.kind == Kind::Unknown &&
-			    (b.kind == Kind::Unknown || b.kind == Kind::Constant)) return {};
-			node.args = {a, b, refined};
-			return self;
-		}
-		case ValueOpcode::CompositeExtractU64: {
-			const auto component = inst.Arg(1).Resolve();
-			if (!component.IsImmediate() || component.GetType() != Type::U32 || component.U32() >= 2u) return {};
-			[[fallthrough]];
-		}
-		default:
-			// The other runtime-uniform ops are strict; composite pairs/vectors are only read through their extracts.
-			if (!IsRuntimeUniformOp(inst.GetOpcode()) ||
-			    inst.GetOpcode() == ValueOpcode::CompositeConstructU32x2 ||
-			    inst.GetOpcode() == ValueOpcode::CompositeConstructU32x3 ||
-			    inst.GetOpcode() == ValueOpcode::CompositeConstructU32x4)
-				return {};
-			for (size_t i = 0; i < inst.NumArgs(); ++i) {
-				node.args.push_back(arg(inst.Arg(i)));
-				if (node.args.back().kind == Kind::Unknown) return {};
-			}
-			return self;
-	}
-}
+					const auto* inst = frame.value.TryInstruction();
+					if (inst == nullptr) {
+						finish_frame({});
+						done_or_pushed = true;
+						break;
+					}
+					const auto op   = inst->GetOpcode();
+					const auto mask = m_masks[frame.context];
+					if (!skip_select_check && frame.context != 0 && IsRuntimeSelect(op) &&
+					    inst->NumArgs() == 3 && MaskImplies(mask, inst->Arg(0))) {
+						if (inst->Arg(0).Resolve() == mask) {
+							frame.step = FrameStep::ReturnForceMasked;
+							push_eval(inst->Arg(1), frame.context);
+							done_or_pushed = true;
+							break;
+						}
+						frame.step = FrameStep::AfterSelectCondCheck;
+						push_eval(inst->Arg(0), 0u);
+						done_or_pushed = true;
+						break;
+					}
 
-WalkerCompiler::Operand WalkerCompiler::AnalyzeRead(Node& node, const auto& arg, Operand self) {
-	const Inst* read_inst = nullptr;
-	uint32_t    component = 0u;
-	if (!UnpackReadNode(*node.inst, read_inst, component)) return {};
-	const auto* handle = read_inst->Arg(0).Resolve().TryInstruction();
-	if (!IsRawRead(m_plan, *read_inst) || handle == nullptr) return {};
-	const bool vector = VectorBufferReadDwords(read_inst->GetOpcode()) != 0u;
-	if (vector) {
-		const auto guard = arg(read_inst->Arg(4));
-		if (guard.kind == Kind::Unknown) return {};
-		if (guard.kind == Kind::Constant && guard.value == 0u) return {Kind::Constant, 0u};
-		node.args.push_back(guard);
+					// Now dispatch on op / memoize (either directly or after select check).
+					bool tail_chase = false;
+					switch (op) {
+						case ValueOpcode::BitCastU32F32:
+						case ValueOpcode::BitCastF32U32:
+						case ValueOpcode::ConditionRef:
+							frame.value = inst->Arg(0);
+							frame.step  = FrameStep::Enter;
+							tail_chase  = true;
+							break;
+						case ValueOpcode::CompositeExtractU32x2:
+						case ValueOpcode::CompositeExtractU32x3:
+						case ValueOpcode::CompositeExtractU32x4: {
+							const auto dwords = CompositeExtractDwords(op);
+							const auto* source =
+							    inst->NumArgs() == 2 ? inst->Arg(0).Resolve().TryInstruction() : nullptr;
+							const auto index =
+							    inst->NumArgs() == 2 ? inst->Arg(1).Resolve() : Value {};
+							if (source == nullptr || !index.IsImmediate() ||
+							    index.GetType() != Type::U32 || index.U32() >= dwords) {
+								finish_frame({});
+								done_or_pushed = true;
+								break;
+							}
+							if (source->GetOpcode() == CompositeConstructForDwords(dwords)) {
+								frame.value = source->Arg(index.U32());
+								frame.step  = FrameStep::Enter;
+								tail_chase  = true;
+								break;
+							}
+							if (VectorBufferReadDwords(source->GetOpcode()) == dwords) {
+								break;
+							}
+							finish_frame({});
+							done_or_pushed = true;
+							break;
+						}
+						case ValueOpcode::ReadFirstLane:
+							frame.step = FrameStep::ReturnUnmaskedOperand;
+							push_eval(inst->Arg(0), Context(inst->Arg(1)));
+							done_or_pushed = true;
+							break;
+						case ValueOpcode::GetUserData: {
+							const auto reg = RegIndex(inst->Arg(0).ScalarRegister());
+							if (reg < m_plan.user_data_base ||
+							    reg - m_plan.user_data_base >= m_plan.user_data_count) {
+								finish_frame({});
+							} else {
+								finish_frame({{Kind::UserData, reg - m_plan.user_data_base}});
+							}
+							done_or_pushed = true;
+							break;
+						}
+						case ValueOpcode::GetShaderBase:
+							finish_frame({{Kind::ShaderBase}});
+							done_or_pushed = true;
+							break;
+						case ValueOpcode::Phi:
+							if (!m_plan.control_phi_predecessors.contains(inst)) {
+								const auto invariant = ResolveInvariantPhi(m_plan, frame.value);
+								if (invariant.IsEmpty()) {
+									finish_frame({});
+									done_or_pushed = true;
+									break;
+								}
+								frame.value = invariant;
+								frame.step  = FrameStep::Enter;
+								tail_chase  = true;
+								break;
+							}
+							break;
+						default: break;
+					}
+					if (done_or_pushed) break;
+					if (tail_chase) {
+						frame.step = FrameStep::Enter;
+						break;
+					}
+
+					const auto [found, inserted] =
+					    m_memo.try_emplace({inst, frame.context},
+					                       static_cast<uint32_t>(m_nodes.size()));
+					const auto index = found->second;
+					if (!inserted) {
+						auto& existing = m_nodes[index];
+						if (!existing.pending) {
+							finish_frame({existing.result, existing.masked});
+						} else {
+							existing.referenced = true;
+							finish_frame({{Kind::Node, index}, frame.context != 0});
+						}
+						done_or_pushed = true;
+						break;
+					}
+					auto& node   = m_nodes.emplace_back();
+					node.inst    = inst;
+					node.context = frame.context;
+					frame.node_index = index;
+					frame.step       = FrameStep::DispatchNode;
+					done_or_pushed   = true;
+					break;
+				}
+				(void)done_or_pushed;
+				break;
+			}
+			case FrameStep::DispatchNode: {
+				auto&       node    = m_nodes[frame.node_index];
+				const auto& inst    = *node.inst;
+				const auto  self    = Operand {Kind::Node, frame.node_index};
+				const auto  op      = inst.GetOpcode();
+				const auto  context = node.context;
+				switch (op) {
+					case ValueOpcode::Phi: {
+						if (inst.NumArgs() == 0u) {
+							finish_node(frame, Operand {});
+							break;
+						}
+						frame.step      = FrameStep::AnalyzePhiArg;
+						frame.arg_index = 0u;
+						frame.known     = false;
+						push_eval(inst.Arg(0), context);
+						break;
+					}
+					case ValueOpcode::LoadAddressU32:
+					case ValueOpcode::ReadConstBuffer:
+					case ValueOpcode::LoadBufferU32:
+					case ValueOpcode::CompositeExtractU32x2:
+					case ValueOpcode::CompositeExtractU32x3:
+					case ValueOpcode::CompositeExtractU32x4: {
+						const Inst* read_inst = nullptr;
+						uint32_t    component = 0u;
+						if (!UnpackReadNode(inst, read_inst, component)) {
+							finish_node(frame, Operand {});
+							break;
+						}
+						const auto* handle = read_inst->Arg(0).Resolve().TryInstruction();
+						if (!IsRawRead(m_plan, *read_inst) || handle == nullptr) {
+							finish_node(frame, Operand {});
+							break;
+						}
+						const bool vector = VectorBufferReadDwords(read_inst->GetOpcode()) != 0u;
+						const bool buffer = read_inst->GetOpcode() != ValueOpcode::LoadAddressU32;
+						const auto offset = static_cast<int32_t>(
+						    m_plan.memory_info[read_inst->Flags<MemoryFlags>().index].offset);
+						frame.read_vec = vector;
+						frame.read_buf = buffer;
+						frame.failed   = buffer && (handle->NumArgs() != 4u || offset < 0);
+						if (vector) {
+							frame.read_words = {handle->Arg(0), handle->Arg(1), handle->Arg(2),
+							                    handle->Arg(3), read_inst->Arg(1),
+							                    read_inst->Arg(2), read_inst->Arg(3)};
+							frame.read_count = 7u;
+							frame.step       = FrameStep::AnalyzeReadGuard;
+							push_eval(read_inst->Arg(4), context);
+						} else {
+							frame.read_words[0] = handle->Arg(0);
+							frame.read_words[1] = handle->Arg(1);
+							frame.read_words[2] = read_inst->Arg(1);
+							if (buffer && handle->NumArgs() == 4u) {
+								frame.read_words[3] = handle->Arg(2);
+								frame.read_words[4] = handle->Arg(3);
+							}
+							frame.read_count    = 3u;
+							frame.arg_index     = 0u;
+							frame.step          = FrameStep::AnalyzeReadWord;
+							push_eval(frame.read_words[0], context);
+						}
+						break;
+					}
+					case ValueOpcode::SelectU1:
+					case ValueOpcode::SelectU32:
+					case ValueOpcode::SelectF32:
+						frame.step = FrameStep::AnalyzeSelectCond;
+						push_eval(inst.Arg(0), context);
+						break;
+					case ValueOpcode::ULessThan32:
+					case ValueOpcode::ULessThanEqual32:
+					case ValueOpcode::UGreaterThanEqual32: {
+						const bool bound_right =
+						    op == ValueOpcode::ULessThan32 || op == ValueOpcode::UGreaterThanEqual32;
+						frame.step = FrameStep::AnalyzeUCmpBound;
+						push_eval(inst.Arg(bound_right ? 1 : 0), context);
+						break;
+					}
+					case ValueOpcode::LogicalOr:
+					case ValueOpcode::LogicalAnd:
+						frame.step = FrameStep::AnalyzeLogicalFirst;
+						push_eval(inst.Arg(0), context);
+						break;
+					case ValueOpcode::CompositeExtractU64: {
+						const auto component = inst.Arg(1).Resolve();
+						if (!component.IsImmediate() || component.GetType() != Type::U32 ||
+						    component.U32() >= 2u) {
+							finish_node(frame, Operand {});
+							break;
+						}
+						[[fallthrough]];
+					}
+					default: {
+						if (!IsRuntimeUniformOp(op) ||
+						    op == ValueOpcode::CompositeConstructU32x2 ||
+						    op == ValueOpcode::CompositeConstructU32x3 ||
+						    op == ValueOpcode::CompositeConstructU32x4) {
+							finish_node(frame, Operand {});
+							break;
+						}
+						if (inst.NumArgs() == 0u) {
+							finish_node(frame, self);
+							break;
+						}
+						frame.step      = FrameStep::AnalyzeDefaultArg;
+						frame.arg_index = 0u;
+						push_eval(inst.Arg(0), context);
+						break;
+					}
+				}
+				break;
+			}
+			case FrameStep::AnalyzePhiArg: {
+				auto&       node = m_nodes[frame.node_index];
+				const auto& inst = *node.inst;
+				node.masked |= last_ref.masked;
+				node.args.push_back(last_ref.operand);
+				frame.known |= last_ref.operand.kind != Kind::Unknown;
+				if (++frame.arg_index < inst.NumArgs()) {
+					push_eval(inst.Arg(frame.arg_index), node.context);
+					break;
+				}
+				finish_node(frame, frame.known ? Operand {Kind::Node, frame.node_index} : Operand {});
+				break;
+			}
+			case FrameStep::AnalyzeReadGuard: {
+				auto& node = m_nodes[frame.node_index];
+				node.masked |= last_ref.masked;
+				const auto guard = last_ref.operand;
+				if (guard.kind == Kind::Unknown) {
+					finish_node(frame, Operand {});
+					break;
+				}
+				if (guard.kind == Kind::Constant && guard.value == 0u) {
+					finish_node(frame, Operand {Kind::Constant, 0u});
+					break;
+				}
+				node.args.push_back(guard);
+				frame.arg_index = 0u;
+				frame.step      = FrameStep::AnalyzeReadWord;
+				push_eval(frame.read_words[0], node.context);
+				break;
+			}
+			case FrameStep::AnalyzeReadWord: {
+				auto& node = m_nodes[frame.node_index];
+				node.masked |= last_ref.masked;
+				node.args.push_back(last_ref.operand);
+				frame.failed |= last_ref.operand.kind == Kind::Unknown;
+				++frame.arg_index;
+				if (!frame.read_vec && frame.arg_index == 3u && frame.read_buf && !frame.failed) {
+					frame.read_count = 5u;
+				}
+				if (frame.arg_index < frame.read_count) {
+					push_eval(frame.read_words[frame.arg_index], node.context);
+					break;
+				}
+				if (!frame.failed) {
+					finish_node(frame, Operand {Kind::Node, frame.node_index});
+					break;
+				}
+				if (!frame.read_vec || node.args[0].kind == Kind::Constant) {
+					finish_node(frame, Operand {});
+					break;
+				}
+				node.args.resize(1u);
+				finish_node(frame, Operand {Kind::Node, frame.node_index});
+				break;
+			}
+			case FrameStep::AnalyzeSelectCond: {
+				auto&       node = m_nodes[frame.node_index];
+				const auto& inst = *node.inst;
+				node.masked |= last_ref.masked;
+				const auto predicate = last_ref.operand;
+				if (predicate.kind == Kind::Unknown) {
+					finish_node(frame, Operand {});
+					break;
+				}
+				if (predicate.kind == Kind::Constant) {
+					frame.step = FrameStep::AnalyzeSelectChosen;
+					push_eval(inst.Arg(predicate.value != 0u ? 1 : 2), node.context);
+					break;
+				}
+				frame.op_a = predicate;
+				frame.step = FrameStep::AnalyzeSelectTrue;
+				push_eval(inst.Arg(1), node.context);
+				break;
+			}
+			case FrameStep::AnalyzeSelectChosen: {
+				auto& node = m_nodes[frame.node_index];
+				node.masked |= last_ref.masked;
+				finish_node(frame, last_ref.operand);
+				break;
+			}
+			case FrameStep::AnalyzeSelectTrue: {
+				auto&       node = m_nodes[frame.node_index];
+				const auto& inst = *node.inst;
+				node.masked |= last_ref.masked;
+				frame.op_b = last_ref.operand;
+				frame.step = FrameStep::AnalyzeSelectFalse;
+				push_eval(inst.Arg(2), node.context);
+				break;
+			}
+			case FrameStep::AnalyzeSelectFalse: {
+				auto& node = m_nodes[frame.node_index];
+				node.masked |= last_ref.masked;
+				node.args = {frame.op_a, frame.op_b, last_ref.operand};
+				finish_node(frame, node.args[1].kind == Kind::Unknown &&
+				                           node.args[2].kind == Kind::Unknown
+				                       ? Operand {}
+				                       : Operand {Kind::Node, frame.node_index});
+				break;
+			}
+			case FrameStep::AnalyzeUCmpBound: {
+				auto&       node        = m_nodes[frame.node_index];
+				const auto& inst        = *node.inst;
+				const auto  op          = inst.GetOpcode();
+				const bool  less        = op == ValueOpcode::ULessThan32;
+				const bool  bound_right = less || op == ValueOpcode::UGreaterThanEqual32;
+				node.masked |= last_ref.masked;
+				const auto bound = last_ref.operand;
+				if (bound.kind == Kind::Unknown) {
+					finish_node(frame, Operand {});
+					break;
+				}
+				if (bound.kind == Kind::Constant && static_cast<uint32_t>(bound.value) == 0u) {
+					finish_node(frame, constant(!less));
+					break;
+				}
+				frame.op_a = bound;
+				frame.step = FrameStep::AnalyzeUCmpOther;
+				push_eval(inst.Arg(bound_right ? 0 : 1), node.context);
+				break;
+			}
+			case FrameStep::AnalyzeUCmpOther: {
+				auto& node = m_nodes[frame.node_index];
+				node.masked |= last_ref.masked;
+				node.args = {frame.op_a, last_ref.operand};
+				finish_node(frame,
+				            node.args[1].kind == Kind::Unknown && frame.op_a.kind == Kind::Constant
+				                ? Operand {}
+				                : Operand {Kind::Node, frame.node_index});
+				break;
+			}
+			case FrameStep::AnalyzeLogicalFirst: {
+				auto&       node        = m_nodes[frame.node_index];
+				const auto& inst        = *node.inst;
+				const bool  conjunction = inst.GetOpcode() == ValueOpcode::LogicalAnd;
+				node.masked |= last_ref.masked;
+				const auto a = last_ref.operand;
+				if (a.kind == Kind::Constant && (a.value == 0u) == conjunction) {
+					finish_node(frame, constant(!conjunction));
+					break;
+				}
+				frame.op_a = a;
+				frame.step = FrameStep::AnalyzeLogicalSecond;
+				push_eval(inst.Arg(1), node.context);
+				break;
+			}
+			case FrameStep::AnalyzeLogicalSecond: {
+				auto&       node        = m_nodes[frame.node_index];
+				const auto& inst        = *node.inst;
+				const bool  conjunction = inst.GetOpcode() == ValueOpcode::LogicalAnd;
+				const auto  decides     = [&](const Operand& x) {
+					return x.kind == Kind::Constant && (x.value == 0u) == conjunction;
+				};
+				node.masked |= last_ref.masked;
+				const auto a = frame.op_a;
+				const auto b = last_ref.operand;
+				if (decides(b)) {
+					finish_node(frame, constant(!conjunction));
+					break;
+				}
+				if (a.kind == Kind::Constant && b.kind == Kind::Constant) {
+					finish_node(frame, constant(conjunction));
+					break;
+				}
+				if (a.kind == Kind::Constant && b.kind == Kind::Unknown) {
+					finish_node(frame, Operand {});
+					break;
+				}
+				if (conjunction && MayBeUnknown(a)) {
+					frame.op_b = b;
+					frame.step = FrameStep::AnalyzeLogicalRefined;
+					push_eval(inst.Arg(1), Context(inst.Arg(0)));
+					break;
+				}
+				if (a.kind == Kind::Unknown && (b.kind == Kind::Unknown || b.kind == Kind::Constant)) {
+					finish_node(frame, Operand {});
+					break;
+				}
+				node.args = {a, b, Operand {}};
+				finish_node(frame, Operand {Kind::Node, frame.node_index});
+				break;
+			}
+			case FrameStep::AnalyzeLogicalRefined: {
+				auto&      node    = m_nodes[frame.node_index];
+				const auto a       = frame.op_a;
+				const auto b       = frame.op_b;
+				auto       refined = last_ref.operand;
+				if (refined == b || (refined.kind == Kind::Constant && refined.value != 0u)) {
+					refined = {};
+				}
+				if (a.kind == Kind::Unknown && refined.kind == Kind::Constant) {
+					finish_node(frame, constant(0u));
+					break;
+				}
+				if (a.kind == Kind::Unknown && refined.kind == Kind::Unknown &&
+				    (b.kind == Kind::Unknown || b.kind == Kind::Constant)) {
+					finish_node(frame, Operand {});
+					break;
+				}
+				node.args = {a, b, refined};
+				finish_node(frame, Operand {Kind::Node, frame.node_index});
+				break;
+			}
+			case FrameStep::AnalyzeDefaultArg: {
+				auto&       node = m_nodes[frame.node_index];
+				const auto& inst = *node.inst;
+				node.masked |= last_ref.masked;
+				node.args.push_back(last_ref.operand);
+				if (last_ref.operand.kind == Kind::Unknown) {
+					finish_node(frame, Operand {});
+					break;
+				}
+				if (++frame.arg_index < inst.NumArgs()) {
+					push_eval(inst.Arg(frame.arg_index), node.context);
+					break;
+				}
+				finish_node(frame, Operand {Kind::Node, frame.node_index});
+				break;
+			}
+		}
 	}
-	const bool buffer = read_inst->GetOpcode() != ValueOpcode::LoadAddressU32;
-	const auto offset =
-	    static_cast<int32_t>(m_plan.memory_info[read_inst->Flags<MemoryFlags>().index].offset);
-	bool failed = buffer && (handle->NumArgs() != 4u || offset < 0);
-	if (vector) {
-		for (const auto& word: {handle->Arg(0), handle->Arg(1), handle->Arg(2), handle->Arg(3),
-		                        read_inst->Arg(1), read_inst->Arg(2), read_inst->Arg(3)}) {
-			node.args.push_back(arg(word));
-			failed |= node.args.back().kind == Kind::Unknown;
-		}
-	} else {
-		for (const auto& word: {handle->Arg(0), handle->Arg(1), read_inst->Arg(1)}) {
-			node.args.push_back(arg(word));
-			failed |= node.args.back().kind == Kind::Unknown;
-		}
-		for (uint32_t word = 2; buffer && !failed && word < 4u; ++word) {
-			node.args.push_back(arg(handle->Arg(word)));
-			failed |= node.args.back().kind == Kind::Unknown;
-		}
-	}
-	if (!failed) return self;
-	// A disabled vector lane still reads zero.
-	if (!vector || node.args[0].kind == Kind::Constant) return {};
-	node.args.resize(1);
-	return self;
+	return last_ref;
 }
 
 void WalkerCompiler::Layout() {

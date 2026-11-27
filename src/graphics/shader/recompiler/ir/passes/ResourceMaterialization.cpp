@@ -1435,55 +1435,97 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	plan.resource_tracking_complete = program.resource_tracking_complete;
 
 	std::unordered_map<const Inst*, Inst*> cloned;
-	std::function<Value(Value)>            Clone = [&](Value value) -> Value {
-		value              = value.Resolve();
-		const auto* source = value.TryInstruction();
-		if (source == nullptr) {
+	const auto unwrap_clone_source = [&](Value value) -> Value {
+		for (;;) {
+			value              = value.Resolve();
+			const auto* source = value.TryInstruction();
+			if (source == nullptr) {
+				return value;
+			}
+			if (source->GetOpcode() == ValueOpcode::ReadConst) {
+				const auto slot = source->Arg(1).Resolve();
+				EXIT_IF(!slot.IsImmediate() || slot.GetType() != Type::U32 ||
+				        slot.U32() >= program.srt_reads.size());
+				value = program.srt_reads[slot.U32()].value;
+				continue;
+			}
+			if (source->GetOpcode() == ValueOpcode::ReadFirstLane &&
+			    ValidateRuntimeValue(program, source->Arg(0))) {
+				// Uniform values need no new EXEC context; preserve their shared evaluation memo.
+				value = source->Arg(0);
+				continue;
+			}
+			if (source->GetOpcode() == ValueOpcode::Phi) {
+				const auto invariant = ResolveInvariantPhi(program, value);
+				if (!invariant.IsEmpty() && invariant != value) {
+					value = invariant;
+					continue;
+				}
+			}
 			return value;
 		}
-		if (source->GetOpcode() == ValueOpcode::ReadConst) {
-			const auto slot = source->Arg(1).Resolve();
-			EXIT_IF(!slot.IsImmediate() || slot.GetType() != Type::U32 ||
-			        slot.U32() >= program.srt_reads.size());
-			return Clone(program.srt_reads[slot.U32()].value);
+	};
+	const auto lookup_cloned = [&](Value value) -> Value {
+		value            = unwrap_clone_source(value);
+		const auto* inst = value.TryInstruction();
+		return inst == nullptr ? value : Value(cloned.at(inst));
+	};
+	const auto Clone = [&](Value root) -> Value {
+		root                  = unwrap_clone_source(root);
+		const auto* root_inst = root.TryInstruction();
+		if (root_inst == nullptr) {
+			return root;
 		}
-		if (source->GetOpcode() == ValueOpcode::ReadFirstLane &&
-		    ValidateRuntimeValue(program, source->Arg(0))) {
-			// Uniform values need no new EXEC context; preserve their shared evaluation memo.
-			return Clone(source->Arg(0));
-		}
-		if (source->GetOpcode() == ValueOpcode::Phi) {
-			const auto invariant = ResolveInvariantPhi(program, value);
-			if (!invariant.IsEmpty() && invariant != value) {
-				return Clone(invariant);
-			}
-		}
-		if (const auto found = cloned.find(source); found != cloned.end()) {
+		if (const auto found = cloned.find(root_inst); found != cloned.end()) {
 			return Value(found->second);
 		}
-		const auto op = source->GetOpcode();
-		const bool vector_buffer_read = op == ValueOpcode::LoadBufferU32 ||
-		                                op == ValueOpcode::LoadBufferU32x2 ||
-		                                op == ValueOpcode::LoadBufferU32x3 ||
-		                                op == ValueOpcode::LoadBufferU32x4;
-		if (vector_buffer_read) plan.capture_specialization_reads = true;
-		auto& target =
-		    plan.value_storage.emplace_back(op, source->Flags<uint64_t>());
-		if (op == ValueOpcode::LoadAddressU32 || op == ValueOpcode::ReadConstBuffer ||
-		    vector_buffer_read) {
-			target.SetFlags(MemoryFlags {.index = source->Flags<MemoryFlags>().index});
-		}
-		cloned.emplace(source, &target);
-		if (source->GetOpcode() == ValueOpcode::Phi) {
-			for (size_t index = 0; index < source->NumArgs(); index++) {
-				target.AddPhiOperand(nullptr, Clone(source->Arg(index)));
+		struct CloneFrame {
+			const Inst* source = nullptr;
+			bool        post   = false;
+		};
+		std::vector<CloneFrame> stack {{root_inst, false}};
+		while (!stack.empty()) {
+			const auto frame = stack.back();
+			stack.pop_back();
+			const auto* source = frame.source;
+			if (frame.post) {
+				auto* target = cloned.at(source);
+				if (source->GetOpcode() == ValueOpcode::Phi) {
+					for (size_t index = 0; index < source->NumArgs(); index++) {
+						target->AddPhiOperand(nullptr, lookup_cloned(source->Arg(index)));
+					}
+				} else {
+					for (size_t index = 0; index < source->NumArgs(); index++) {
+						target->SetArg(index, lookup_cloned(source->Arg(index)));
+					}
+				}
+				continue;
 			}
-		} else {
-			for (size_t index = 0; index < source->NumArgs(); index++) {
-				target.SetArg(index, Clone(source->Arg(index)));
+			if (cloned.contains(source)) {
+				continue;
+			}
+			const auto op                 = source->GetOpcode();
+			const bool vector_buffer_read = op == ValueOpcode::LoadBufferU32 ||
+			                                op == ValueOpcode::LoadBufferU32x2 ||
+			                                op == ValueOpcode::LoadBufferU32x3 ||
+			                                op == ValueOpcode::LoadBufferU32x4;
+			if (vector_buffer_read) plan.capture_specialization_reads = true;
+			auto& target = plan.value_storage.emplace_back(op, source->Flags<uint64_t>());
+			if (op == ValueOpcode::LoadAddressU32 || op == ValueOpcode::ReadConstBuffer ||
+			    vector_buffer_read) {
+				target.SetFlags(MemoryFlags {.index = source->Flags<MemoryFlags>().index});
+			}
+			cloned.emplace(source, &target);
+			stack.push_back({source, true});
+			for (size_t index = source->NumArgs(); index-- > 0;) {
+				const auto child = unwrap_clone_source(source->Arg(index));
+				if (const auto* child_inst = child.TryInstruction();
+				    child_inst != nullptr && !cloned.contains(child_inst)) {
+					stack.push_back({child_inst, false});
+				}
 			}
 		}
-		return Value(&target);
+		return Value(cloned.at(root_inst));
 	};
 
 	bool capture_indirect_reads = false;
@@ -1534,62 +1576,147 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		bool complete = false;
 	};
 	std::unordered_map<const Inst*, ControlValue> predicates;
-	std::function<Value(Value)> ClonePredicate = [&](Value value) -> Value {
+	const auto lookup_predicate = [&](Value value) -> Value {
 		value = value.Resolve();
 		if (value.IsEmpty()) return {};
 		const auto* inst = value.TryInstruction();
 		if (inst == nullptr) {
-			uniform_control |= value.GetType() == Type::U1;
 			return ValidateRuntimeValue(program, value, RuntimeValueType::Integer) ? value : Value {};
 		}
-		const auto [found, inserted] = predicates.try_emplace(inst);
-		auto& entry = found->second;
-		auto& result = entry.value;
-		const auto opaque = [&]() -> Value {
-			if (value.GetType() != Type::U1 && value.GetType() != Type::U32) return {};
-			return result = Value(&plan.value_storage.emplace_back(
-			    value.GetType() == Type::U1 ? ValueOpcode::UndefU1 : ValueOpcode::UndefU32));
-		};
-		// A recursive projection remains opaque, including unstructured loop Phis.
-		if (!inserted) return entry.complete || !result.IsEmpty() ? result : opaque();
-		const auto finish = [&](Value projected) {
-			entry.complete = true;
-			return result = projected;
-		};
-		if (ValidateRuntimeValue(program, value, RuntimeValueType::Integer)) {
-			uniform_control = true;
-			capture_control_reads |=
-			    !ValidateRuntimeValue(program, value, RuntimeValueType::ImmutableInteger);
-			return finish(Clone(value));
+		auto& entry = predicates.at(inst);
+		if (entry.complete || !entry.value.IsEmpty()) {
+			return entry.value;
 		}
-		const auto op = inst->GetOpcode();
-		if (op == ValueOpcode::ConditionRef) return finish(ClonePredicate(inst->Arg(0)));
-		if (op == ValueOpcode::Phi) {
-			if (inst->Parent() == nullptr || inst->Parent()->terminator.loop_header ||
-			    inst->NumPhiBlocks() != inst->NumArgs() || inst->NumArgs() == 0u ||
-			    (value.GetType() != Type::U1 && value.GetType() != Type::U32)) return finish(opaque());
-			std::vector<uint32_t> predecessors;
-			for (size_t index = 0; index < inst->NumArgs(); ++index) {
-				const auto predecessor = std::ranges::find(program.blocks, inst->PhiBlock(index));
-				if (predecessor == program.blocks.end()) return finish(opaque());
-				predecessors.push_back(static_cast<uint32_t>(predecessor - program.blocks.begin()));
+		if (value.GetType() != Type::U1 && value.GetType() != Type::U32) return {};
+		return entry.value = Value(&plan.value_storage.emplace_back(
+		           value.GetType() == Type::U1 ? ValueOpcode::UndefU1 : ValueOpcode::UndefU32));
+	};
+	const auto ClonePredicate = [&](Value root) -> Value {
+		root = root.Resolve();
+		if (root.IsEmpty()) return {};
+		if (root.TryInstruction() == nullptr) {
+			uniform_control |= root.GetType() == Type::U1;
+			return ValidateRuntimeValue(program, root, RuntimeValueType::Integer) ? root : Value {};
+		}
+		struct PredFrame {
+			const Inst* inst = nullptr;
+			Inst*       node = nullptr;
+			bool        post = false;
+		};
+		std::vector<PredFrame> stack {{root.TryInstruction(), nullptr, false}};
+		while (!stack.empty()) {
+			const auto frame = stack.back();
+			stack.pop_back();
+			const auto* inst = frame.inst;
+			if (frame.post) {
+				auto& entry = predicates.at(inst);
+				if (inst->GetOpcode() == ValueOpcode::ConditionRef) {
+					entry.value    = lookup_predicate(inst->Arg(0));
+					entry.complete = true;
+				} else if (inst->GetOpcode() == ValueOpcode::Phi) {
+					for (size_t index = 0; index < inst->NumArgs(); ++index) {
+						frame.node->AddPhiOperand(nullptr, lookup_predicate(inst->Arg(index)));
+					}
+					entry.complete = true;
+				} else {
+					for (size_t index = 0; index < inst->NumArgs(); ++index) {
+						frame.node->SetArg(index, lookup_predicate(inst->Arg(index)));
+					}
+					entry.value    = Value(frame.node);
+					entry.complete = true;
+				}
+				continue;
 			}
-			auto& node = plan.value_storage.emplace_back(op, inst->Flags<uint64_t>());
-			plan.control_phi_predecessors.emplace(&node, std::move(predecessors));
-			for (size_t index = 0; index < inst->NumArgs(); ++index)
-				node.AddPhiOperand(nullptr, ClonePredicate(inst->Arg(index)));
-			return finish(Value(&node));
+			const auto [found, inserted] = predicates.try_emplace(inst);
+			if (!inserted) continue;
+			auto&       entry  = found->second;
+			const Value value(const_cast<Inst*>(inst));
+			const auto  opaque = [&]() -> Value {
+				if (value.GetType() != Type::U1 && value.GetType() != Type::U32) return {};
+				return entry.value = Value(&plan.value_storage.emplace_back(
+				           value.GetType() == Type::U1 ? ValueOpcode::UndefU1 : ValueOpcode::UndefU32));
+			};
+			if (ValidateRuntimeValue(program, value, RuntimeValueType::Integer)) {
+				uniform_control = true;
+				capture_control_reads |=
+				    !ValidateRuntimeValue(program, value, RuntimeValueType::ImmutableInteger);
+				entry.value    = Clone(value);
+				entry.complete = true;
+				continue;
+			}
+			const auto op = inst->GetOpcode();
+			if (op == ValueOpcode::ConditionRef) {
+				stack.push_back({inst, nullptr, true});
+				const auto inner = inst->Arg(0).Resolve();
+				if (const auto* inner_inst = inner.TryInstruction();
+				    inner_inst != nullptr && !predicates.contains(inner_inst)) {
+					stack.push_back({inner_inst, nullptr, false});
+				} else if (inner_inst == nullptr && !inner.IsEmpty()) {
+					uniform_control |= inner.GetType() == Type::U1;
+				}
+				continue;
+			}
+			if (op == ValueOpcode::Phi) {
+				if (inst->Parent() == nullptr || inst->Parent()->terminator.loop_header ||
+				    inst->NumPhiBlocks() != inst->NumArgs() || inst->NumArgs() == 0u ||
+				    (value.GetType() != Type::U1 && value.GetType() != Type::U32)) {
+					opaque();
+					entry.complete = true;
+					continue;
+				}
+				std::vector<uint32_t> predecessors;
+				bool                  missing_pred = false;
+				for (size_t index = 0; index < inst->NumArgs(); ++index) {
+					const auto predecessor = std::ranges::find(program.blocks, inst->PhiBlock(index));
+					if (predecessor == program.blocks.end()) {
+						missing_pred = true;
+						break;
+					}
+					predecessors.push_back(static_cast<uint32_t>(predecessor - program.blocks.begin()));
+				}
+				if (missing_pred) {
+					opaque();
+					entry.complete = true;
+					continue;
+				}
+				auto& node = plan.value_storage.emplace_back(op, inst->Flags<uint64_t>());
+				plan.control_phi_predecessors.emplace(&node, std::move(predecessors));
+				entry.value = Value(&node);
+				stack.push_back({inst, &node, true});
+				for (size_t index = inst->NumArgs(); index-- > 0;) {
+					const auto arg = inst->Arg(index).Resolve();
+					if (const auto* arg_inst = arg.TryInstruction();
+					    arg_inst != nullptr && !predicates.contains(arg_inst)) {
+						stack.push_back({arg_inst, nullptr, false});
+					} else if (arg_inst == nullptr && !arg.IsEmpty()) {
+						uniform_control |= arg.GetType() == Type::U1;
+					}
+				}
+				continue;
+			}
+			if (op != ValueOpcode::LogicalAnd && op != ValueOpcode::LogicalOr &&
+			    op != ValueOpcode::LogicalNot && op != ValueOpcode::IEqual32 &&
+			    op != ValueOpcode::INotEqual32 && op != ValueOpcode::ULessThan32 &&
+			    op != ValueOpcode::ULessThanEqual32 && op != ValueOpcode::UGreaterThan32 &&
+			    op != ValueOpcode::UGreaterThanEqual32 && op != ValueOpcode::SelectU1 &&
+			    op != ValueOpcode::SelectU32) {
+				opaque();
+				entry.complete = true;
+				continue;
+			}
+			auto& node = plan.value_storage.emplace_back(op);
+			stack.push_back({inst, &node, true});
+			for (size_t index = inst->NumArgs(); index-- > 0;) {
+				const auto arg = inst->Arg(index).Resolve();
+				if (const auto* arg_inst = arg.TryInstruction();
+				    arg_inst != nullptr && !predicates.contains(arg_inst)) {
+					stack.push_back({arg_inst, nullptr, false});
+				} else if (arg_inst == nullptr && !arg.IsEmpty()) {
+					uniform_control |= arg.GetType() == Type::U1;
+				}
+			}
 		}
-		if (op != ValueOpcode::LogicalAnd && op != ValueOpcode::LogicalOr &&
-		    op != ValueOpcode::LogicalNot && op != ValueOpcode::IEqual32 &&
-		    op != ValueOpcode::INotEqual32 && op != ValueOpcode::ULessThan32 &&
-		    op != ValueOpcode::ULessThanEqual32 && op != ValueOpcode::UGreaterThan32 &&
-		    op != ValueOpcode::UGreaterThanEqual32 &&
-		    op != ValueOpcode::SelectU1 && op != ValueOpcode::SelectU32) return finish(opaque());
-		auto& node = plan.value_storage.emplace_back(op);
-		for (size_t index = 0; index < inst->NumArgs(); ++index)
-			node.SetArg(index, ClonePredicate(inst->Arg(index)));
-		return finish(Value(&node));
+		return predicates.at(root.TryInstruction()).value;
 	};
 	plan.control_flow = ResourceControlFlow(program, ClonePredicate);
 	if (!uniform_control) {

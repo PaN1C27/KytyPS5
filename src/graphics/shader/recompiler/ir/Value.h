@@ -189,12 +189,17 @@ inline bool Value::IsPhi() const {
 }
 
 inline Inst* Value::ResolveInstruction() const {
-	EXIT_IF(type != Type::Opaque);
-	return IsIdentity() ? inst->Arg(0).ResolveInstruction() : inst;
+	const Value resolved = Resolve();
+	EXIT_IF(resolved.type != Type::Opaque);
+	return resolved.inst;
 }
 
 inline Value Value::Resolve() const {
-	return IsIdentity() ? inst->Arg(0).Resolve() : *this;
+	Value current = *this;
+	while (current.IsIdentity()) {
+		current = current.inst->Arg(0);
+	}
+	return current;
 }
 
 inline uint32_t Value::U32() const {

@@ -26,13 +26,11 @@ Value Value::F32(float value) {
 }
 
 Type Value::GetType() const {
-	if (IsPhi()) {
-		return inst->Flags<Type>();
+	const Value resolved = Resolve();
+	if (resolved.IsPhi()) {
+		return resolved.inst->Flags<Type>();
 	}
-	if (IsIdentity()) {
-		return inst->Arg(0).GetType();
-	}
-	return type == Type::Opaque ? inst->GetType() : type;
+	return resolved.type == Type::Opaque ? resolved.inst->GetType() : resolved.type;
 }
 
 Inst* Value::Instruction() const {
@@ -119,13 +117,19 @@ Inst::~Inst() {
 }
 
 Type Inst::GetType() const {
-	if (opcode == ValueOpcode::Phi) {
-		return static_cast<Type>(flags);
+	const Inst* current = this;
+	while (current->opcode == ValueOpcode::Identity && current->num_args != 0) {
+		const Value inner      = current->Arg(0).Resolve();
+		const Inst* inner_inst = inner.TryInstruction();
+		if (inner_inst == nullptr) {
+			return inner.GetType();
+		}
+		current = inner_inst;
 	}
-	if (opcode == ValueOpcode::Identity && num_args != 0) {
-		return Arg(0).GetType();
+	if (current->opcode == ValueOpcode::Phi) {
+		return static_cast<Type>(current->flags);
 	}
-	return TypeOf(opcode);
+	return TypeOf(current->opcode);
 }
 
 bool Inst::MayHaveSideEffects() const {

@@ -57,47 +57,13 @@ bool IsRuntimeRead(ValueOpcode opcode) {
 	       AddressOpcodeInfoOf(opcode).access == AddressAccess::Read;
 }
 
-bool EquivalentValue(const ResourcePlan& program, Value left, Value right,
-                     std::vector<std::pair<const Inst*, const Inst*>>& visited) {
-	left  = left.Resolve();
-	right = right.Resolve();
-	if (left == right) {
-		return true;
+struct InstPairHash {
+	size_t operator()(const std::pair<const Inst*, const Inst*>& pair) const noexcept {
+		const auto a = reinterpret_cast<uintptr_t>(pair.first);
+		const auto b = reinterpret_cast<uintptr_t>(pair.second);
+		return (a * 0x9e3779b97f4a7c15ull) ^ (b + 0x517cc1b727220a95ull + (a << 6u) + (a >> 2u));
 	}
-	if (left.IsImmediate() || right.IsImmediate() || left.GetType() != right.GetType()) {
-		return false;
-	}
-	const auto* lhs = left.TryInstruction();
-	const auto* rhs = right.TryInstruction();
-	if (lhs == nullptr || rhs == nullptr || lhs->GetOpcode() != rhs->GetOpcode() ||
-	    lhs->NumArgs() != rhs->NumArgs()) {
-		return false;
-	}
-	if (std::ranges::find(visited, std::pair {lhs, rhs}) != visited.end()) {
-		return true;
-	}
-	visited.emplace_back(lhs, rhs);
-	if (IsRuntimeRead(lhs->GetOpcode())) {
-		const auto li = lhs->Flags<MemoryFlags>().index;
-		const auto ri = rhs->Flags<MemoryFlags>().index;
-		if (li >= program.memory_info.size() || ri >= program.memory_info.size() ||
-		    program.memory_info[li] != program.memory_info[ri]) {
-			return false;
-		}
-	} else if (lhs->GetOpcode() != ValueOpcode::ReadConst &&
-	           lhs->Flags<uint64_t>() != rhs->Flags<uint64_t>()) {
-		return false;
-	}
-	for (size_t index = 0; index < lhs->NumArgs(); index++) {
-		if (lhs->GetOpcode() == ValueOpcode::Phi && lhs->PhiBlock(index) != rhs->PhiBlock(index)) {
-			return false;
-		}
-		if (!EquivalentValue(program, lhs->Arg(index), rhs->Arg(index), visited)) {
-			return false;
-		}
-	}
-	return true;
-}
+};
 
 } // namespace
 
@@ -158,8 +124,49 @@ CompiledShaderInfo Program::TakeCompiledInfo() && {
 }
 
 bool EquivalentValue(const ResourcePlan& program, Value left, Value right) {
-	std::vector<std::pair<const Inst*, const Inst*>> visited;
-	return EquivalentValue(program, left, right, visited);
+	std::vector<std::pair<Value, Value>>                            pending {{left, right}};
+	std::unordered_set<std::pair<const Inst*, const Inst*>, InstPairHash> visited;
+	while (!pending.empty()) {
+		auto [cur_left, cur_right] = pending.back();
+		pending.pop_back();
+		cur_left  = cur_left.Resolve();
+		cur_right = cur_right.Resolve();
+		if (cur_left == cur_right) {
+			continue;
+		}
+		if (cur_left.IsImmediate() || cur_right.IsImmediate() ||
+		    cur_left.GetType() != cur_right.GetType()) {
+			return false;
+		}
+		const auto* lhs = cur_left.TryInstruction();
+		const auto* rhs = cur_right.TryInstruction();
+		if (lhs == nullptr || rhs == nullptr || lhs->GetOpcode() != rhs->GetOpcode() ||
+		    lhs->NumArgs() != rhs->NumArgs()) {
+			return false;
+		}
+		if (!visited.emplace(lhs, rhs).second) {
+			continue;
+		}
+		if (IsRuntimeRead(lhs->GetOpcode())) {
+			const auto li = lhs->Flags<MemoryFlags>().index;
+			const auto ri = rhs->Flags<MemoryFlags>().index;
+			if (li >= program.memory_info.size() || ri >= program.memory_info.size() ||
+			    program.memory_info[li] != program.memory_info[ri]) {
+				return false;
+			}
+		} else if (lhs->GetOpcode() != ValueOpcode::ReadConst &&
+		           lhs->Flags<uint64_t>() != rhs->Flags<uint64_t>()) {
+			return false;
+		}
+		for (size_t index = lhs->NumArgs(); index-- > 0;) {
+			if (lhs->GetOpcode() == ValueOpcode::Phi &&
+			    lhs->PhiBlock(index) != rhs->PhiBlock(index)) {
+				return false;
+			}
+			pending.emplace_back(lhs->Arg(index), rhs->Arg(index));
+		}
+	}
+	return true;
 }
 
 bool EquivalentSelectorDomain(const ResourcePlan& program,
