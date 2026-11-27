@@ -14184,6 +14184,125 @@ void TestLargeMixedIndirectBufferAndImageUsesCompactShaderDataMap() {
         "compact mixed indirect emission missed required NonUniform indexing capabilities");
 }
 
+void TestDynamicIndirectBufferCollapsesStridesAndPadsCapacity() {
+  using namespace ShaderRecompiler;
+  using namespace ShaderRecompiler::IR;
+
+  Program program;
+  program.stage = ShaderType::Compute;
+  program.wave_size = 32u;
+  program.srt_plan_complete = true;
+  program.resource_tracking_complete = true;
+  program.block_storage.push_back(std::make_unique<Block>());
+  auto *block = program.block_storage.back().get();
+  program.blocks.push_back(block);
+
+  auto &lane = block->AppendNewInst(ValueOpcode::LaneId);
+  auto &buf_selection =
+      block->AppendNewInst(ValueOpcode::GetBufferResourceIndex, {Value(&lane)});
+  buf_selection.SetFlags<uint32_t>(0u);
+  auto &buf_handle = block->AppendNewInst(
+      ValueOpcode::GetBufferResource,
+      {Value(&buf_selection), Value(0u), Value(0u), Value(0u)});
+  buf_handle.SetFlags<uint32_t>(0u);
+
+  auto &load = block->AppendNewInst(
+      ValueOpcode::LoadBufferU32x2,
+      {Value(&buf_handle), Value(&lane), Value(0u), Value(0u), Value(true)});
+  load.SetFlags<MemoryFlags>({.index = 0u});
+  auto &load_x = block->AppendNewInst(
+      ValueOpcode::CompositeExtractU32x2, {Value(&load), Value(0u)});
+  auto &out_handle = block->AppendNewInst(
+      ValueOpcode::GetBufferResource,
+      {Value(0u), Value(0u), Value(0u), Value(0u)});
+  out_handle.SetFlags<uint32_t>(1u);
+  auto &out_store = block->AppendNewInst(
+      ValueOpcode::StoreBufferU32,
+      {Value(&out_handle), Value(0u), Value(&lane), Value(0u), Value(&load_x),
+       Value(true)});
+  out_store.SetFlags<MemoryFlags>({.index = 1u});
+
+  program.memory_info.push_back({.kind = ResourceKind::Buffer,
+                                 .data_dwords = 2u,
+                                 .data_bits = 32u,
+                                 .component_count = 2u,
+                                 .formatted = true,
+                                 .idxen = true});
+  program.memory_info.push_back({.kind = ResourceKind::Buffer,
+                                 .resource = 1u,
+                                 .data_dwords = 1u,
+                                 .data_bits = 32u,
+                                 .component_count = 1u,
+                                 .offen = true});
+
+  program.descriptor_sources.resize(2u);
+  program.descriptor_sources[0].indirect_descriptor =
+      DescriptorSource::IndirectDescriptor{.table_stride = 16u, .indexed = true};
+
+  constexpr uint32_t ChildCount = 24u;
+  constexpr std::array<uint32_t, 8> Strides{8u, 12u, 16u, 20u, 24u, 28u, 32u, 36u};
+  program.info.buffers.resize(2u + ChildCount);
+  program.bindings.base_buffer_count = 2u;
+  {
+    auto &root = program.info.buffers[0];
+    root.source = 0u;
+    root.read = true;
+    root.formatted = true;
+    root.indirect_root = 0u;
+    root.packed_stride = 0u;
+    root.descriptor_format = Prospero::BufferFormat::k32_32Float;
+    root.descriptor_swizzle = DstSel(4, 5, 6, 7);
+    root.indirect_mapping_offset = 4u;
+    root.indirect_search_iterations = 5u;
+    root.indirect_resources.reserve(1u + ChildCount);
+    root.indirect_resources.push_back(0u);
+    for (uint32_t c = 0; c < ChildCount; ++c) {
+      const uint32_t idx = 2u + c;
+      auto &buf = program.info.buffers[idx];
+      buf.source = 0u;
+      buf.read = true;
+      buf.formatted = true;
+      buf.indirect_root = 0u;
+      buf.packed_stride = Strides[c % Strides.size()];
+      buf.descriptor_format = Prospero::BufferFormat::k32_32Float;
+      buf.descriptor_swizzle = DstSel(4, 5, 6, 7);
+      root.indirect_resources.push_back(idx);
+    }
+  }
+  auto &out_buf = program.info.buffers[1];
+  out_buf.source = 1u;
+  out_buf.packed_stride = 4u;
+  out_buf.written = true;
+
+  ShaderComputeInputInfo compute{};
+  compute.wave_size = 32u;
+  compute.host_subgroup_size = 32u;
+  compute.threads_num[0] = 32u;
+  compute.threads_num[1] = 1u;
+  compute.threads_num[2] = 1u;
+  CollectShaderInfo(program, {.compute = &compute});
+
+  Spirv::Profile profile = Spirv::DefaultProfile;
+  profile.dynamic_indirect_buffers = true;
+  const auto spirv = Spirv::EmitProgram(program, {.compute = &compute}, {}, profile);
+  CheckSpirvBinaryValidates(spirv);
+  Check(program.bindings.dynamic_indirect_buffers,
+        "dynamic indirect buffers flag was not enabled");
+  Check(program.bindings.descriptor_counts[0] >= 128u,
+        "dynamic indirect buffer descriptor array was not padded");
+  Check(program.bindings.indirect_buffer_roots.size() == 1u &&
+            program.bindings.indirect_root_mappings == std::vector<uint32_t>{4u},
+        "dynamic indirect buffer root mapping table was not populated");
+  Check(program.bindings.indirect_buffer_tables.size() == 1u &&
+            program.bindings.indirect_buffer_tables[0].groups.size() == 2u &&
+            program.bindings.indirect_buffer_tables[0].map_capacity >= 128u,
+        "distinct strides were not collapsed into a single format group or map was not padded");
+  Check(SpirvInstructionOpcodeCount(spirv, 251u) <= 1u,
+        "stride-collapsed dynamic indirect buffer emitted extra OpSwitch instructions");
+  Check(SpirvContainsCapability(spirv, spv::CapabilityStorageBufferArrayNonUniformIndexing),
+        "dynamic indirect buffer missed NonUniform storage buffer capability");
+}
+
 #include "ShaderRayTracingTests.inc"
 
 } // namespace
@@ -14412,6 +14531,7 @@ int main() {
 
   TestNewShaderRecompilerVop3LaneReadDestinationEncoding();
   TestLargeMixedIndirectBufferAndImageUsesCompactShaderDataMap();
+  TestDynamicIndirectBufferCollapsesStridesAndPadsCapacity();
 
   return 0;
 }

@@ -88,6 +88,7 @@ struct IndirectResourcePlan {
 	std::vector<uint8_t>               ordinal_needs_slot;
 	uint32_t                           transition_count = 0;
 	uint32_t                           map_offset       = UINT32_MAX;
+	uint32_t                           map_capacity     = 0;
 	bool                               dynamic_slot     = false;
 };
 
@@ -452,6 +453,7 @@ struct MemoryResourceAccess {
 	uint32_t              descriptor_index = 0;
 	uint32_t              length           = 0;
 	uint32_t              byte_offset      = 0;
+	uint32_t              stride           = 0;
 	uint32_t              element_bits     = 32;
 	bool                  non_uniform      = false;
 	spv::MemoryAccessMask memory_access    = spv::MemoryAccessMaskNone;
@@ -459,6 +461,8 @@ struct MemoryResourceAccess {
 
 uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t mapping_offset,
                                    uint32_t search_iterations, uint32_t default_resource);
+uint32_t EmitIndirectResourceIndexDynamic(EmitterState& state, uint32_t key, uint32_t mapping,
+                                          uint32_t search_iterations, uint32_t default_resource);
 // Slot word of an image heap byte offset; offsets past the heap select the null element.
 uint32_t EmitImageHeapEntry(EmitterState& state, uint32_t key, uint32_t mapping_offset);
 MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::MemoryInfo& mem,

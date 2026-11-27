@@ -226,11 +226,27 @@ void DefineDescriptors(EmitterState& state) {
 	using Kind = IR::DescriptorBindingKind;
 	auto& info = state.program.info;
 	auto& bindings = state.program.bindings;
+	if (bindings.base_buffer_count == 0u && !info.buffers.empty()) {
+		uint32_t base_count = 0u;
+		for (uint32_t i = 0; i < info.buffers.size(); ++i) {
+			if (info.buffers[i].indirect_root == IR::BufferResource::NoIndirectBuffer ||
+			    info.buffers[i].indirect_root == i) {
+				++base_count;
+			}
+		}
+		bindings.base_buffer_count = base_count;
+	}
 	auto& counts = bindings.descriptor_counts;
 	auto& buffer_count = counts[static_cast<size_t>(Kind::Buffers)];
-	for (auto& buffer: info.buffers) {
+	uint32_t live_base_count = 0u;
+	for (uint32_t i = 0; i < info.buffers.size(); ++i) {
+		auto& buffer = info.buffers[i];
 		buffer.descriptor_index = buffer.live ? buffer_count++ : UINT32_MAX;
+		if (buffer.live && i < bindings.base_buffer_count) {
+			++live_base_count;
+		}
 	}
+	bindings.live_base_buffer_count = live_base_count;
 	std::array<const IR::ImageResource*, IR::ImageBindingCount> image_types {};
 	for (auto& image: info.images) {
 		const auto kind = IR::DescriptorBindingForImage(image);

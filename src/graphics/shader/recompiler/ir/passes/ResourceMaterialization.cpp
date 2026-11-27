@@ -1865,6 +1865,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 
 	auto& buffers = program.info.buffers;
 	const auto original_buffer_count = buffers.size();
+	program.bindings.base_buffer_count = static_cast<uint32_t>(original_buffer_count);
 	buffers.reserve(specialization.buffers.size());
 	for (uint32_t index = 0; index < specialization.buffers.size(); ++index) {
 		const auto& source = specialization.buffers[index];

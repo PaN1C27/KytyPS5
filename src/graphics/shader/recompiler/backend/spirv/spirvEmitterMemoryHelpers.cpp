@@ -77,17 +77,16 @@ uint32_t EmitImageHeapEntry(EmitterState& state, uint32_t key, uint32_t mapping_
 	return entry;
 }
 
-uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t mapping_offset,
-                                   uint32_t search_iterations, uint32_t default_resource) {
-	const auto mapping = ConstantU32(state, mapping_offset);
+static uint32_t EmitIndirectResourceIndexImpl(EmitterState& state, uint32_t key, uint32_t mapping,
+                                              uint32_t mapping_plus_one, uint32_t search_iterations,
+                                              uint32_t default_resource) {
 	const auto count = LoadFlattenedSrt(state, mapping);
 	if (search_iterations == 0u) {
 		const auto index = Binary(state, spv::OpShiftRightLogical, TypeU32(state), key,
 		                          ConstantU32(state, 2u));
 		const auto valid = Binary(state, spv::OpULessThan, TypeBool(state), index, count);
 		const auto safe = Select(state, TypeU32(state), valid, index, ConstantU32(state, 0u));
-		const auto entry = Binary(state, spv::OpIAdd, TypeU32(state), safe,
-		                          ConstantU32(state, mapping_offset + 1u));
+		const auto entry = Binary(state, spv::OpIAdd, TypeU32(state), safe, mapping_plus_one);
 		return Select(state, TypeU32(state), valid, LoadFlattenedSrt(state, entry),
 		              ConstantU32(state, default_resource));
 	}
@@ -122,6 +121,20 @@ uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t m
 	const auto resource = LoadFlattenedSrt(
 	    state, Binary(state, spv::OpIAdd, TypeU32(state), entry, ConstantU32(state, 1u)));
 	return Select(state, TypeU32(state), match, resource, ConstantU32(state, default_resource));
+}
+
+uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t mapping_offset,
+                                   uint32_t search_iterations, uint32_t default_resource) {
+	return EmitIndirectResourceIndexImpl(state, key, ConstantU32(state, mapping_offset),
+	                                     ConstantU32(state, mapping_offset + 1u), search_iterations,
+	                                     default_resource);
+}
+
+uint32_t EmitIndirectResourceIndexDynamic(EmitterState& state, uint32_t key, uint32_t mapping,
+                                          uint32_t search_iterations, uint32_t default_resource) {
+	return EmitIndirectResourceIndexImpl(
+	    state, key, mapping, EmitAddU32(state, mapping, ConstantU32(state, 1u)), search_iterations,
+	    default_resource);
 }
 
 uint32_t StorageBufferPackedStride(const EmitterState& state, const IR::MemoryInfo& mem) {
@@ -207,6 +220,7 @@ IndirectResourcePlan BuildIndirectBufferPlan(const EmitterState& state,
 	const auto& sources = state.program.descriptor_sources;
 	const auto& root = buffers.at(mem.resource);
 	const bool check_format_swizzle = mem.formatted && !mem.typed;
+	const bool dynamic_buffers = state.program.bindings.dynamic_indirect_buffers;
 	const auto IsIndexed = [&](uint32_t resource) {
 		const auto& buf = buffers[resource];
 		return buf.source < sources.size() && sources[buf.source].indirect_descriptor &&
@@ -228,10 +242,18 @@ IndirectResourcePlan BuildIndirectBufferPlan(const EmitterState& state,
 		auto second_mem = mem;
 		first_mem.resource = lhs;
 		second_mem.resource = rhs;
-		return first.packed_stride == second.packed_stride &&
-		       IR::StorageBufferElementBits(state.program, first_mem) ==
-		           IR::StorageBufferElementBits(state.program, second_mem) &&
-		       IsIndexed(lhs) == IsIndexed(rhs);
+		if (IR::StorageBufferElementBits(state.program, first_mem) !=
+		        IR::StorageBufferElementBits(state.program, second_mem) ||
+		    IsIndexed(lhs) != IsIndexed(rhs)) {
+			return false;
+		}
+		if (dynamic_buffers) {
+			return IR::MakeIndirectBufferGroup(first.packed_stride, first.descriptor_format,
+			                                   first.descriptor_swizzle, check_format_swizzle) ==
+			       IR::MakeIndirectBufferGroup(second.packed_stride, second.descriptor_format,
+			                                   second.descriptor_swizzle, check_format_swizzle);
+		}
+		return first.packed_stride == second.packed_stride;
 	};
 	IndirectResourcePlan plan;
 	plan.ordinal_groups.reserve(root.indirect_resources.size());
@@ -252,7 +274,8 @@ IndirectResourcePlan BuildIndirectBufferPlan(const EmitterState& state,
 		}
 	}
 	for (auto& group : plan.groups) {
-		group.needs_slot = !IsEmptyIndirectBufferCandidate(state, group.resource) && group.count > 1u;
+		group.needs_slot = !IsEmptyIndirectBufferCandidate(state, group.resource) &&
+		                   (dynamic_buffers || group.count > 1u);
 	}
 	FinalizeIndirectPlan(plan);
 	return plan;
@@ -296,7 +319,38 @@ IndirectResourcePlan BuildIndirectImagePlan(const EmitterState& state, uint32_t 
 
 void PlanIndirectResourceMaps(EmitterState& state) {
 	constexpr uint32_t MaxInlineIndirectTransitions = 8u;
-	auto& indirect_map = state.program.bindings.indirect_map;
+	constexpr uint32_t MinDynamicBufferBucket       = 128u;
+	constexpr uint32_t MaxDynamicBufferBucket       = 4096u;
+	auto& info         = state.program.info;
+	auto& bindings     = state.program.bindings;
+	auto& indirect_map = bindings.indirect_map;
+	bindings.dynamic_indirect_buffers =
+	    state.profile.dynamic_indirect_buffers &&
+	    std::ranges::any_of(
+	        std::span(info.buffers).first(bindings.base_buffer_count),
+	        [](const IR::BufferResource& b) {
+		        return b.live && b.indirect_root != IR::BufferResource::NoIndirectBuffer &&
+		               !b.indirect_resources.empty();
+	        });
+	if (bindings.dynamic_indirect_buffers) {
+		auto& buffer_count =
+		    bindings.descriptor_counts[static_cast<size_t>(IR::DescriptorBindingKind::Buffers)];
+		if (buffer_count <= MaxDynamicBufferBucket) {
+			buffer_count = std::min(
+			    MaxDynamicBufferBucket,
+			    std::max(MinDynamicBufferBucket, std::bit_ceil(buffer_count + buffer_count / 2u)));
+		}
+		for (uint32_t r = 0; r < bindings.base_buffer_count; ++r) {
+			const auto& buf = info.buffers[r];
+			if (!buf.live || buf.indirect_root != r || buf.indirect_resources.empty()) continue;
+			bindings.indirect_buffer_roots.push_back({
+			    .resource      = r,
+			    .mapping_dword = static_cast<uint32_t>(bindings.indirect_buffer_roots.size()),
+			    .binary_search = buf.indirect_search_iterations > 0u,
+			});
+			bindings.indirect_root_mappings.push_back(buf.indirect_mapping_offset);
+		}
+	}
 	const auto InternMap = [&](IndirectResourcePlan& plan) {
 		if (plan.transition_count <= MaxInlineIndirectTransitions ||
 		    plan.ordinal_groups.empty()) {
@@ -312,10 +366,62 @@ void PlanIndirectResourceMaps(EmitterState& state) {
 		const auto match = std::ranges::search(indirect_map, entries);
 		if (!match.empty()) {
 			plan.map_offset = static_cast<uint32_t>(match.begin() - indirect_map.begin());
+			plan.map_capacity = static_cast<uint32_t>(plan.ordinal_groups.size());
 			return;
 		}
 		plan.map_offset = static_cast<uint32_t>(indirect_map.size());
+		plan.map_capacity = static_cast<uint32_t>(plan.ordinal_groups.size());
 		indirect_map.insert(indirect_map.end(), entries.begin(), entries.end());
+	};
+	const auto InternDynamicBufferPlan = [&](uint32_t root_resource, bool check_format_swizzle,
+	                                         IndirectResourcePlan& plan) {
+		const auto existing = std::ranges::find_if(
+		    bindings.indirect_buffer_tables, [&](const IR::IndirectBufferTable& table) {
+			    return table.root_resource == root_resource &&
+			           table.check_format_swizzle == check_format_swizzle;
+		    });
+		if (existing != bindings.indirect_buffer_tables.end()) {
+			plan.map_offset   = existing->map_offset;
+			plan.map_capacity = existing->map_capacity;
+			return;
+		}
+		const uint32_t count = static_cast<uint32_t>(plan.ordinal_groups.size());
+		const uint32_t capacity = count <= MaxDynamicBufferBucket
+		                              ? std::min(MaxDynamicBufferBucket,
+		                                         std::max(MinDynamicBufferBucket,
+		                                                  std::bit_ceil(count + count / 2u)))
+		                              : std::min(count, IR::MaxIndirectDescriptorProbes);
+		uint32_t default_entry = 0u;
+		for (uint32_t g = 0; g < plan.groups.size(); ++g) {
+			if (IsEmptyIndirectBufferCandidate(state, plan.groups[g].resource)) {
+				default_entry = g << 20u;
+				break;
+			}
+		}
+		const uint32_t map_offset = static_cast<uint32_t>(indirect_map.size());
+		indirect_map.resize(map_offset + capacity, default_entry);
+		for (size_t ordinal = 0; ordinal < plan.ordinal_groups.size(); ++ordinal) {
+			const uint32_t group_index = plan.ordinal_groups[ordinal];
+			const uint32_t slot = plan.ordinal_slots[ordinal];
+			EXIT_IF(group_index >= (1u << 12u) || slot >= (1u << 20u));
+			indirect_map[map_offset + ordinal] = (group_index << 20u) | (slot & 0xfffffu);
+		}
+		std::vector<IR::IndirectBufferGroup> group_keys;
+		group_keys.reserve(plan.groups.size());
+		for (const auto& group : plan.groups) {
+			const auto& b = info.buffers[group.resource];
+			group_keys.push_back(IR::MakeIndirectBufferGroup(
+			    b.packed_stride, b.descriptor_format, b.descriptor_swizzle, check_format_swizzle));
+		}
+		bindings.indirect_buffer_tables.push_back({
+		    .root_resource        = root_resource,
+		    .check_format_swizzle = check_format_swizzle,
+		    .map_offset           = map_offset,
+		    .map_capacity         = capacity,
+		    .groups               = std::move(group_keys),
+		});
+		plan.map_offset   = map_offset;
+		plan.map_capacity = capacity;
 	};
 	ValueEmitContext ctx(state);
 	for (const auto* block : state.program.blocks) {
@@ -333,9 +439,14 @@ void PlanIndirectResourceMaps(EmitterState& state) {
 					const auto& buf = state.program.info.buffers.at(mem.resource);
 					if (buf.indirect_root == mem.resource &&
 					    !buf.indirect_resources.empty() &&
-					    SharedIndirectBufferResource(state, mem.resource) == UINT32_MAX) {
+					    (bindings.dynamic_indirect_buffers ||
+					     SharedIndirectBufferResource(state, mem.resource) == UINT32_MAX)) {
 						auto plan = BuildIndirectBufferPlan(state, mem);
-						InternMap(plan);
+						if (bindings.dynamic_indirect_buffers) {
+							InternDynamicBufferPlan(mem.resource, mem.formatted && !mem.typed, plan);
+						} else {
+							InternMap(plan);
+						}
 						state.indirect_plans.emplace(&inst, std::move(plan));
 					}
 				}
@@ -361,9 +472,12 @@ SelectedIndirectGroup SelectIndirectResourceGroup(EmitterState& state,
                                                   const IndirectResourcePlan& plan,
                                                   uint32_t selected) {
 	if (plan.map_offset != UINT32_MAX) {
+		const auto capacity = plan.map_capacity != 0u
+		                          ? plan.map_capacity
+		                          : static_cast<uint32_t>(plan.ordinal_groups.size());
 		const auto clamped = EmitUMin32(
 		    state, selected,
-		    ConstantU32(state, static_cast<uint32_t>(plan.ordinal_groups.size() - 1u)));
+		    ConstantU32(state, capacity - 1u));
 		const auto packed = EmitShaderDataDwordLoadDynamic(
 		    state, state.program.bindings.IndirectMapDword() + plan.map_offset, clamped);
 		const auto group_index =
@@ -418,14 +532,19 @@ SelectedIndirectGroup SelectIndirectResourceGroup(EmitterState& state,
 }
 
 void EmitMemoryBindings(EmitterState& state) {
-	const auto count = state.program.bindings.descriptor_counts[static_cast<size_t>(IR::DescriptorBindingKind::Buffers)];
+	const auto& bindings = state.program.bindings;
+	const auto  count = bindings.dynamic_indirect_buffers
+	                        ? bindings.live_base_buffer_count
+	                        : bindings.descriptor_counts[static_cast<size_t>(IR::DescriptorBindingKind::Buffers)];
 	state.memory_byte_offsets.resize(count);
 	state.memory_byte_sizes.resize(count);
 	std::vector<bool> dynamic_offsets(count);
-	for (uint32_t resource = 0; resource < state.program.info.buffers.size(); ++resource) {
-		if (SharedIndirectBufferResource(state, resource) == UINT32_MAX) continue;
-		for (const auto candidate: state.program.info.buffers[resource].indirect_resources) {
-			dynamic_offsets[state.program.info.buffers[candidate].descriptor_index] = true;
+	if (!bindings.dynamic_indirect_buffers) {
+		for (uint32_t resource = 0; resource < state.program.info.buffers.size(); ++resource) {
+			if (SharedIndirectBufferResource(state, resource) == UINT32_MAX) continue;
+			for (const auto candidate: state.program.info.buffers[resource].indirect_resources) {
+				dynamic_offsets[state.program.info.buffers[candidate].descriptor_index] = true;
+			}
 		}
 	}
 	for (uint32_t i = 0; i < count; i += 4u) {
@@ -433,13 +552,13 @@ void EmitMemoryBindings(EmitterState& state) {
 		if (std::all_of(dynamic_offsets.begin() + i, dynamic_offsets.begin() + i + lanes,
 		                [](bool dynamic) { return dynamic; })) continue;
 		const auto word =
-		    EmitShaderDataDwordLoad(state, state.program.bindings.memory_offset_dword + i / 4u);
+		    EmitShaderDataDwordLoad(state, bindings.memory_offset_dword + i / 4u);
 		for (uint32_t lane = 0; lane < lanes; ++lane) {
 			if (dynamic_offsets[i + lane]) continue;
 			state.memory_byte_offsets[i + lane] = EmitNative<spv::OpBitFieldUExtract, IR::Type::U32>(
 			    state, word, ConstantU32(state, lane * 8u), ConstantU32(state, 8u));
 			state.memory_byte_sizes[i + lane] =
-			    EmitShaderDataDwordLoad(state, state.program.bindings.MemorySizeDword() + i + lane);
+			    EmitShaderDataDwordLoad(state, bindings.MemorySizeDword() + i + lane);
 		}
 	}
 }
@@ -535,7 +654,12 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 		    state, word, shift, ConstantU32(state, 8));
 		access.length = EmitShaderDataDwordLoadAt(state, EmitAddU32(
 		    state, ConstantU32(state, bindings.MemorySizeDword() + data_start), array_index));
+		if (bindings.dynamic_indirect_buffers) {
+			access.stride = EmitShaderDataDwordLoadDynamic(state, bindings.MemoryStrideDword(),
+			                                               array_index);
+		}
 	} else {
+		EXIT_IF(static_index >= state.memory_byte_offsets.size());
 		access.byte_offset = state.memory_byte_offsets[static_index];
 		access.length      = state.memory_byte_sizes[static_index];
 	}

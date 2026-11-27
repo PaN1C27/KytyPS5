@@ -772,14 +772,30 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 		const auto& program  = prepared.runtime->module->info;
 		const auto& snapshot = *prepared.runtime->resources;
 		const auto& layout   = program.bindings;
-		prepared.buffer_sources.resize(layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)]);
-		if (layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)] == 0) {
+		const auto& spec     = prepared.runtime->specialization != nullptr
+		                           ? *prepared.runtime->specialization
+		                           : prepared.runtime->module->specialization;
+		const uint32_t buffer_capacity = layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)];
+		prepared.buffer_sources.assign(buffer_capacity, {});
+		if (buffer_capacity == 0) {
 			continue;
 		}
-		for (uint32_t resource = 0; resource < program.info.buffers.size(); ++resource) {
-			const auto& metadata = program.info.buffers[resource];
-			if (metadata.descriptor_index == UINT32_MAX) continue;
-			auto& source = prepared.buffer_sources[metadata.descriptor_index];
+		uint32_t next_child_slot = layout.live_base_buffer_count;
+		const auto total_resources =
+		    layout.dynamic_indirect_buffers ? snapshot.buffers.size() : program.info.buffers.size();
+		for (uint32_t resource = 0; resource < total_resources; ++resource) {
+			const uint32_t meta_index =
+			    (!layout.dynamic_indirect_buffers || resource < layout.base_buffer_count)
+			        ? resource
+			        : spec.buffers[resource].indirect_root;
+			const auto& metadata = program.info.buffers[meta_index];
+			const uint32_t slot =
+			    (!layout.dynamic_indirect_buffers || resource < layout.base_buffer_count)
+			        ? metadata.descriptor_index
+			        : (metadata.live ? next_child_slot++ : UINT32_MAX);
+			if (slot == UINT32_MAX) continue;
+			EXIT_IF(slot >= buffer_capacity);
+			auto& source = prepared.buffer_sources[slot];
 			const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[resource]);
 			const auto address = descriptor.Base48();
 			auto size = descriptor.GetSize();
@@ -794,7 +810,7 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 				continue;
 			}
 			if (descriptor.NumRecords() == UINT32_MAX) {
-				if (program.info.buffers[resource].written) {
+				if (metadata.written) {
 					// Sentinel write ranges end before tables captured by any bound stage.
 					for (const auto* reader: stages) {
 						for (const auto [read_address, read_size]: reader->runtime->resources->specialization_reads) {
@@ -830,8 +846,12 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	const auto& program  = prepared.runtime->module->info;
 	const auto& snapshot = *prepared.runtime->resources;
 	const auto& layout   = program.bindings;
+	const auto& spec     = prepared.runtime->specialization != nullptr
+	                           ? *prepared.runtime->specialization
+	                           : prepared.runtime->module->specialization;
 
-	prepared.buffers.resize(layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)]);
+	const uint32_t buffer_capacity = layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)];
+	prepared.buffers.assign(buffer_capacity, vk::DescriptorBufferInfo {nullptr, 0, vk::WholeSize});
 	std::fill(prepared.shader_data.begin() + layout.memory_offset_dword,
 	          prepared.shader_data.end(), 0);
 	auto pack_memory_offset = [&](uint32_t index, uint32_t offset) {
@@ -839,19 +859,79 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		const auto shift = (index % 4u) * 8u;
 		prepared.shader_data[dword] |= offset << shift;
 	};
-	for (const auto& resource: program.info.buffers) {
-		const auto index = resource.descriptor_index;
+	const auto total_resources =
+	    layout.dynamic_indirect_buffers ? snapshot.buffers.size() : program.info.buffers.size();
+	std::vector<uint32_t> slot_of;
+	if (layout.dynamic_indirect_buffers) {
+		slot_of.assign(total_resources, UINT32_MAX);
+	}
+	uint32_t next_child_slot = layout.live_base_buffer_count;
+	for (uint32_t resource = 0; resource < total_resources; ++resource) {
+		const uint32_t meta_index =
+		    (!layout.dynamic_indirect_buffers || resource < layout.base_buffer_count)
+		        ? resource
+		        : spec.buffers[resource].indirect_root;
+		const auto& metadata = program.info.buffers[meta_index];
+		const uint32_t index =
+		    (!layout.dynamic_indirect_buffers || resource < layout.base_buffer_count)
+		        ? metadata.descriptor_index
+		        : (metadata.live ? next_child_slot++ : UINT32_MAX);
 		if (index == UINT32_MAX) continue;
+		EXIT_IF(index >= buffer_capacity);
+		if (layout.dynamic_indirect_buffers) {
+			slot_of[resource] = index;
+		}
 		uint32_t buffer_offset = 0;
 		prepared.buffers[index] = NativeStorageBuffer(m_context, prepared.buffer_sources[index],
-		                                              resource, buffer_offset);
+		                                              metadata, buffer_offset);
 		pack_memory_offset(index, buffer_offset);
 		// Null bindings allow 0 bytes, not the shared null buffer's 16, so no store reaches it.
 		prepared.shader_data[layout.MemorySizeDword() + index] =
 		    static_cast<uint32_t>(prepared.buffer_sources[index].size + buffer_offset);
+		if (layout.dynamic_indirect_buffers) {
+			prepared.shader_data[layout.MemoryStrideDword() + index] =
+			    spec.buffers[resource].packed_stride & 0x3fffu;
+		}
 	}
 	std::ranges::copy(layout.indirect_map,
 	                  prepared.shader_data.begin() + layout.IndirectMapDword());
+	if (layout.dynamic_indirect_buffers) {
+		for (const auto& root : layout.indirect_buffer_roots) {
+			prepared.shader_data[layout.IndirectRootMappingDword() + root.mapping_dword] =
+			    spec.buffers[root.resource].indirect_mapping_offset;
+		}
+		for (const auto& table : layout.indirect_buffer_tables) {
+			uint32_t default_entry = 0u;
+			for (uint32_t g = 0; g < table.groups.size(); ++g) {
+				if (table.groups[g].is_empty) {
+					default_entry = g << 20u;
+					break;
+				}
+			}
+			const auto map_begin = prepared.shader_data.begin() + layout.IndirectMapDword() + table.map_offset;
+			std::fill_n(map_begin, table.map_capacity, default_entry);
+			const auto encode_entry = [&](uint32_t resource_idx) {
+				const auto& buf = spec.buffers[resource_idx];
+				const auto key = ShaderRecompiler::IR::MakeIndirectBufferGroup(
+				    buf.packed_stride, buf.descriptor_format, buf.descriptor_swizzle,
+				    table.check_format_swizzle);
+				const auto it = std::ranges::find(table.groups, key);
+				EXIT_IF(it == table.groups.end());
+				const uint32_t group_index = static_cast<uint32_t>(it - table.groups.begin());
+				const uint32_t slot = key.is_empty ? 0u : slot_of[resource_idx];
+				EXIT_IF(!key.is_empty && slot == UINT32_MAX);
+				return (group_index << 20u) | (slot & 0xfffffu);
+			};
+			uint32_t ordinal = 0u;
+			EXIT_IF(ordinal >= table.map_capacity);
+			map_begin[ordinal++] = encode_entry(table.root_resource);
+			for (uint32_t c = layout.base_buffer_count; c < spec.buffers.size(); ++c) {
+				if (spec.buffers[c].indirect_root != table.root_resource) continue;
+				EXIT_IF(ordinal >= table.map_capacity);
+				map_begin[ordinal++] = encode_entry(c);
+			}
+		}
+	}
 	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::FlattenedSrt)] != 0) {
 		prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
 	}

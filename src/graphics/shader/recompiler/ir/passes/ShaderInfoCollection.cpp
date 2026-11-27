@@ -350,11 +350,21 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 				collect_element(memory.resource);
 				for (const auto child: info.buffers[memory.resource].indirect_resources)
 					collect_element(child);
-				if ((info.buffers[memory.resource].packed_stride & (1u << 20u)) != 0u) {
+				const auto check_add_tid = [&](uint32_t resource) {
+					if ((info.buffers[resource].packed_stride & (1u << 20u)) == 0u) return true;
 					if (program.stage != ShaderType::Compute) {
-						return Fail("buffer ADD_TID is only valid for compute shaders");
+						return false;
 					}
 					info.subgroup_local_invocation_id = true;
+					return true;
+				};
+				if (!check_add_tid(memory.resource)) {
+					return Fail("buffer ADD_TID is only valid for compute shaders");
+				}
+				for (const auto child: info.buffers[memory.resource].indirect_resources) {
+					if (!check_add_tid(child)) {
+						return Fail("buffer ADD_TID is only valid for compute shaders");
+					}
 				}
 			}
 		}

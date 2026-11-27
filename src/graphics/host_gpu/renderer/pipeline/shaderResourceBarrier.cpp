@@ -75,11 +75,22 @@ vk::BufferMemoryBarrier MakeGdsDependency(vk::Buffer buffer) {
 bool HasShaderBufferWrites(const ShaderStageRuntime& runtime) {
 	const auto& program   = runtime.module->info;
 	const auto& resources = *runtime.resources;
-	EXIT_IF(resources.buffers.size() != program.info.buffers.size());
+	const auto& spec =
+	    runtime.specialization != nullptr ? *runtime.specialization : runtime.module->specialization;
+	if (!program.bindings.dynamic_indirect_buffers) {
+		EXIT_IF(resources.buffers.size() != program.info.buffers.size());
+	} else {
+		EXIT_IF(resources.buffers.size() != spec.buffers.size() ||
+		        resources.buffers.size() < program.bindings.base_buffer_count);
+	}
 	// Address writes reach memory outside the bound buffer descriptors.
 	bool has_writes = program.has_address_writes;
-	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
-		if (!program.info.buffers[i].written) {
+	for (uint32_t i = 0; i < resources.buffers.size(); i++) {
+		const uint32_t meta_index =
+		    (!program.bindings.dynamic_indirect_buffers || i < program.bindings.base_buffer_count)
+		        ? i
+		        : spec.buffers[i].indirect_root;
+		if (!program.info.buffers[meta_index].written) {
 			continue;
 		}
 		const auto&          value = resources.buffers[i];

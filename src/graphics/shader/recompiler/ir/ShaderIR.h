@@ -503,6 +503,47 @@ DescriptorBindingForImage(const ImageResource& image) {
 	return static_cast<DescriptorBindingKind>(base + dimension);
 }
 
+struct IndirectBufferGroup {
+	bool                   is_empty     = false;
+	bool                   zero_stride  = false;
+	uint32_t               stride_flags = 0;
+	Prospero::BufferFormat format       = Prospero::BufferFormat::kInvalid;
+	uint32_t               swizzle      = 0;
+
+	bool operator==(const IndirectBufferGroup&) const = default;
+};
+
+[[nodiscard]] constexpr IndirectBufferGroup
+MakeIndirectBufferGroup(uint32_t packed_stride, Prospero::BufferFormat descriptor_format,
+                        uint32_t descriptor_swizzle, bool check_format_swizzle) {
+	const bool is_empty = packed_stride == 0u;
+	return {
+	    .is_empty     = is_empty,
+	    .zero_stride  = !is_empty && (packed_stride & 0x3fffu) == 0u,
+	    .stride_flags = is_empty ? 0u : (packed_stride & ~0x3fffu),
+	    .format       = check_format_swizzle ? descriptor_format : Prospero::BufferFormat::kInvalid,
+	    .swizzle      = check_format_swizzle ? descriptor_swizzle : 0u,
+	};
+}
+
+struct IndirectBufferTable {
+	uint32_t                         root_resource        = 0;
+	bool                             check_format_swizzle = false;
+	uint32_t                         map_offset           = 0;
+	uint32_t                         map_capacity         = 0;
+	std::vector<IndirectBufferGroup> groups;
+
+	bool operator==(const IndirectBufferTable&) const = default;
+};
+
+struct IndirectBufferRoot {
+	uint32_t resource      = 0;
+	uint32_t mapping_dword = 0;
+	bool     binary_search = false;
+
+	bool operator==(const IndirectBufferRoot&) const = default;
+};
+
 struct Bindings {
 	std::array<uint32_t, static_cast<size_t>(DescriptorBindingKind::Count)> descriptor_counts {};
 	uint64_t descriptor_mask = 0;
@@ -510,6 +551,12 @@ struct Bindings {
 	uint32_t dispatch_thread_dword = PushData::NoStart;
 	uint32_t ray_query_dword       = PushData::NoStart; // Device address of the context.
 	uint32_t memory_offset_dword = 0;
+	uint32_t base_buffer_count = 0;
+	uint32_t live_base_buffer_count = 0;
+	bool dynamic_indirect_buffers = false;
+	std::vector<IndirectBufferRoot> indirect_buffer_roots;
+	std::vector<uint32_t> indirect_root_mappings;
+	std::vector<IndirectBufferTable> indirect_buffer_tables;
 	std::vector<uint32_t> indirect_map;
 
 	// Packed 8-bit binding offsets, then each binding's bound range in bytes: OpArrayLength
@@ -518,9 +565,18 @@ struct Bindings {
 		return memory_offset_dword +
 		       (descriptor_counts[static_cast<size_t>(DescriptorBindingKind::Buffers)] + 3u) / 4u;
 	}
-	[[nodiscard]] uint32_t IndirectMapDword() const {
+	[[nodiscard]] uint32_t MemoryStrideDword() const {
 		return MemorySizeDword() +
 		       descriptor_counts[static_cast<size_t>(DescriptorBindingKind::Buffers)];
+	}
+	[[nodiscard]] uint32_t IndirectRootMappingDword() const {
+		return MemoryStrideDword() +
+		       (dynamic_indirect_buffers
+		            ? descriptor_counts[static_cast<size_t>(DescriptorBindingKind::Buffers)]
+		            : 0u);
+	}
+	[[nodiscard]] uint32_t IndirectMapDword() const {
+		return IndirectRootMappingDword() + static_cast<uint32_t>(indirect_buffer_roots.size());
 	}
 	[[nodiscard]] uint32_t ShaderDataDwords() const {
 		return IndirectMapDword() + static_cast<uint32_t>(indirect_map.size());

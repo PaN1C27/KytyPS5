@@ -2026,7 +2026,15 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
             "storage buffer offset is not representable");
     packed_user_data[result.program.bindings.memory_offset_dword + index / 4u] |=
         offset << ((index % 4u) * 8u);
+    if (result.program.bindings.dynamic_indirect_buffers) {
+      packed_user_data[result.program.bindings.MemoryStrideDword() + index] =
+          result.program.info.buffers[resource].packed_stride & 0x3fffu;
+    }
   }
+  std::ranges::copy(
+      result.program.bindings.indirect_root_mappings,
+      packed_user_data.begin() +
+          result.program.bindings.IndirectRootMappingDword());
   std::ranges::copy(
       result.program.bindings.indirect_map,
       packed_user_data.begin() + result.program.bindings.IndirectMapDword());
@@ -20918,6 +20926,10 @@ public:
                   "storage buffer descriptor range exceeds backing buffer");
         }
         shader_data[layout.MemorySizeDword() + index] = static_cast<u32>(info.range);
+        if (layout.dynamic_indirect_buffers) {
+          shader_data[layout.MemoryStrideDword() + index] =
+              compiled.program.info.buffers[resource].packed_stride & 0x3fffu;
+        }
       }
       vk::WriteDescriptorSet write{};
       write.sType = vk::StructureType::eWriteDescriptorSet;
@@ -20928,6 +20940,8 @@ public:
       write.pBufferInfo = buffer_infos.data();
       writes.push_back(write);
     }
+    std::ranges::copy(layout.indirect_root_mappings,
+                      shader_data.begin() + layout.IndirectRootMappingDword());
     std::ranges::copy(layout.indirect_map,
                       shader_data.begin() + layout.IndirectMapDword());
     if (Count(Kind::FlattenedSrt) != 0) {
@@ -51415,6 +51429,194 @@ void CheckShaderStore(VulkanHarness &vulkan) {
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
+void CheckStreamingIndirectBufferReuse(VulkanHarness &vulkan) {
+  constexpr const char *name = "StreamingIndirectBufferReuse";
+  constexpr uintptr_t base = 0x0000000206000000ull;
+  constexpr uint64_t allocation_size = 0x40000;
+  constexpr u32 table_offset = 0x0100u;
+  constexpr u32 out_offset = 0x1000u;
+  constexpr u32 data_offset = 0x2000u;
+  // Loop s32 = 0..s4-1: load V# s[12:15] from table s[0:3] at s32*16,
+  // buffer_load_format_xy v[4:5], v1(=0), s[12:15], then buffer_store_dwordx2
+  // v[4:5], v2(=s32), s[8:11].
+  std::vector<u32> compute{
+      EncodeVop1(0x01u, 1u, InlineU32(0u)),
+      EncodeSMovB32(32u, InlineU32(0u)),
+  };
+  const auto header = compute.size();
+  compute.push_back(EncodeSopc(0x04u, 32u, 4u));
+  const auto exit_branch = compute.size();
+  compute.push_back(0u);
+  compute.insert(compute.end(), {
+      EncodeSop2(0x26u, 33u, 32u, 255u), 16u,
+      EncodeSmem0(0x0au, 12u, 0u), EncodeSmem1(0u, 33u),
+      EncodeSopp(0x0cu, 0u),
+      EncodeMubuf0(0x01u, 0u, true, false), EncodeMubuf1(4u, 3u, 1u),
+      EncodeSopp(0x0cu, 0u),
+      EncodeVop1(0x01u, 2u, 32u),
+      EncodeMubuf0(0x1du, 0u, true, false), EncodeMubuf1(4u, 2u, 2u),
+      EncodeSop2(0x02u, 32u, 32u, InlineU32(1u)),
+  });
+  compute.push_back(EncodeSopp(0x02u, static_cast<u32>(header - compute.size() - 1u)));
+  compute[exit_branch] = EncodeSopp(0x04u, static_cast<u32>(compute.size() - exit_branch - 1u));
+  AppendEnd(&compute);
+  ShaderMapUserData(reinterpret_cast<uint64_t>(compute.data()),
+                    {.type = Prospero::ShaderBinaryType::kCs,
+                     .code_size_bytes = static_cast<u32>(compute.size() * sizeof(u32))});
+
+  int64_t direct_offset = -1;
+  void *mapped = reinterpret_cast<void *>(base);
+  Require(name, "memory allocation",
+          LibKernel::Memory::KernelAllocateDirectMemory(
+              0, LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size, 0x10000, 0,
+              &direct_offset) == 0 &&
+              LibKernel::Memory::KernelMapDirectMemory(&mapped, allocation_size, 0x3, 0x10,
+                                                       direct_offset, 0x10000) == 0,
+          "memory allocation or mapping failed");
+
+  const auto store = std::filesystem::temp_directory_path() /
+                     fmt::format("kyty_streaming_indirect_{}",
+                                 std::chrono::steady_clock::now().time_since_epoch().count()) /
+                     "TEST00001.shaders";
+  struct RowSpec {
+    Prospero::BufferFormat format;
+    u32 stride;
+    std::array<u32, 2> raw_words;
+    std::array<u32, 2> expected_words;
+  };
+  const auto dispatch_rows = [&](RenderContext &context, const std::vector<RowSpec> &rows) {
+    auto *words = static_cast<u32 *>(mapped);
+    std::memset(words, 0, allocation_size);
+    for (size_t i = 0; i < rows.size(); ++i) {
+      const uint64_t row_addr = base + data_offset + i * 0x100u;
+      const u32 data_word = (data_offset + static_cast<u32>(i) * 0x100u) / 4u;
+      words[data_word] = rows[i].raw_words[0];
+      words[data_word + 1u] = rows[i].raw_words[1];
+      const u32 desc_word = (table_offset + static_cast<u32>(i) * 16u) / 4u;
+      words[desc_word] = static_cast<u32>(row_addr);
+      words[desc_word + 1u] = static_cast<u32>(row_addr >> 32u) | (rows[i].stride << 16u);
+      words[desc_word + 2u] = 2u;
+      words[desc_word + 3u] =
+          DstSel(4, 5, 6, 7) | (static_cast<u32>(rows[i].format) << 12u);
+    }
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      auto &shaders = processor.GetShCtx();
+      shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(compute.data()),
+                           .num_thread_x = 1, .num_thread_y = 1, .num_thread_z = 1,
+                           .wave_size = 64, .user_sgpr = 12});
+      const uint64_t table_addr = base + table_offset;
+      const uint64_t out_addr = base + out_offset;
+      shaders.SetCsUserSgpr(0, static_cast<u32>(table_addr));
+      shaders.SetCsUserSgpr(1, static_cast<u32>(table_addr >> 32u) | (16u << 16u));
+      shaders.SetCsUserSgpr(2, 8u);
+      shaders.SetCsUserSgpr(3, 0x5204u);
+      shaders.SetCsUserSgpr(4, static_cast<u32>(rows.size()));
+      shaders.SetCsUserSgpr(8, static_cast<u32>(out_addr));
+      shaders.SetCsUserSgpr(9, static_cast<u32>(out_addr >> 32u) | (8u << 16u));
+      shaders.SetCsUserSgpr(10, 8u);
+      shaders.SetCsUserSgpr(11,
+          DstSel(4, 5, 6, 7) |
+              (static_cast<u32>(Prospero::BufferFormat::k32_32UInt) << 12u));
+      context.MapMemory(base, allocation_size);
+      processor.DispatchDirect(1, 1, 1, 0x41u);
+      context.GetBufferCache().ReadMemory(out_addr, rows.size() * 8u);
+      std::vector<u32> actual(rows.size() * 2u);
+      (void)LibKernel::Memory::TryReadBacking(out_addr, actual.data(),
+                                              actual.size() * sizeof(u32));
+      context.UnmapMemory(base, allocation_size);
+      for (size_t i = 0; i < rows.size(); ++i) {
+        Require(name, "row output",
+                actual[i * 2u] == rows[i].expected_words[0] &&
+                    actual[i * 2u + 1u] == rows[i].expected_words[1],
+                "indirect buffer reuse readback mismatched expected formatted values");
+      }
+    });
+  };
+
+  using F = Prospero::BufferFormat;
+  const std::vector<RowSpec> batch1{
+      {F::k32_32Float, 8u,  {0x3f800000u, 0x40000000u}, {0x3f800000u, 0x40000000u}},
+      {F::k32_32Float, 16u, {0x40400000u, 0x40800000u}, {0x40400000u, 0x40800000u}},
+      {F::k32_32Float, 16u, {0x40a00000u, 0x40c00000u}, {0x40a00000u, 0x40c00000u}},
+  };
+  const std::vector<RowSpec> batch2{
+      {F::k32_32Float, 12u, {0x41000000u, 0x41100000u}, {0x41000000u, 0x41100000u}},
+      {F::k32_32Float, 24u, {0x41200000u, 0x41300000u}, {0x41200000u, 0x41300000u}},
+      {F::k32_32Float, 32u, {0x41400000u, 0x41500000u}, {0x41400000u, 0x41500000u}},
+      {F::k32_32Float, 8u,  {0x41600000u, 0x41700000u}, {0x41600000u, 0x41700000u}},
+      {F::k32_32Float, 20u, {0x41800000u, 0x41880000u}, {0x41800000u, 0x41880000u}},
+      {F::k32_32Float, 16u, {0x41900000u, 0x41980000u}, {0x41900000u, 0x41980000u}},
+      {F::k32_32Float, 36u, {0x41a00000u, 0x41a80000u}, {0x41a00000u, 0x41a80000u}},
+  };
+  const std::vector<RowSpec> batch3{
+      {F::k32_32Float, 20u, {0xbf800000u, 0xc0000000u}, {0xbf800000u, 0xc0000000u}},
+      {F::k32_32Float, 28u, {0xc0400000u, 0xc0800000u}, {0xc0400000u, 0xc0800000u}},
+  };
+  // Mixed k32_32Float + k16_16Float triggers a superset module compile; batch5 reuses it.
+  const std::vector<RowSpec> batch4{
+      {F::k32_32Float, 16u, {0x3f800000u, 0x40000000u}, {0x3f800000u, 0x40000000u}},
+      {F::k16_16Float, 8u,  {0x40003c00u, 0x00000000u}, {0x3f800000u, 0x40000000u}},
+      {F::k32_32Float, 24u, {0x40400000u, 0x40800000u}, {0x40400000u, 0x40800000u}},
+      {F::k16_16Float, 4u,  {0xc000bc00u, 0x00000000u}, {0xbf800000u, 0xc0000000u}},
+  };
+  const std::vector<RowSpec> batch5{
+      {F::k32_32Float, 28u, {0x40a00000u, 0x40c00000u}, {0x40a00000u, 0x40c00000u}},
+      {F::k32_32Float, 40u, {0x41000000u, 0x41200000u}, {0x41000000u, 0x41200000u}},
+      {F::k32_32Float, 12u, {0x41400000u, 0x41600000u}, {0x41400000u, 0x41600000u}},
+      {F::k32_32Float, 8u,  {0x41800000u, 0x41900000u}, {0x41800000u, 0x41900000u}},
+      {F::k32_32Float, 44u, {0x41a00000u, 0x41b00000u}, {0x41a00000u, 0x41b00000u}},
+  };
+
+  const auto cs_index = static_cast<size_t>(ShaderType::Compute);
+  {
+    RenderContext context(vulkan.RuntimeContext(), store);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    auto &pipelines = context.GetPipelineCache();
+    dispatch_rows(context, batch1);
+    Require(name, "initial compile", PipelineCacheTestAccess::Compiled(pipelines)[cs_index] == 1u,
+            "initial dispatch compiled unexpected module count");
+    dispatch_rows(context, batch2);
+    dispatch_rows(context, batch3);
+    Require(name, "same-group streaming reuse",
+            PipelineCacheTestAccess::Compiled(pipelines)[cs_index] == 1u,
+            "adding/reordering records or changing strides triggered a recompile");
+    dispatch_rows(context, batch4);
+    Require(name, "superset format group compile",
+            PipelineCacheTestAccess::Compiled(pipelines)[cs_index] == 2u,
+            "introducing a new format group did not compile one superset module");
+    dispatch_rows(context, batch5);
+    Require(name, "superset subset reuse",
+            PipelineCacheTestAccess::Compiled(pipelines)[cs_index] == 2u,
+            "returning to a subset of format groups triggered a recompile");
+    context.ShutdownGpu();
+    LibKernel::Memory::InstallGpuResources(nullptr);
+  }
+  {
+    RenderContext context(vulkan.RuntimeContext(), store);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    auto &pipelines = context.GetPipelineCache();
+    dispatch_rows(context, batch1);
+    dispatch_rows(context, batch2);
+    dispatch_rows(context, batch4);
+    dispatch_rows(context, batch5);
+    Require(name, "warm store reuse",
+            PipelineCacheTestAccess::Compiled(pipelines)[cs_index] == 0u,
+            "warm shader store recompiled indirect buffer modules on streaming dispatches");
+    context.ShutdownGpu();
+    LibKernel::Memory::InstallGpuResources(nullptr);
+  }
+  std::filesystem::remove_all(store.parent_path());
+  Require(name, "release",
+          LibKernel::Memory::KernelMunmap(base, allocation_size) == 0 &&
+              LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
+          "memory release failed");
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
 void CheckPs5GameExampleImageClearRuntimeShape() {
   const auto MakeCode = [] {
     std::vector<u32> code;
@@ -59518,6 +59720,7 @@ int main(int argc, char **argv) {
   CheckGraphicsPushDataModules(vulkan);
   CheckVertexFormatModules(vulkan);
   CheckShaderStore(vulkan);
+  CheckStreamingIndirectBufferReuse(vulkan);
   vulkan.CheckOrderedDispatch();
   vulkan.CheckZeroStrideBufferBinding();
   vulkan.CheckNullStorageBufferDescriptor();

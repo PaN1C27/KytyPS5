@@ -36,11 +36,16 @@ enum class ShaderType {
 // MODE bit 6 enables FP16 and FP64 input denormals independently of output flushing.
 constexpr bool ShaderFlushF16Inputs(uint8_t float_mode) { return (float_mode & 0x40u) == 0; }
 
+namespace ShaderRecompiler::IR {
+struct ResourceSpecialization;
+} // namespace ShaderRecompiler::IR
+
 struct ShaderModule;
 
 struct ShaderStageRuntime {
-	const ShaderModule*                           module    = nullptr;
-	const ShaderRecompiler::IR::ResourceSnapshot* resources = nullptr;
+	const ShaderModule*                              module         = nullptr;
+	const ShaderRecompiler::IR::ResourceSnapshot*    resources      = nullptr;
+	const ShaderRecompiler::IR::ResourceSpecialization* specialization = nullptr;
 
 	[[nodiscard]] explicit operator bool() const {
 		return module != nullptr && resources != nullptr;

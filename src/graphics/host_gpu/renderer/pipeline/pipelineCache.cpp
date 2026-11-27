@@ -167,14 +167,15 @@ void ValidateShaderSpirv(const char* stage, uint64_t shader_hash,
 ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
 	// AMD GPUs (vendor 0x1002) run NMin/NMax as v_min/v_max, which give the guest's NaN and
 	// signed-zero results; GLSL.std.450 alone does not order -0 below +0.
-	return {.maintenance8           = graphics.maintenance8_enabled,
-	        .native_float_min_max   = graphics.physical_device_properties.vendorID == 0x1002u,
-	        .device_clock_period_ps = graphics.device_clock_period_ps,
-	        .robust_buffer_access   = graphics.robust_buffer_access_enabled,
-	        .r8_srgb_views          = graphics.r8_srgb_views,
-	        .r8g8_srgb_views        = graphics.r8g8_srgb_views,
-	        .relaxed_float          = Config::RelaxedShaderFloatEnabled(),
-	        .ray_query              = graphics.ray_query_enabled};
+	return {.maintenance8             = graphics.maintenance8_enabled,
+	        .native_float_min_max     = graphics.physical_device_properties.vendorID == 0x1002u,
+	        .device_clock_period_ps   = graphics.device_clock_period_ps,
+	        .robust_buffer_access     = graphics.robust_buffer_access_enabled,
+	        .r8_srgb_views            = graphics.r8_srgb_views,
+	        .r8g8_srgb_views          = graphics.r8g8_srgb_views,
+	        .relaxed_float            = Config::RelaxedShaderFloatEnabled(),
+	        .ray_query                = graphics.ray_query_enabled,
+	        .dynamic_indirect_buffers = true};
 }
 
 std::filesystem::path ShaderStorePath() {
@@ -210,16 +211,102 @@ bool PipelineCache::Program::RefreshCallSource(const ShaderRecompiler::IR::SrtRu
 	return revision != call_source->revision;
 }
 
+namespace {
+
+bool IsCompatibleModuleSpecialization(
+    const ShaderRecompiler::IR::ResourcePlan& resource_plan, const ShaderModule& candidate,
+    const ShaderRecompiler::IR::ResourceSpecialization& specialization) {
+	if (candidate.specialization == specialization) return true;
+	const auto& layout = candidate.info.bindings;
+	if (!layout.dynamic_indirect_buffers) return false;
+	if (candidate.specialization.images != specialization.images ||
+	    candidate.specialization.samplers != specialization.samplers) {
+		return false;
+	}
+	const uint32_t base_count = layout.base_buffer_count;
+	if (base_count != resource_plan.info.buffers.size() ||
+	    specialization.buffers.size() < base_count) {
+		return false;
+	}
+	for (uint32_t i = 0; i < base_count; ++i) {
+		const auto& base_info = candidate.info.info.buffers[i];
+		const bool  has_indirect =
+		    base_info.source < resource_plan.descriptor_sources.size() &&
+		    resource_plan.descriptor_sources[base_info.source].indirect_descriptor.has_value();
+		if (!has_indirect) {
+			if (candidate.specialization.buffers[i] != specialization.buffers[i]) return false;
+			continue;
+		}
+		const bool cand_active = candidate.specialization.buffers[i].indirect_root == i;
+		const bool spec_active = specialization.buffers[i].indirect_root == i;
+		if (cand_active != spec_active) return false;
+		if (!spec_active) {
+			if (candidate.specialization.buffers[i] != specialization.buffers[i]) return false;
+			continue;
+		}
+		if (base_info.live) {
+			const auto root = std::ranges::find_if(
+			    layout.indirect_buffer_roots,
+			    [i](const ShaderRecompiler::IR::IndirectBufferRoot& entry) {
+				    return entry.resource == i;
+			    });
+			if (root == layout.indirect_buffer_roots.end()) return false;
+			if (root->binary_search != (specialization.buffers[i].indirect_search_iterations > 0u) ||
+			    specialization.buffers[i].indirect_search_iterations > 17u) {
+				return false;
+			}
+		}
+	}
+	uint32_t live_children = 0u;
+	std::array<uint32_t, ShaderRecompiler::IR::ShaderInfo::MaxBufferRoots> root_children {};
+	for (size_t c = base_count; c < specialization.buffers.size(); ++c) {
+		const uint32_t r = specialization.buffers[c].indirect_root;
+		if (r >= base_count || specialization.buffers[r].indirect_root != r) return false;
+		if (candidate.info.info.buffers[r].live) {
+			++live_children;
+			++root_children[r];
+		}
+	}
+	const uint32_t buffer_capacity =
+	    layout.descriptor_counts[static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::Buffers)];
+	if (layout.live_base_buffer_count + live_children > buffer_capacity) {
+		return false;
+	}
+	const auto has_group = [](const ShaderRecompiler::IR::IndirectBufferTable& table,
+	                          const ShaderRecompiler::IR::ResourceSpecialization::Buffer& buf) {
+		const auto key = ShaderRecompiler::IR::MakeIndirectBufferGroup(
+		    buf.packed_stride, buf.descriptor_format, buf.descriptor_swizzle,
+		    table.check_format_swizzle);
+		return std::ranges::find(table.groups, key) != table.groups.end();
+	};
+	for (const auto& table : layout.indirect_buffer_tables) {
+		const uint32_t r = table.root_resource;
+		if (1u + root_children[r] > table.map_capacity) return false;
+		if (!has_group(table, specialization.buffers[r])) return false;
+	}
+	for (size_t c = base_count; c < specialization.buffers.size(); ++c) {
+		const uint32_t r = specialization.buffers[c].indirect_root;
+		for (const auto& table : layout.indirect_buffer_tables) {
+			if (table.root_resource == r && !has_group(table, specialization.buffers[c])) {
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
+} // namespace
+
 template <bool HasCalls>
 ShaderModule* PipelineCache::Program::FindModule(const ShaderRecompiler::IR::SrtRuntime& runtime,
                                                  ShaderRecompiler::IR::PushData::Window push_data) {
 	EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
 	                                                    specialization));
-	for (auto& candidate: modules) {
+	for (auto& candidate: std::views::reverse(modules)) {
 		const auto& layout = candidate.info.bindings;
 		if (layout.push_data_start_dword !=
 		        push_data.StartFor(layout.ShaderDataDwords(), candidate.info.stage) ||
-		    candidate.specialization != specialization) {
+		    !IsCompatibleModuleSpecialization(resource_plan, candidate, specialization)) {
 			continue;
 		}
 		if constexpr (HasCalls) {
@@ -323,7 +410,9 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	BuildStageStaticKey(input_info, m_lookup_key.static_state);
 	auto entry = m_program_cache.find(m_lookup_key);
 	const auto bind = [&](const ShaderModule& module) {
-		input_info.stage = {.module = &module, .resources = &entry->second.resources};
+		input_info.stage = {.module         = &module,
+		                    .resources      = &entry->second.resources,
+		                    .specialization = &entry->second.specialization};
 		module.info.bindings.AdvancePushData(push_data, module.info.stage);
 		return &module;
 	};

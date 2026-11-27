@@ -24,6 +24,8 @@ struct Profile {
 	bool relaxed_float = false;
 	// Ray queries: recognized traversal loops trace the dispatch's host TLAS.
 	bool ray_query = false;
+	// Indirect buffer reuse: read strides/mappings from shader_data and pad descriptor arrays.
+	bool dynamic_indirect_buffers = false;
 };
 
 inline constexpr Profile DefaultProfile {};
