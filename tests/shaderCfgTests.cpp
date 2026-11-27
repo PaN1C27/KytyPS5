@@ -11981,6 +11981,85 @@ void TestScalarMemorySelectedWritableDescriptor() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestEdgeGuardedMovreldPreservesUniformDescriptor() {
+  using namespace ShaderRecompiler::IR;
+  const uint32_t shader[] = {
+      EncodeVop1(0x01u, 2u, 128u),                         // 0: v_mov_b32 v2, 0
+      EncodeMubuf0(0x0du, 0u, true),                       // 1..2: buffer_load_dwordx2 v[8:9], v2, s[0:3], 0 idxen
+      EncodeMubuf1(8u, 0u, 2u),
+      0xbf8c0000u,                                         // 3: s_waitcnt 0
+      EncodeVop1(0x01u, 4u, 128u + 8u),                    // 4: v_mov_b32 v4, 8
+      EncodeVopc(0xc4u, 128u + 10u, 0u),                   // 5: v_cmp_gt_u32 vcc, 10, v0
+      EncodeSop1(0x04u, 6u, 106u),                         // 6: s_mov_b64 s[6:7], vcc
+      EncodeSop1(0x24u, 20u, 106u),                        // 7: s_and_saveexec_b64 s[20:21], vcc
+      EncodeSopp(0x08u, 29u),                              // 8: s_cbranch_execz +29 -> end (38)
+      EncodeVopc(0xc2u, 128u + 1u, 0u),                    // 9: v_cmp_eq_u32 vcc, 1, v0
+      EncodeSop1(0x04u, 8u, 106u),                         // 10: s_mov_b64 s[8:9], vcc
+      EncodeSop2(0x15u, 10u, 6u, 8u),                      // 11: s_andn2_b64 s[10:11], s[6:7], s[8:9]
+      EncodeSop1(0x24u, 16u, 8u),                          // 12: s_and_saveexec_b64 s[16:17], s[8:9]
+      EncodeSopp(0x08u, 1u),                               // 13: s_cbranch_execz +1 -> skip1 (15)
+      EncodeVop1(0x01u, 4u, 128u + 4u),                    // 14: v_mov_b32 v4, 4
+      EncodeSop1(0x04u, 126u, 16u),                        // 15: s_mov_b64 exec, s[16:17]
+      EncodeSop1(0x24u, 16u, 10u),                         // 16: s_and_saveexec_b64 s[16:17], s[10:11]
+      EncodeSopp(0x08u, 1u),                               // 17: s_cbranch_execz +1 -> skip2 (19)
+      EncodeVop1(0x01u, 4u, 128u + 1u),                    // 18: v_mov_b32 v4, 1
+      EncodeSop1(0x04u, 126u, 16u),                        // 19: s_mov_b64 exec, s[16:17]
+      EncodeSop1(0x04u, 18u, 126u),                        // 20: s_mov_b64 s[18:19], exec
+      EncodeVop3Word0(0x182u, 22u),                        // 21..22: v_readfirstlane_b32 s22, v4
+      EncodeVop3Word1(256u + 4u, 0u, 0u),
+      EncodeSMovB32(124u, 22u),                            // 23: s_mov_b32 m0, s22
+      EncodeSop1(0x04u, 16u, 126u),                        // 24: s_mov_b64 s[16:17], exec
+      EncodeVopc(0xd2u, 22u, 4u),                          // 25: v_cmpx_eq_u32 exec, s22, v4
+      EncodeVop1(0x42u, 0u, 256u + 1u),                    // 26: v_movreld_b32 v0, v1
+      EncodeSop2(0x15u, 126u, 16u, 126u),                  // 27: s_andn2_b64 exec, s[16:17], exec
+      EncodeSopp(0x09u, static_cast<uint16_t>(-8)),        // 28: s_cbranch_execnz -8 -> loop (21)
+      EncodeSop1(0x04u, 126u, 18u),                        // 29: s_mov_b64 exec, s[18:19]
+      EncodeVop3Word0(0x182u, 14u),                        // 30..31: v_readfirstlane_b32 s14, v8
+      EncodeVop3Word1(256u + 8u, 0u, 0u),
+      EncodeSMovB32(12u, 4u),                              // 32: s_mov_b32 s12, s4
+      EncodeSMovB32(13u, 5u),                              // 33: s_mov_b32 s13, s5
+      EncodeSMovB32(15u, 255u), 0x00016204u,               // 34..35: s_mov_b32 s15, 0x00016204
+      EncodeMubuf0(0x1cu, 0u, true),                       // 36..37: buffer_store_dword v1, v2, s[12:15], 0 idxen
+      EncodeMubuf1(1u, 3u, 2u),
+      EncodeSop1(0x04u, 126u, 20u),                        // 38: s_mov_b64 exec, s[20:21]
+      EncodeSopp(0x01u),                                   // 39: s_endpgm
+  };
+  std::array<uint32_t, 6> user_data{
+      0x1000u, 0x00040000u, 1024u, 0x00016204u, 0x2000u, 0x00040000u};
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.user_data = user_data;
+  auto translated = ShaderRecompiler::TranslateProgram(shader, options);
+  auto plan = ExtractResourcePlan(translated.program);
+  Check(plan.info.buffers.size() == 2 && !plan.info.buffers[0].written &&
+            plan.info.buffers[1].written,
+        "edge-guarded MOVRELD waterfall lost uniform descriptor provenance");
+
+  FakeGuestMemory fake(+[](void *, uint64_t address, std::span<uint32_t> words) {
+    if (address == 0x1000u) {
+      for (size_t i = 0; i < words.size(); ++i) {
+        words[i] = 64u + static_cast<uint32_t>(i * 32u);
+      }
+      return true;
+    }
+    return false;
+  });
+
+  const SrtRuntime runtime{.user_data = user_data};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.buffers.size() == 2,
+        "edge-guarded MOVRELD waterfall failed to materialize output buffer");
+  Check(snapshot.buffers[1].dwords[0] == 0x2000u &&
+            snapshot.buffers[1].dwords[1] == 0x00040000u &&
+            snapshot.buffers[1].dwords[2] == 64u &&
+            snapshot.buffers[1].dwords[3] == 0x00016204u,
+        "edge-guarded MOVRELD waterfall materialized wrong output descriptor");
+
+  const auto result = RecompileForTest(shader, options);
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestUniformSelectedDescriptorLoadAddress() {
   using namespace ShaderRecompiler::IR;
   const uint32_t shader[] = {
@@ -14114,6 +14193,7 @@ int main() {
   TestUniformSelectedWritableDescriptor();
   TestDominatedBranchAndNestedDiamondDescriptor();
   TestScalarMemorySelectedWritableDescriptor();
+  TestEdgeGuardedMovreldPreservesUniformDescriptor();
   TestUniformSelectedDescriptorLoadAddress();
   TestBoundedScalarMaterialImageKeys();
   TestImmutableDescriptorPredicate();

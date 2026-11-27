@@ -2839,9 +2839,8 @@ private:
 			if (req == Value(true) || equiv(equiv, guard, req)) return true;
 			const auto* g_inst = guard.TryInstruction();
 			const auto* r_inst = req.TryInstruction();
-			if (depth > 10u || g_inst == nullptr) return false;
-			const bool cacheable = depth == 0u && r_inst != nullptr;
-			if (cacheable) {
+			if (depth > 32u || g_inst == nullptr) return false;
+			if (r_inst != nullptr) {
 				if (const auto found = implies_cache.find({g_inst, r_inst});
 				    found != implies_cache.end()) {
 					return found->second;
@@ -2880,7 +2879,9 @@ private:
 					ans = ok && non_self;
 				}
 			}
-			if (cacheable) implies_cache.emplace(std::pair {g_inst, r_inst}, ans);
+			if (r_inst != nullptr && (ans || depth == 0u)) {
+				implies_cache.emplace(std::pair {g_inst, r_inst}, ans);
+			}
 			return ans;
 		};
 
@@ -2949,6 +2950,19 @@ private:
 			}
 			std::ranges::sort(out, order_less);
 			inv_cache.emplace(std::move(key), out);
+			return out;
+		};
+		const auto invariant_neg_guards =
+		    [&](std::span<const Inst* const> neg,
+		        const Block* target_blk) -> std::vector<const Inst*> {
+			std::vector<const Inst*> out;
+			for (const auto* g: neg) {
+				if (g != nullptr && strictly_dominates(g->Parent(), target_blk) &&
+				    std::ranges::find(out, g) == out.end()) {
+					out.push_back(g);
+				}
+			}
+			std::ranges::sort(out, order_less);
 			return out;
 		};
 
@@ -3051,7 +3065,13 @@ private:
 			return next;
 		};
 
-		using PhiKey = std::pair<const Inst*, std::vector<const Inst*>>;
+		struct PhiKey {
+			const Inst*              phi = nullptr;
+			std::vector<const Inst*> pos;
+			std::vector<const Inst*> neg;
+
+			auto operator<=>(const PhiKey&) const = default;
+		};
 		std::map<PhiKey, std::optional<Range>>                      phi_ranges;
 		std::vector<PhiKey>                                         phi_order;
 		std::map<std::pair<const Inst*, GuardState>, std::optional<Range>> eval_memo;
@@ -3180,8 +3200,9 @@ private:
 			std::optional<Range> res = Range {};
 			switch (inst->GetOpcode()) {
 				case ValueOpcode::Phi: {
-					const auto   inv = invariant_guards(guards.pos, inst->Parent());
-					const PhiKey key {inst, inv};
+					const auto   inv     = invariant_guards(guards.pos, inst->Parent());
+					const auto   inv_neg = invariant_neg_guards(guards.neg, inst->Parent());
+					const PhiKey key {inst, inv, inv_neg};
 					const auto [it, inserted] = phi_ranges.try_emplace(key, std::nullopt);
 					if (inserted) phi_order.push_back(key);
 					res = it->second;
@@ -3189,10 +3210,12 @@ private:
 				}
 				case ValueOpcode::ReadFirstLane: {
 					if (inst->NumArgs() == 2u) {
-						const auto mask    = inst->Arg(1);
-						const bool implied = std::ranges::any_of(guards.pos, [&](const Inst* p) {
-							return implies_guard(implies_guard, Value(const_cast<Inst*>(p)), mask);
-						});
+						const auto mask    = inst->Arg(1).Resolve();
+						const bool implied = mask == Value(true) ||
+						                     std::ranges::any_of(guards.pos, [&](const Inst* p) {
+							                     return implies_guard(implies_guard,
+							                                          Value(const_cast<Inst*>(p)), mask);
+						                     });
 						if (implied) {
 							res = eval_range(inst->Arg(0), add_guard(GuardState {}, mask, Value {}));
 						}
@@ -3287,26 +3310,51 @@ private:
 			eval_memo.clear();
 			changed = false;
 			for (size_t idx = 0; idx < phi_order.size(); ++idx) {
-				const auto               key    = phi_order[idx];
-				const auto*              phi    = key.first;
-				GuardState               guards;
-				guards.pos                      = key.second;
-				guards                          = expand_guards(std::move(guards));
+				const auto  key = phi_order[idx];
+				const auto* phi = key.phi;
+				GuardState  guards;
+				guards.pos = key.pos;
+				guards.neg = key.neg;
+				guards     = expand_guards(std::move(guards));
 				std::optional<Range> joined;
-				for (size_t arm = 0; arm < phi->NumArgs(); ++arm) {
-					const auto arm_range = eval_range(phi->Arg(arm), guards);
-					if (!arm_range) continue;
-					if (!joined) joined = arm_range;
-					else {
-						joined->low  = std::min(joined->low, arm_range->low);
-						joined->high = std::max(joined->high, arm_range->high);
+				if (!guards.contradictory) {
+					const bool has_blocks = phi->NumPhiBlocks() == phi->NumArgs();
+					for (size_t arm = 0; arm < phi->NumArgs(); ++arm) {
+						GuardState arm_guards = guards;
+						if (has_blocks) {
+							const Block* pred = phi->PhiBlock(arm);
+							if (IsUnreachablePhiEdge(pred, phi->Parent())) continue;
+							const Block* to = phi->Parent();
+							for (uint32_t hop = 0u; hop < 8u && pred != nullptr; ++hop) {
+								if (const auto edge = ConditionalEdge(pred, to);
+								    edge && edge->lanes == LaneQuantifier::All) {
+									const auto pos_add =
+									    edge->positive ? edge->condition : Value {};
+									const auto neg_add =
+									    edge->positive ? Value {} : edge->condition;
+									arm_guards = add_guard(arm_guards, pos_add, neg_add);
+									if (arm_guards.contradictory) break;
+								}
+								if (pred->ImmPredecessors().size() != 1u) break;
+								to   = pred;
+								pred = pred->ImmPredecessors()[0];
+							}
+							if (arm_guards.contradictory) continue;
+						}
+						const auto arm_range = eval_range(phi->Arg(arm), arm_guards);
+						if (!arm_range) continue;
+						if (!joined) joined = arm_range;
+						else {
+							joined->low  = std::min(joined->low, arm_range->low);
+							joined->high = std::max(joined->high, arm_range->high);
+						}
 					}
 				}
 				auto& slot = phi_ranges.at(key);
 				if (joined && slot) {
 					auto& [lo_widen, hi_widen] = widen_counts[key];
-					if (joined->low < slot->low && ++lo_widen > 8u) joined->low = 0u;
-					if (joined->high > slot->high && ++hi_widen > 8u) joined->high = UINT32_MAX;
+					if (joined->low < slot->low && ++lo_widen > 32u) joined->low = 0u;
+					if (joined->high > slot->high && ++hi_widen > 32u) joined->high = UINT32_MAX;
 				}
 				if (joined != slot) {
 					slot    = joined;
@@ -3331,9 +3379,13 @@ private:
 			for (auto* block: m_program.blocks) {
 				for (auto& inst: *block) {
 					if (inst.GetOpcode() != ValueOpcode::Phi || !inst.HasUses()) continue;
-					Value same;
-					bool  uniform = true;
+					Value      same;
+					bool       uniform    = true;
+					const bool has_blocks = inst.NumPhiBlocks() == inst.NumArgs();
 					for (size_t arm = 0; arm < inst.NumArgs(); ++arm) {
+						if (has_blocks && IsUnreachablePhiEdge(inst.PhiBlock(arm), inst.Parent())) {
+							continue;
+						}
 						const auto arg = inst.Arg(arm).Resolve();
 						if (arg.TryInstruction() == &inst) continue;
 						if (same.IsEmpty()) same = arg;
