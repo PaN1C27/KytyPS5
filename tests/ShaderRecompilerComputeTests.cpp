@@ -37966,11 +37966,16 @@ void CheckSharedIndirectBufferLoads(VulkanHarness &vulkan) {
       std::map<u32, std::string> functions;
       std::map<u32, std::string> format_helpers;
       std::map<u32, std::pair<u32, u32>> helper_cfg_counts;
-      u32 function = 0, bda = 0, inline_reads = 0;
+      std::map<u32, u32> indirect_label_counts;
+      u32 function = 0, bda = 0, bda_pagetable = 0, inline_reads = 0, main_function = 0;
+      u32 wrapped_call_sites = 0, prev_indirect_call_res = 0;
+      bool saw_branch_after_call = false, saw_label_after_call_branch = false;
       for (size_t offset = 5; offset < compiled.spirv.size();) {
         const auto words = std::span(compiled.spirv).subspan(offset, compiled.spirv[offset] >> 16u);
         const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
-        if (opcode == spv::OpName) {
+        if (opcode == spv::OpEntryPoint) {
+          main_function = words[2];
+        } else if (opcode == spv::OpName) {
           const std::string_view name(reinterpret_cast<const char *>(words.data() + 2));
           if (name.starts_with("load_indirect_buffer_")) {
             functions.emplace(words[1], name);
@@ -37980,6 +37985,7 @@ void CheckSharedIndirectBufferLoads(VulkanHarness &vulkan) {
             format_helpers.emplace(words[1], name);
           }
           if (name == "get_bda_pointer") bda = words[1];
+          if (name == "bda_pagetable") bda_pagetable = words[1];
         }
         if (opcode == spv::OpFunction) {
           function = words[2];
@@ -37987,6 +37993,9 @@ void CheckSharedIndirectBufferLoads(VulkanHarness &vulkan) {
           Require(test.name, "function control policy",
                   (words[3] & spv::FunctionControlDontInlineMask) == 0u,
                   "SPIR-V helper function must not be marked DontInline");
+          prev_indirect_call_res = 0u;
+          saw_branch_after_call = false;
+          saw_label_after_call_branch = false;
         }
         if (opcode == spv::OpFunctionEnd) {
           function = 0;
@@ -37995,8 +38004,41 @@ void CheckSharedIndirectBufferLoads(VulkanHarness &vulkan) {
           if (opcode == spv::OpLabel) ++helper_cfg_counts[function].first;
           if (opcode == spv::OpSwitch) ++helper_cfg_counts[function].second;
         }
+        if (functions.contains(function) && opcode == spv::OpLabel) {
+          ++indirect_label_counts[function];
+        }
+        if (function == main_function) {
+          if (saw_label_after_call_branch && opcode == spv::OpPhi) {
+            for (size_t i = 3; i < words.size(); i += 2) {
+              if (words[i] == prev_indirect_call_res) ++wrapped_call_sites;
+            }
+            prev_indirect_call_res = 0u;
+            saw_branch_after_call = false;
+            saw_label_after_call_branch = false;
+          } else if (saw_branch_after_call && opcode == spv::OpLabel) {
+            saw_label_after_call_branch = true;
+          } else if (prev_indirect_call_res != 0u && opcode == spv::OpBranch) {
+            saw_branch_after_call = true;
+          } else {
+            prev_indirect_call_res = 0u;
+            saw_branch_after_call = false;
+            saw_label_after_call_branch = false;
+          }
+        }
+        if (opcode == spv::OpAccessChain && bda_pagetable != 0u && words[3] == bda_pagetable &&
+            function != bda) {
+          if (functions.contains(function)) ++profiles[functions.at(function)].reads;
+          else ++inline_reads;
+        }
         if (opcode == spv::OpFunctionCall) {
-          if (functions.contains(words[3])) ++profiles[functions.at(words[3])].calls;
+          if (functions.contains(words[3])) {
+            ++profiles[functions.at(words[3])].calls;
+            if (function == main_function) {
+              prev_indirect_call_res = words[2];
+              saw_branch_after_call = false;
+              saw_label_after_call_branch = false;
+            }
+          }
           if (words[3] == bda) {
             if (functions.contains(function)) ++profiles[functions.at(function)].reads;
             else ++inline_reads;
@@ -38009,12 +38051,18 @@ void CheckSharedIndirectBufferLoads(VulkanHarness &vulkan) {
         Require(test.name, name.c_str(), labels == 1u && switches == 0u,
                 "indirect format helper must be a single branchless basic block");
       }
+      for (const auto &[id, name] : functions) {
+        Require(test.name, name.c_str(), indirect_label_counts[id] <= 7u,
+                "coalesced indirect load helper exceeded 7 basic blocks");
+      }
+      Require(test.name, "call-site exec elision", wrapped_call_sites == 0u,
+              "indirect buffer loads emitted call-site selection blocks in main");
       Require(test.name, "indirect load function scope", functions.size() == profiles.size() && inline_reads == 0u,
               "an indirect load profile was unused, missing or still emitted inline");
       for (const auto &[name, profile] : profiles)
         Require(test.name, name.c_str(), profile.uses != 0u && profile.definitions == 1u &&
                     profile.calls == profile.uses * (wave == 64u && vulkan.SubgroupSize() == 32u ? 2u : 1u) &&
-                    profile.reads == profile.components,
+                    profile.reads == (name.ends_with("_formatted") ? 1u : std::min(profile.components, 2u)),
                 "indirect load helpers duplicated definitions, calls or component reads");
       auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size(), true);
       vulkan.Dispatch(test, compiled, buffer);
@@ -38024,6 +38072,268 @@ void CheckSharedIndirectBufferLoads(VulkanHarness &vulkan) {
     }
   }
   std::printf("[compute] %-32s ok\n", "SharedIndirectBufferLoads");
+}
+
+void CheckCoalescedIndirectBufferMultiPageAndCompileTime(VulkanHarness &vulkan) {
+  using O = ShaderOpcode;
+  constexpr uint64_t GuestBase = 0x0000000110000000ull;
+  constexpr u32 kPage = static_cast<u32>(BufferCache::CACHING_PAGESIZE); // 16 KiB BDA page
+  constexpr u32 kBufferBytes = 2u * kPage; // 2 mapped BDA pages; +2*kPage is unmapped.
+  constexpr u32 kSelectionOffset = 0x400u;
+  constexpr u32 kDescOffset = 0x600u;
+  constexpr u32 kFormatRaw = 0x5204u; // 32-bit raw format, OOB_SELECT injected below
+  constexpr u32 kUnmappedPageBit =
+      1u << (BufferCache::PageIndex(GuestBase + 2u * kPage) & 31u);
+
+  const auto RunBoundaryCase = [&](const char *case_name, bool trigger_unmapped_fault) {
+    TestCase test;
+    test.name = case_name;
+    test.compute_info.threads_num[0] = 64u;
+    test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+    test.compute_info.thread_ids_num = 1u;
+    test.compute_info.wave_size = 64u;
+    test.has_compute_info = true;
+    test.bda_mappings = {{GuestBase, 0u}};
+    test.initial.resize(kBufferBytes / sizeof(u32), 0u);
+    for (u32 word = 0x800u / 4u; word < kBufferBytes / 4u; ++word) {
+      test.initial[word] = 0x70000000u + word;
+    }
+    test.initial[kSelectionOffset / 4u] = 0u;
+
+    const auto AddDesc = [&](u32 idx, uint64_t addr, u32 records, u32 mode) {
+      const std::array<u32, 4> d{
+          static_cast<u32>(addr),
+          1u, // stride=0, 32x1
+          records,
+          kFormatRaw | (mode << 28u),
+      };
+      std::copy(d.begin(), d.end(), test.initial.begin() + kDescOffset / 4u + idx * 4u);
+    };
+
+    if (!trigger_unmapped_fault) {
+      // Desc 0: 2-page mapped region [0, 2*kPage) with OOB_SELECT=3 (raw).
+      AddDesc(0, GuestBase, 2u * kPage, 3u);
+      // Desc 1: 3-page region reaching into unmapped page 2 (only used under EXEC=0).
+      AddDesc(1, GuestBase, 3u * kPage, 3u);
+      test.faults = {GuestBase + 2u * kPage, {0u}};
+    } else {
+      // Desc 0: 3-page region reaching into unmapped page 2 (actively read across 2*kPage - 8).
+      AddDesc(0, GuestBase, 3u * kPage, 3u);
+      AddDesc(1, GuestBase, 3u * kPage, 3u);
+      test.faults = {GuestBase + 2u * kPage, {kUnmappedPageBit}};
+    }
+
+    auto &code = test.code;
+    // v25 = thread_id_x (0..63), v26 = thread_id_x * 16 (output byte offset)
+    code.push_back(EncodeVop1(0x01, 25u, Vgpr(0u)));
+    code.push_back(EncodeVop2(0x1a, 26u, InlineU32(4u), 25u));
+    // GPU-selected indirect descriptor 0 -> s[8:11]
+    AppendVMovU32(&code, 30u, kSelectionOffset);
+    AppendBufferLoadDword(&code, 0u, 30u);
+    code.push_back(EncodeVop1(0x02, 20u, Vgpr(0u)));
+    code.push_back(EncodeSop2(0x1e, 20u, 20u, InlineU32(4u))); // s20 *= 16
+    code.push_back(EncodeSmem0(0x0a, 8u, 0u)); // s_buffer_load_dwordx4 s[8:11], s[0:3], s20
+    code.push_back(EncodeSmem1(kDescOffset, 20u));
+    AppendSMovLiteral(&code, 22u, 0u); // soffset = 0
+
+    test.expected = test.initial;
+    const auto EmitSlot = [&](u32 slot, u32 desc_sgpr_base, u32 byte_off, bool x3, u32 exec_lo,
+                              u32 exec_hi) {
+      AppendSMovLiteral(&code, 126u, exec_lo);
+      AppendSMovLiteral(&code, 127u, exec_hi);
+      for (u32 c = 0; c < 4u; ++c) AppendVMovLiteral(&code, 4u + c, 0u);
+      AppendVMovLiteral(&code, 21u, byte_off);
+      code.push_back(EncodeMubuf0(x3 ? 0x0fu : 0x0eu, 0u, false, true));
+      code.push_back(EncodeMubuf1(4u, desc_sgpr_base / 4u, 21u, 22u));
+      AppendSMovLiteral(&code, 126u, 1u); // lane 0 only writes slot output
+      AppendSMovLiteral(&code, 127u, 0u);
+      code.push_back(EncodeMubuf0(0x1eu, slot * 16u, false, true));
+      code.push_back(EncodeMubuf1(4u, 0u, 26u));
+      AppendSMovLiteral(&code, 126u, UINT32_MAX);
+      AppendSMovLiteral(&code, 127u, UINT32_MAX);
+    };
+
+    if (!trigger_unmapped_fault) {
+      // Load desc 1 into s[12:15]
+      AppendSMovLiteral(&code, 20u, 16u);
+      code.push_back(EncodeSmem0(0x0a, 12u, 0u));
+      code.push_back(EncodeSmem1(kDescOffset, 20u));
+      AppendVMovLiteral(&code, 21u, 0u); // dummy
+
+      const std::array<std::tuple<u32, u32, u32, bool, u32, u32>, 8> slots{{
+          {0u, 8u, kPage - 16u,      false, 1u, 0u},
+          {1u, 8u, kPage - 12u,      false, 1u, 0u},
+          {2u, 8u, kPage - 8u,       false, 1u, 0u},
+          {3u, 8u, kPage - 4u,       false, 1u, 0u},
+          {4u, 8u, 2u * kPage - 8u,  false, 1u, 0u},
+          {5u, 8u, kPage - 8u,       true,  1u, 0u},
+          {6u, 8u, 2u * kPage - 8u,  true,  1u, 0u},
+          {7u, 12u, 2u * kPage,      false, 0u, 0u},
+      }};
+      for (const auto &[slot, sgpr, off, x3, elo, ehi] : slots) {
+        if (slot == 7u) {
+          constexpr u32 canary = 0xa5a5a5a5u;
+          for (u32 c = 0; c < 4u; ++c) AppendVMovLiteral(&code, 4u + c, canary);
+          // Inactive EXEC=0 load into v[4..7] pointing at unmapped page 2 must not fault or overwrite v[4..7].
+          AppendSMovLiteral(&code, 126u, elo);
+          AppendSMovLiteral(&code, 127u, ehi);
+          AppendVMovLiteral(&code, 21u, off);
+          code.push_back(EncodeMubuf0(0x0eu, 0u, false, true));
+          code.push_back(EncodeMubuf1(4u, sgpr / 4u, 21u, 22u));
+          AppendSMovLiteral(&code, 126u, 1u);
+          AppendSMovLiteral(&code, 127u, 0u);
+          code.push_back(EncodeMubuf0(0x1eu, slot * 16u, false, true));
+          code.push_back(EncodeMubuf1(4u, 0u, 26u));
+          AppendSMovLiteral(&code, 126u, UINT32_MAX);
+          AppendSMovLiteral(&code, 127u, UINT32_MAX);
+          for (u32 c = 0; c < 4u; ++c) test.expected[slot * 4u + c] = canary;
+        } else {
+          EmitSlot(slot, sgpr, off, x3, elo, ehi);
+          for (u32 c = 0; c < (x3 ? 3u : 4u); ++c) {
+            const u32 addr = off + c * 4u;
+            const u32 val = (addr >= 2u * kPage) ? 0u : test.initial[addr / 4u];
+            test.expected[slot * 4u + c] = val;
+          }
+          if (x3) test.expected[slot * 4u + 3u] = 0u;
+        }
+      }
+    } else {
+      EmitSlot(0u, 8u, 2u * kPage - 8u, false, 1u, 0u);
+      test.expected[0] = test.initial[(2u * kPage - 8u) / 4u];
+      test.expected[1] = test.initial[(2u * kPage - 4u) / 4u];
+      test.expected[2] = 0u;
+      test.expected[3] = 0u;
+    }
+
+    AppendEnd(&code);
+    test.opcodes = {O::S_MOV_B32, O::V_MOV_B32, O::V_LSHLREV_B32, O::BUFFER_LOAD_DWORD,
+                    O::V_READFIRSTLANE_B32, O::S_LSHL_B32, O::S_BUFFER_LOAD_DWORDX4,
+                    O::BUFFER_LOAD_DWORDX4, O::BUFFER_STORE_DWORDX4, O::S_ENDPGM};
+    if (!trigger_unmapped_fault) {
+      test.opcodes.push_back(O::BUFFER_LOAD_DWORDX3);
+    }
+    auto compiled = CompileCase(test, vulkan.SubgroupSize());
+    auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size(), true);
+    vulkan.Dispatch(test, compiled, buffer);
+    CompareWords(test, "coalesced multi-page BDA & fault boundaries", test.expected,
+                 vulkan.ReadBuffer(test.name, buffer, test.expected.size()));
+    vulkan.DestroyBuffer(&buffer);
+  };
+
+  RunBoundaryCase("CoalescedIndirectBufferMultiPageNoFalseFault", false);
+  RunBoundaryCase("CoalescedIndirectBufferMultiPageTrueFault", true);
+
+  // Compile-time regression benchmark modeling Ghost of Yotei rec=1246 (360 X4 + 144 X3 Wave64
+  // across 56 loops and 19 distinct GPU-selected descriptor 4-tuples).
+  {
+    constexpr u32 kNumDescriptors = 19u;
+    constexpr u32 kLoopBoundOffset = kSelectionOffset + 0x50u;
+    TestCase bench;
+    bench.name = "CoalescedIndirectBufferWave64CompileBenchmark";
+    bench.compute_info.threads_num[0] = 64u;
+    bench.compute_info.threads_num[1] = bench.compute_info.threads_num[2] = 1u;
+    bench.compute_info.thread_ids_num = 1u;
+    bench.compute_info.wave_size = 64u;
+    bench.has_compute_info = true;
+    bench.bda_mappings = {{GuestBase, 0u}};
+    bench.initial.resize(kPage / 4u, 0u);
+    bench.initial[kSelectionOffset / 4u] = 0u;
+    for (u32 idx = 0; idx < kNumDescriptors; ++idx) {
+      const std::array<u32, 4> desc{static_cast<u32>(GuestBase + idx * 16u), 1u, kPage - idx * 16u,
+                                    kFormatRaw | (3u << 28u)};
+      std::copy(desc.begin(), desc.end(), bench.initial.begin() + kDescOffset / 4u + idx * 4u);
+    }
+    bench.initial[kLoopBoundOffset / 4u] = 1u;
+    for (u32 w = 0x800u / 4u; w < kPage / 4u; ++w) bench.initial[w] = (w & 7u) + 1u;
+    bench.expected = bench.initial;
+
+    auto &code = bench.code;
+    code.push_back(EncodeVop1(0x01, 25u, Vgpr(0u)));
+    code.push_back(EncodeVop2(0x1a, 26u, InlineU32(4u), 25u));
+    AppendVMovU32(&code, 30u, kSelectionOffset);
+    AppendBufferLoadDword(&code, 0u, 30u);
+    code.push_back(EncodeVop1(0x02u, 20u, Vgpr(0u))); // s20 = 0 (runtime GPU offset)
+    AppendVMovU32(&code, 30u, kLoopBoundOffset);
+    AppendBufferLoadDword(&code, 0u, 30u);
+    code.push_back(EncodeVop1(0x02u, 29u, Vgpr(0u))); // s29 = 1 (runtime loop bound)
+    AppendSMovLiteral(&code, 22u, 0u);
+    AppendVMovLiteral(&code, 21u, 0x800u);
+    for (u32 c = 0; c < 4u; ++c) AppendVMovU32(&code, 4u + c, 0u);
+
+    std::array<u32, 4> expected_sum{};
+    u32 cur_desc_idx = 0u;
+    for (u32 group = 0; group < 56u; ++group) {
+      if (group % 3u == 0u) {
+        cur_desc_idx = (group / 3u) % kNumDescriptors;
+        code.push_back(EncodeSmem0(0x0au, 8u, 0u));
+        code.push_back(EncodeSmem1(kDescOffset + cur_desc_idx * 16u, 20u));
+      }
+      AppendSMovLiteral(&code, 28u, 0u);
+      const auto loop = static_cast<u32>(code.size());
+      for (u32 j = 0; j < 9u; ++j) {
+        const u32 i = group * 9u + j;
+        const bool x3 = i >= 360u;
+        const u32 imm = (i % 64u) * 4u;
+        code.push_back(EncodeMubuf0(x3 ? 0x0fu : 0x0eu, imm, false, true));
+        code.push_back(EncodeMubuf1(12u, 2u, 21u, 22u));
+        const u32 comps = x3 ? 3u : 4u;
+        for (u32 c = 0; c < comps; ++c) {
+          code.push_back(EncodeVop2(0x25u, 4u + c, Vgpr(4u + c), 12u + c));
+          expected_sum[c] += bench.initial[(cur_desc_idx * 16u + 0x800u + imm) / 4u + c];
+        }
+      }
+      code.push_back(EncodeSop2(0x00u, 28u, 28u, InlineU32(1u)));
+      code.push_back(EncodeSopc(0x0au, 28u, 29u));
+      code.push_back(EncodeSopp(0x05u, loop - static_cast<u32>(code.size()) - 1u));
+    }
+    AppendSMovLiteral(&code, 126u, 1u);
+    AppendSMovLiteral(&code, 127u, 0u);
+    code.push_back(EncodeMubuf0(0x1eu, 0u, false, true));
+    code.push_back(EncodeMubuf1(4u, 0u, 26u));
+    AppendEnd(&code);
+    for (u32 c = 0; c < 4u; ++c) bench.expected[c] = expected_sum[c];
+
+    bench.opcodes = {O::S_MOV_B32, O::V_MOV_B32, O::V_LSHLREV_B32, O::BUFFER_LOAD_DWORD,
+                     O::V_READFIRSTLANE_B32, O::S_BUFFER_LOAD_DWORDX4,
+                     O::BUFFER_LOAD_DWORDX4, O::BUFFER_LOAD_DWORDX3, O::V_ADD_NC_U32,
+                     O::S_ADD_U32, O::S_CMP_LT_U32, O::S_CBRANCH_SCC1,
+                     O::BUFFER_STORE_DWORDX4, O::S_ENDPGM};
+    const auto t0 = std::chrono::steady_clock::now();
+    auto compiled = CompileCase(bench, vulkan.SubgroupSize());
+    const auto t1 = std::chrono::steady_clock::now();
+    std::set<u32> indirect_helper_ids;
+    u32 indirect_calls = 0;
+    for (size_t offset = 5; offset < compiled.spirv.size();) {
+      const auto words = std::span(compiled.spirv).subspan(offset, compiled.spirv[offset] >> 16u);
+      const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
+      if (opcode == spv::OpName) {
+        const std::string_view fn_name(reinterpret_cast<const char *>(words.data() + 2));
+        if (fn_name.starts_with("load_indirect_buffer_")) {
+          indirect_helper_ids.insert(words[1]);
+        }
+      } else if (opcode == spv::OpFunctionCall && indirect_helper_ids.contains(words[3])) {
+        ++indirect_calls;
+      }
+      offset += words.size();
+    }
+    Require(bench.name, "indirect helper call count",
+            indirect_calls == (vulkan.SubgroupSize() == 32u ? 1008u : 504u),
+            "benchmark did not emit indirect buffer helper calls");
+    auto buffer = vulkan.CreateStorageBuffer(bench.name, bench.initial, bench.initial.size(), true);
+    const auto t2 = std::chrono::steady_clock::now();
+    vulkan.Dispatch(bench, compiled, buffer);
+    const auto t3 = std::chrono::steady_clock::now();
+    const auto compile_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    const auto driver_ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
+    std::printf("[compute] %-32s recompile=%.1f ms driver+dispatch=%.1f ms\n",
+                "CoalescedIndirectWave64Bench", compile_ms, driver_ms);
+    Require(bench.name, "driver pipeline compile time", driver_ms < 25000.0,
+            "1,008-call indirect buffer shader took >= 25s to compile/dispatch");
+    CompareWords(bench, "504 indirect X4/X3 sum matches expected", bench.expected,
+                 vulkan.ReadBuffer(bench.name, buffer, bench.expected.size()));
+    vulkan.DestroyBuffer(&buffer);
+  }
+  std::printf("[compute] %-32s ok\n", "CoalescedIndirectBufferMultiPageAndCompileTime");
 }
 
 TestCase BufferStoreDwordx4DropsOnlyOutOfBoundsTail() {
@@ -58927,6 +59237,7 @@ int main(int argc, char **argv) {
     CheckGpuSelectedFormattedRecordStore(vulkan);
     CheckRuntimeBufferRecords(vulkan);
     CheckSharedIndirectBufferLoads(vulkan);
+  CheckCoalescedIndirectBufferMultiPageAndCompileTime(vulkan);
     RunCase(&vulkan, BufferLoadFormatXGpuSelectedDescriptors());
     RunCase(&vulkan, BufferLoadFormatXGpuSelectedDescriptors64());
     RunCase(&vulkan, BufferLoadGpuSelectedDescriptors(32u, ShaderOpcode::BUFFER_LOAD_FORMAT_D16_X));
@@ -59633,6 +59944,12 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, VectorReadlaneSelectsTwoKeysWithinWave());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--shared-indirect-loads-only") == 0) {
+    VulkanHarness vulkan;
+    CheckSharedIndirectBufferLoads(vulkan);
+    CheckCoalescedIndirectBufferMultiPageAndCompileTime(vulkan);
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--runtime-buffer-only") == 0) {
     VulkanHarness vulkan;
     CheckRuntimeBufferRecords(vulkan);
@@ -59812,6 +60129,7 @@ int main(int argc, char **argv) {
   CheckRuntimeBufferRecords(vulkan);
   CheckRuntimeIndexedBufferX2AndWaterfall(vulkan);
   CheckSharedIndirectBufferLoads(vulkan);
+  CheckCoalescedIndirectBufferMultiPageAndCompileTime(vulkan);
   CheckComputeThreadDimensions(vulkan);
   CheckCountedRowImageSelector(vulkan);
   CheckPointerImageTable(vulkan);

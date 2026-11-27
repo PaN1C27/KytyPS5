@@ -338,10 +338,16 @@ void DefineDescriptors(EmitterState& state) {
 			case IR::DescriptorBindingKind::BdaPagetable:
 				state.bda_pagetable_variable =
 				    Define(StorageBufferType(state, state.storage_buffers[3], 64), "bda_pagetable");
+				state.builder.AddAnnotation(spv::OpDecorate, state.bda_pagetable_variable,
+				                            spv::DecorationNonWritable);
+				state.builder.AddAnnotation(spv::OpDecorate, state.bda_pagetable_variable,
+				                            spv::DecorationRestrict);
 				break;
 			case IR::DescriptorBindingKind::FaultBuffer:
 				state.fault_buffer_variable =
 				    Define(StorageBufferType(state, state.storage_buffers[2]), "fault_buffer");
+				state.builder.AddAnnotation(spv::OpDecorate, state.fault_buffer_variable,
+				                            spv::DecorationRestrict);
 				break;
 			case IR::DescriptorBindingKind::ShaderData:
 				state.shader_data_storage_variable =
