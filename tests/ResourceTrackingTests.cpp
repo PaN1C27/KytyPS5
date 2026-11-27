@@ -10642,6 +10642,83 @@ void TestValidateRuntimeValueSccAndMaskedDag() {
   }
 }
 
+void TestInductivePhiFoldingPreservesSsaDominance() {
+  Fixture fixture;
+  auto *entry = fixture.block;
+  auto *branch_blk = fixture.AddBlock();
+  auto *taken_blk = fixture.AddBlock();
+  auto *merge_blk = fixture.AddBlock();
+  auto *loop_hdr = fixture.AddBlock();
+  auto *loop_body = fixture.AddBlock();
+  auto *exit_blk = fixture.AddBlock();
+  const auto branch = [](Block *from, Block *to) {
+    from->AddBranch(to);
+    from->terminator = {
+        .kind = Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Branch,
+        .true_block = to};
+  };
+  const auto choose = [](Block *from, Block *yes, Block *no, Value condition) {
+    from->AddBranch(yes);
+    from->AddBranch(no);
+    from->condition = condition;
+    from->terminator = {
+        .kind = Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch,
+        .true_block = yes,
+        .false_block = no};
+  };
+  branch(entry, branch_blk);
+  choose(branch_blk, taken_blk, merge_blk, Value(true));
+  branch(taken_blk, merge_blk);
+  branch(merge_blk, loop_hdr);
+  branch(loop_body, loop_hdr);
+  exit_blk->terminator = {
+      .kind = Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Return};
+
+  fixture.block = entry;
+  const auto ud0 = fixture.UserData(0);
+  const auto ud1 = fixture.UserData(1);
+  const auto ud2 = fixture.UserData(2);
+
+  fixture.block = taken_blk;
+  const auto taken_only_val = fixture.Emit(ValueOpcode::IAdd32, {ud0, ud1});
+
+  auto &non_dom_phi = merge_blk->AppendNewInst(ValueOpcode::Phi);
+  non_dom_phi.SetFlags(Type::U32);
+  non_dom_phi.AddPhiOperand(branch_blk, Value(0u));
+  non_dom_phi.AddPhiOperand(taken_blk, taken_only_val);
+
+  auto &dom_phi = merge_blk->AppendNewInst(ValueOpcode::Phi);
+  dom_phi.SetFlags(Type::U32);
+  dom_phi.AddPhiOperand(branch_blk, Value(0u));
+  dom_phi.AddPhiOperand(taken_blk, ud2);
+
+  auto &ind = loop_hdr->AppendNewInst(ValueOpcode::Phi);
+  ind.SetFlags(Type::U32);
+  const auto loop_cond = fixture.Emit(ValueOpcode::ULessThan32,
+                                      {Value(&ind), Value(4u)}, 0, loop_hdr);
+  choose(loop_hdr, loop_body, exit_blk, loop_cond);
+
+  fixture.block = loop_body;
+  const auto ind_next = fixture.Emit(ValueOpcode::IAdd32, {Value(&ind), Value(1u)});
+  ind.AddPhiOperand(merge_blk, Value(0u));
+  ind.AddPhiOperand(loop_body, ind_next);
+  const auto out_range = fixture.Emit(ValueOpcode::IEqual32, {Value(&ind), Value(99u)});
+  const auto dead_sel = fixture.Emit(ValueOpcode::SelectU32, {out_range, ud0, ud1});
+  fixture.Emit(ValueOpcode::ReferenceU32, {dead_sel});
+
+  fixture.block = exit_blk;
+  const auto non_dom_ref = fixture.Emit(ValueOpcode::ReferenceU32, {Value(&non_dom_phi)});
+  const auto dom_ref = fixture.Emit(ValueOpcode::ReferenceU32, {Value(&dom_phi)});
+
+  fixture.PlanAndTrack();
+  ValidateProgram(fixture.program);
+
+  Check(non_dom_ref.TryInstruction()->Arg(0).Resolve() == Value(&non_dom_phi),
+        "non-dominating Phi arm must not be substituted across an unreachable CFG edge");
+  Check(dom_ref.TryInstruction()->Arg(0).Resolve() == ud2,
+        "dominating Phi arm should still fold across an unreachable CFG edge");
+}
+
 } // namespace
 
 int main() {
@@ -10737,6 +10814,7 @@ int main() {
     Run("malformed memory kinds", TestMalformedMemoryKindsRejected);
     Run("deep multi-loop inductive selector", TestInductiveSelectorConvergenceOnDeepMultiLoopDag);
     Run("validate runtime value SCC and masked DAG", TestValidateRuntimeValueSccAndMaskedDag);
+    Run("inductive phi folding preserves SSA dominance", TestInductivePhiFoldingPreservesSsaDominance);
   } catch (const std::exception &exception) {
     std::cerr << "resource tracking test failed: " << exception.what() << '\n';
     return 1;

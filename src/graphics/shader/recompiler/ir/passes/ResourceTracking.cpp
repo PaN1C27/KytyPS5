@@ -4752,6 +4752,16 @@ private:
 						}
 					}
 					if (uniform && !same.IsEmpty()) {
+						const auto* same_def = same.TryInstruction();
+						const bool  same_dominates =
+						    same.IsImmediate() ||
+						    (same_def != nullptr && same_def->Parent() != nullptr &&
+						     (strictly_dominates(same_def->Parent(), inst.Parent()) ||
+						      (same_def->Parent() == inst.Parent() &&
+						       same_def->GetOpcode() == ValueOpcode::Phi)));
+						if (!same_dominates) {
+							continue;
+						}
 						inst.ReplaceUsesWith(same);
 						phi_changed = true;
 					}
