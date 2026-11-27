@@ -37895,9 +37895,14 @@ TestCase BufferLoadGpuSelectedDescriptors(u32 wave, ShaderOpcode load) {
   test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
   test.compute_info.wave_size = wave;
   test.has_compute_info = true;
-  test.required_spirv = {"PhysicalStorageBuffer", "OpLoopMerge", formatted ? "OpSwitch" : "Volatile"};
-  if (!formatted) test.forbidden_spirv = {"convert_indirect_buffer_format",
-                                         "indirect_buffer_format_geometry"};
+  test.required_spirv = {"PhysicalStorageBuffer", "OpLoopMerge",
+                         formatted ? "convert_indirect_buffer_format" : "Volatile"};
+  if (formatted) {
+    test.forbidden_spirv = {"OpSwitch"};
+  } else {
+    test.forbidden_spirv = {"convert_indirect_buffer_format",
+                            "indirect_buffer_format_geometry"};
+  }
   test.opcodes = {O::S_MOV_B32, O::V_MOV_B32, O::V_LSHLREV_B32,
                   O::BUFFER_LOAD_DWORD, O::V_READFIRSTLANE_B32, O::S_LSHL_B32,
                   O::S_BUFFER_LOAD_DWORDX8, load,
@@ -37959,7 +37964,8 @@ void CheckSharedIndirectBufferLoads(VulkanHarness &vulkan) {
           ++profile.uses;
         }
       std::map<u32, std::string> functions;
-      std::map<u32, std::string> helper_names;
+      std::map<u32, std::string> format_helpers;
+      std::map<u32, std::pair<u32, u32>> helper_cfg_counts;
       u32 function = 0, bda = 0, inline_reads = 0;
       for (size_t offset = 5; offset < compiled.spirv.size();) {
         const auto words = std::span(compiled.spirv).subspan(offset, compiled.spirv[offset] >> 16u);
@@ -37968,26 +37974,26 @@ void CheckSharedIndirectBufferLoads(VulkanHarness &vulkan) {
           const std::string_view name(reinterpret_cast<const char *>(words.data() + 2));
           if (name.starts_with("load_indirect_buffer_")) {
             functions.emplace(words[1], name);
-            helper_names.emplace(words[1], name);
           } else if (name == "indirect_buffer_format_geometry" ||
                      name == "convert_indirect_buffer_format" ||
                      name == "pack_indirect_buffer_d16") {
-            helper_names.emplace(words[1], name);
+            format_helpers.emplace(words[1], name);
           }
           if (name == "get_bda_pointer") bda = words[1];
         }
         if (opcode == spv::OpFunction) {
           function = words[2];
           if (functions.contains(function)) ++profiles[functions.at(function)].definitions;
-          if (helper_names.contains(function)) {
-            Require(test.name, helper_names.at(function).c_str(),
-                    (words[3] & spv::FunctionControlDontInlineMask) != 0u,
-                    "indirect load helper must be marked DontInline");
-          } else if (function == bda) {
-            Require(test.name, "get_bda_pointer",
-                    (words[3] & spv::FunctionControlDontInlineMask) == 0u,
-                    "get_bda_pointer should remain inlineable");
-          }
+          Require(test.name, "function control policy",
+                  (words[3] & spv::FunctionControlDontInlineMask) == 0u,
+                  "SPIR-V helper function must not be marked DontInline");
+        }
+        if (opcode == spv::OpFunctionEnd) {
+          function = 0;
+        }
+        if (format_helpers.contains(function)) {
+          if (opcode == spv::OpLabel) ++helper_cfg_counts[function].first;
+          if (opcode == spv::OpSwitch) ++helper_cfg_counts[function].second;
         }
         if (opcode == spv::OpFunctionCall) {
           if (functions.contains(words[3])) ++profiles[functions.at(words[3])].calls;
@@ -37997,6 +38003,11 @@ void CheckSharedIndirectBufferLoads(VulkanHarness &vulkan) {
           }
         }
         offset += words.size();
+      }
+      for (const auto &[id, name] : format_helpers) {
+        const auto [labels, switches] = helper_cfg_counts[id];
+        Require(test.name, name.c_str(), labels == 1u && switches == 0u,
+                "indirect format helper must be a single branchless basic block");
       }
       Require(test.name, "indirect load function scope", functions.size() == profiles.size() && inline_reads == 0u,
               "an indirect load profile was unused, missing or still emitted inline");
@@ -45110,8 +45121,9 @@ void CheckBoundedFormattedBufferCopy(VulkanHarness &vulkan) {
         std::vector<u32> stores;
         u32 bda_function = 0, conversion_function = 0, geometry_function = 0, function = 0;
         u32 bda_calls = 0, conversion_calls = 0, conversion_definitions = 0;
-        u32 geometry_calls = 0, geometry_definitions = 0, geometry_switches = 0;
-        bool geometry_pure = true, geometry_cases = true;
+        u32 conversion_labels = 0, conversion_switches = 0;
+        u32 geometry_calls = 0, geometry_definitions = 0, geometry_labels = 0, geometry_switches = 0;
+        bool geometry_pure = true;
         for (size_t offset = 5; offset < compiled.spirv.size();) {
           const auto words = std::span(compiled.spirv).subspan(offset, compiled.spirv[offset] >> 16u);
           const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
@@ -45129,19 +45141,15 @@ void CheckBoundedFormattedBufferCopy(VulkanHarness &vulkan) {
             conversion_definitions += function == conversion_function;
             geometry_definitions += function == geometry_function;
           }
+          if (function == conversion_function && function != 0u) {
+            conversion_labels += opcode == spv::OpLabel;
+            conversion_switches += opcode == spv::OpSwitch;
+          }
           if (function == geometry_function && function != 0u) {
             geometry_pure &= opcode != spv::OpLoad && opcode != spv::OpStore &&
                              opcode != spv::OpFunctionCall;
-            if (opcode == spv::OpSwitch) {
-              ++geometry_switches;
-              constexpr u32 formats = u32(Prospero::BufferFormat::k32_32_32_32Float) + 1u;
-              geometry_cases &= words.size() == 3u + 2u * formats;
-              if (words.size() == 3u + 2u * formats) {
-                geometry_cases &= words[2] == words[4]; // Invalid formats use format zero.
-                for (u32 format = 0; format < formats; ++format)
-                  geometry_cases &= words[3u + 2u * format] == format;
-              }
-            }
+            geometry_labels += opcode == spv::OpLabel;
+            geometry_switches += opcode == spv::OpSwitch;
           }
           if (opcode == spv::OpFunctionCall) {
             if (words[3] == bda_function) ++bda_calls;
@@ -45152,12 +45160,13 @@ void CheckBoundedFormattedBufferCopy(VulkanHarness &vulkan) {
           offset += words.size();
         }
         Require(test.name, "one shared formatted conversion",
-                conversion_definitions == 1u && conversion_calls == 1u,
-                "formatted loads must call one conversion function across virtual halves");
+                conversion_definitions == 1u && conversion_calls == 1u &&
+                    conversion_labels == 1u && conversion_switches == 0u,
+                "formatted loads must call one branchless conversion function across virtual halves");
         Require(test.name, "one shared pure format geometry",
                 geometry_definitions == 1u && geometry_calls == conversion_calls &&
-                    geometry_switches == 1u && geometry_cases && geometry_pure,
-                "format geometry duplicated, lost a format/default or acquired memory accesses");
+                    geometry_labels == 1u && geometry_switches == 0u && geometry_pure,
+                "format geometry duplicated, emitted control-flow switches or acquired memory accesses");
         Require(test.name, "one shared indirect store per virtual half",
                 std::ranges::count_if(stores, [&](u32 pointer) { return nonuniform.contains(pointer); }) ==
                     (wave > vulkan.SubgroupSize() ? 2 : 1),

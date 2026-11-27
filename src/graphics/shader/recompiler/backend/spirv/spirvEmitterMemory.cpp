@@ -1258,114 +1258,351 @@ void StoreWideShared(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compo
 	});
 }
 
+constexpr uint32_t IndirectBufferFormatCount =
+    static_cast<uint32_t>(Prospero::BufferFormat::k32_32_32_32Float) + 1u;
+
+struct IndirectFormatLayout {
+	uint32_t                   byte_size;
+	uint32_t                   component_count;
+	uint32_t                   component_step;
+	uint32_t                   alignment_mask;
+	std::array<uint32_t, 4>    component_bits;
+	std::array<uint32_t, 4>    component_offset;
+	bool                       packed;
+};
+
+constexpr IndirectFormatLayout LayoutFromInfo(const Format::BufferFormatInfo& info) {
+	IndirectFormatLayout layout {};
+	layout.byte_size       = info.byte_size;
+	layout.component_count = std::max(1u, info.component_count);
+	layout.component_step  = info.packed_bitfield ? 0u : info.component_bits[0] / 8u;
+	layout.alignment_mask  = info.byte_size == 0u ? 0u : std::min(4u, info.byte_size) - 1u;
+	layout.packed          = info.packed_bitfield;
+	for (uint32_t c = 0u; c < 4u; ++c) {
+		const uint32_t eff     = (!info.packed_bitfield || c >= info.component_count) ? 0u : c;
+		layout.component_bits[c]   = info.component_bits[eff];
+		layout.component_offset[c] = info.packed_bitfield ? info.component_bit_offset[eff] : 0u;
+	}
+	return layout;
+}
+
+constexpr uint32_t EncodeWidthCode(uint32_t bits) {
+	switch (bits) {
+		case 0u: return 0u;
+		case 2u: return 1u;
+		case 8u: return 2u;
+		case 10u: return 3u;
+		case 11u: return 4u;
+		case 16u: return 5u;
+		case 32u: return 6u;
+		default: return 7u;
+	}
+}
+
+struct IndirectFormatTables {
+	std::array<uint32_t, (IndirectBufferFormatCount + 3u) / 4u> format_words {};
+	std::array<uint32_t, 8>                                     geometry_words {};
+	std::array<uint32_t, 16>                                    component_spec_words {};
+	uint32_t                                                    layout_count = 0u;
+};
+
+constexpr IndirectFormatTables BuildIndirectFormatTables() {
+	IndirectFormatTables                     tables {};
+	std::array<IndirectFormatLayout, 16>     layouts {};
+	const auto                               find_or_add_layout = [&](const IndirectFormatLayout& candidate) {
+		for (uint32_t i = 0u; i < tables.layout_count; ++i) {
+			const auto& existing = layouts[i];
+			if (existing.byte_size == candidate.byte_size &&
+			    existing.component_count == candidate.component_count &&
+			    existing.component_step == candidate.component_step &&
+			    existing.alignment_mask == candidate.alignment_mask &&
+			    existing.packed == candidate.packed &&
+			    existing.component_bits == candidate.component_bits &&
+			    existing.component_offset == candidate.component_offset) {
+				return i;
+			}
+		}
+		const uint32_t idx = tables.layout_count++;
+		layouts[idx]       = candidate;
+		return idx;
+	};
+
+	for (uint32_t f = 0u; f < IndirectBufferFormatCount; ++f) {
+		const auto info      = Format::GetFormatInfo(static_cast<Prospero::BufferFormat>(f));
+		const auto type_code = static_cast<uint32_t>(info.type);
+		const auto layout_id = find_or_add_layout(LayoutFromInfo(info));
+		const auto byte_val  = ((layout_id & 0x1fu) << 3u) | (type_code & 0x7u);
+		tables.format_words[f >> 2u] |= byte_val << ((f & 3u) * 8u);
+	}
+	for (uint32_t i = 0u; i < tables.layout_count; ++i) {
+		const auto& l = layouts[i];
+		const uint32_t geom16 = (l.byte_size & 0x1fu) | ((l.component_count & 0x7u) << 5u) |
+		                        ((l.component_step & 0x7u) << 8u) |
+		                        ((l.alignment_mask & 0x7u) << 11u);
+		tables.geometry_words[i >> 1u] |= geom16 << ((i & 1u) * 16u);
+		uint32_t spec = 0u;
+		for (uint32_t c = 0u; c < 4u; ++c) {
+			const uint32_t code = EncodeWidthCode(l.component_bits[c]);
+			const uint32_t byte = (l.component_offset[c] & 0x1fu) | ((code & 0x7u) << 5u);
+			spec |= byte << (c * 8u);
+		}
+		tables.component_spec_words[i] = spec;
+	}
+	return tables;
+}
+
+constexpr IndirectFormatTables kIndirectFormatTables = BuildIndirectFormatTables();
+
+constexpr bool VerifyIndirectFormatTables() {
+	if (kIndirectFormatTables.layout_count > 16u) return false;
+	for (uint32_t f = 0u; f < IndirectBufferFormatCount; ++f) {
+		const auto info      = Format::GetFormatInfo(static_cast<Prospero::BufferFormat>(f));
+		const auto expected  = LayoutFromInfo(info);
+		const auto byte_val  = (kIndirectFormatTables.format_words[f >> 2u] >> ((f & 3u) * 8u)) & 0xffu;
+		const auto type_code = byte_val & 0x7u;
+		const auto layout_id = (byte_val >> 3u) & 0x1fu;
+		if (type_code != static_cast<uint32_t>(info.type) || layout_id >= kIndirectFormatTables.layout_count) {
+			return false;
+		}
+		const auto geom16 = (kIndirectFormatTables.geometry_words[layout_id >> 1u] >> ((layout_id & 1u) * 16u)) &
+		                    0xffffu;
+		if ((geom16 & 0x1fu) != expected.byte_size ||
+		    ((geom16 >> 5u) & 0x7u) != expected.component_count ||
+		    ((geom16 >> 8u) & 0x7u) != expected.component_step ||
+		    ((geom16 >> 11u) & 0x7u) != expected.alignment_mask) {
+			return false;
+		}
+		const auto spec = kIndirectFormatTables.component_spec_words[layout_id];
+		for (uint32_t c = 0u; c < 4u; ++c) {
+			const auto cb = (spec >> (c * 8u)) & 0xffu;
+			if ((cb & 0x1fu) != expected.component_offset[c] ||
+			    ((cb >> 5u) & 0x7u) != EncodeWidthCode(expected.component_bits[c])) {
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
+static_assert(VerifyIndirectFormatTables(), "indirect buffer format lookup table mismatch");
+
+uint32_t EmitConstantU32TableLookup(EmitterState& state, uint32_t index,
+                                    std::span<const uint32_t> words, uint32_t base = 0u) {
+	if (words.size() == 1u) {
+		return ConstantU32(state, words.front());
+	}
+	const size_t   mid  = words.size() / 2u;
+	const uint32_t low  = EmitConstantU32TableLookup(state, index, words.first(mid), base);
+	const uint32_t high = EmitConstantU32TableLookup(state, index, words.subspan(mid),
+	                                                 base + static_cast<uint32_t>(mid));
+	const uint32_t pick = Binary(state, spv::OpULessThan, TypeBool(state), index,
+	                             ConstantU32(state, base + static_cast<uint32_t>(mid)));
+	return Select(state, TypeU32(state), pick, low, high);
+}
+
+uint32_t EmitPackedFormatByte(EmitterState& state, uint32_t format) {
+	const auto u           = TypeU32(state);
+	const auto safe_format = Select(
+	    state, u, Binary(state, spv::OpULessThan, TypeBool(state), format, ConstantU32(state, IndirectBufferFormatCount)),
+	    format, ConstantU32(state, 0u));
+	const auto word = EmitConstantU32TableLookup(
+	    state, Binary(state, spv::OpShiftRightLogical, u, safe_format, ConstantU32(state, 2u)),
+	    kIndirectFormatTables.format_words);
+	const auto bit_shift = Binary(
+	    state, spv::OpShiftLeftLogical, u,
+	    Binary(state, spv::OpBitwiseAnd, u, safe_format, ConstantU32(state, 3u)),
+	    ConstantU32(state, 3u));
+	return EmitBitFieldUExtract(state, word, bit_shift, ConstantU32(state, 8u));
+}
+
 void DefineIndirectBufferFormats(ValueEmitContext& ctx) {
-	auto& state = ctx.state;
-	const auto type = TypeU32(state);
-	constexpr auto format_count =
-	    static_cast<uint32_t>(Prospero::BufferFormat::k32_32_32_32Float) + 1u;
+	auto&      state = ctx.state;
+	const auto u     = TypeU32(state);
+	const auto i     = TypeI32(state);
+	const auto f     = TypeF32(state);
+	const auto b     = TypeBool(state);
 	{
-		const auto result_type = TypeU32Composite(state, 4);
-		const auto function_type = state.builder.Type(spv::OpTypeFunction, result_type, type);
+		const auto result_type   = TypeU32Composite(state, 4);
+		const auto function_type = state.builder.Type(spv::OpTypeFunction, result_type, u);
 		state.indirect_format_geometry_function = state.builder.AllocateId();
 		const auto format = state.builder.AllocateId();
 		state.builder.AddName(state.indirect_format_geometry_function,
 		                      "indirect_buffer_format_geometry");
 		state.builder.AddFunction(spv::OpFunction, result_type,
 		                          state.indirect_format_geometry_function,
-		                          spv::FunctionControlDontInlineMask, function_type);
-		state.builder.AddFunction(spv::OpFunctionParameter, type, format);
+		                          spv::FunctionControlMaskNone, function_type);
+		state.builder.AddFunction(spv::OpFunctionParameter, u, format);
 		EmitLabel(state, state.builder.AllocateId());
-		const auto result = EmitIndexSwitch(
-		    state, format, format_count, result_type, [&](uint32_t format) {
-			    const auto info = Format::GetFormatInfo(static_cast<Prospero::BufferFormat>(format));
-			    return state.builder.Constant(
-			        spv::OpConstantComposite, result_type, ConstantU32(state, info.byte_size),
-			        ConstantU32(state, std::max(1u, info.component_count)),
-			        ConstantU32(state, info.packed_bitfield ? 0u : info.component_bits[0] / 8u),
-			        ConstantU32(state, info.byte_size == 0u ? 0u : std::min(4u, info.byte_size) - 1u));
-		    });
-		state.builder.AddFunction(spv::OpReturnValue, result);
+		const auto format_byte = EmitPackedFormatByte(state, format);
+		const auto layout_id   = EmitBitFieldUExtract(state, format_byte, ConstantU32(state, 3u),
+		                                              ConstantU32(state, 5u));
+		const auto geom_word   = EmitConstantU32TableLookup(
+		    state, Binary(state, spv::OpShiftRightLogical, u, layout_id, ConstantU32(state, 1u)),
+		    kIndirectFormatTables.geometry_words);
+		const auto geom_shift = Binary(
+		    state, spv::OpShiftLeftLogical, u,
+		    Binary(state, spv::OpBitwiseAnd, u, layout_id, ConstantU32(state, 1u)),
+		    ConstantU32(state, 4u));
+		const auto geom16 = EmitBitFieldUExtract(state, geom_word, geom_shift, ConstantU32(state, 16u));
+		const std::array values {
+		    EmitBitFieldUExtract(state, geom16, ConstantU32(state, 0u), ConstantU32(state, 5u)),
+		    EmitBitFieldUExtract(state, geom16, ConstantU32(state, 5u), ConstantU32(state, 3u)),
+		    EmitBitFieldUExtract(state, geom16, ConstantU32(state, 8u), ConstantU32(state, 3u)),
+		    EmitBitFieldUExtract(state, geom16, ConstantU32(state, 11u), ConstantU32(state, 3u)),
+		};
+		state.builder.AddFunction(spv::OpReturnValue, ConstructU32Composite(state, 4u, values));
 		state.builder.AddFunction(spv::OpFunctionEnd);
 	}
-	const auto function_type = state.builder.Type(spv::OpTypeFunction, type, type, type, type, type);
+	const auto function_type = state.builder.Type(spv::OpTypeFunction, u, u, u, u, u);
 	state.indirect_format_function = state.builder.AllocateId();
-	const auto format = state.builder.AllocateId();
-	const auto selector = state.builder.AllocateId();
+	const auto format    = state.builder.AllocateId();
+	const auto selector  = state.builder.AllocateId();
 	const auto component = state.builder.AllocateId();
-	const auto raw = state.builder.AllocateId();
+	const auto raw       = state.builder.AllocateId();
 	state.builder.AddName(state.indirect_format_function, "convert_indirect_buffer_format");
-	state.builder.AddFunction(spv::OpFunction, type, state.indirect_format_function,
-	                          spv::FunctionControlDontInlineMask, function_type);
-	state.builder.AddFunction(spv::OpFunctionParameter, type, format);
-	state.builder.AddFunction(spv::OpFunctionParameter, type, selector);
-	state.builder.AddFunction(spv::OpFunctionParameter, type, component);
-	state.builder.AddFunction(spv::OpFunctionParameter, type, raw);
+	state.builder.AddFunction(spv::OpFunction, u, state.indirect_format_function,
+	                          spv::FunctionControlMaskNone, function_type);
+	state.builder.AddFunction(spv::OpFunctionParameter, u, format);
+	state.builder.AddFunction(spv::OpFunctionParameter, u, selector);
+	state.builder.AddFunction(spv::OpFunctionParameter, u, component);
+	state.builder.AddFunction(spv::OpFunctionParameter, u, raw);
 	EmitLabel(state, state.builder.AllocateId());
-	const auto result = EmitIndexSwitch(
-	    state, format, format_count, TypeU32(state), [&](uint32_t format) {
-		    const auto info = Format::GetFormatInfo(static_cast<Prospero::BufferFormat>(format));
-		    if (info.type == Format::ComponentType::Unknown) return ConstantU32(state, 0);
-		    const auto constant = Select(
-		        state, TypeU32(state),
-		        Binary(state, spv::OpIEqual, TypeBool(state), selector, ConstantU32(state, 1)),
-		        FormattedConstant(ctx, info, FormattedSourceKind::One), ConstantU32(state, 0));
-		    return EmitValueOrDefaultIfCondition(
-		        state, Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), selector,
-		                      ConstantU32(state, 4)),
-		        TypeU32(state), constant, [&]() {
-			        const auto emit_component = [&](uint32_t component) {
-				        return LoadFormattedComponent(
-				            ctx, info, {FormattedSourceKind::Memory, component},
-				            [&](uint32_t) { return raw; },
-				            [&](uint32_t, uint32_t bits) {
-					            return Binary(state, spv::OpBitwiseAnd, TypeU32(state), raw,
-					                          ConstantU32(state, bits == 8u ? 0xffu : 0xffffu));
-				            });
-			        };
-			        if (!info.packed_bitfield) return emit_component(0u);
-			        return EmitIndexSwitch(state, component, info.component_count, TypeU32(state),
-			                               emit_component);
-		        });
-	    });
+
+	const auto eq_u32 = [&](uint32_t lhs, uint32_t rhs) {
+		return Binary(state, spv::OpIEqual, b, lhs, ConstantU32(state, rhs));
+	};
+	const auto or_b = [&](uint32_t lhs, uint32_t rhs) {
+		return Binary(state, spv::OpLogicalOr, b, lhs, rhs);
+	};
+	const auto format_byte = EmitPackedFormatByte(state, format);
+	const auto type_code   = Binary(state, spv::OpBitwiseAnd, u, format_byte, ConstantU32(state, 7u));
+	const auto layout_id   = EmitBitFieldUExtract(state, format_byte, ConstantU32(state, 3u),
+	                                              ConstantU32(state, 5u));
+	const auto comp_spec   = EmitConstantU32TableLookup(
+	    state, layout_id, std::span(kIndirectFormatTables.component_spec_words).first(kIndirectFormatTables.layout_count));
+	const auto safe_comp   = Select(
+	    state, u, Binary(state, spv::OpULessThan, b, component, ConstantU32(state, 4u)),
+	    component, ConstantU32(state, 0u));
+	const auto spec_byte   = EmitBitFieldUExtract(
+	    state, comp_spec,
+	    Binary(state, spv::OpShiftLeftLogical, u, safe_comp, ConstantU32(state, 3u)),
+	    ConstantU32(state, 8u));
+	const auto bit_offset = Binary(state, spv::OpBitwiseAnd, u, spec_byte, ConstantU32(state, 0x1fu));
+	const auto width_code = EmitBitFieldUExtract(state, spec_byte, ConstantU32(state, 5u),
+	                                             ConstantU32(state, 3u));
+
+	const std::array width_table {0u, 2u, 8u, 10u, 11u, 16u, 32u, 0u};
+	const auto       bits = EmitConstantU32TableLookup(state, width_code, width_table);
+	const auto       subword = Binary(
+	    state, spv::OpLogicalAnd, b,
+	    Binary(state, spv::OpUGreaterThanEqual, b, width_code, ConstantU32(state, 1u)),
+	    Binary(state, spv::OpULessThanEqual, b, width_code, ConstantU32(state, 5u)));
+	const auto safe_bits   = Select(state, u, subword, bits, ConstantU32(state, 1u));
+	const auto safe_offset = Select(state, u, subword, bit_offset, ConstantU32(state, 0u));
+
+	const auto is_signed = or_b(
+	    eq_u32(type_code, static_cast<uint32_t>(Format::ComponentType::Sint)),
+	    or_b(eq_u32(type_code, static_cast<uint32_t>(Format::ComponentType::Snorm)),
+	         eq_u32(type_code, static_cast<uint32_t>(Format::ComponentType::Sscaled))));
+	const auto u_ext = EmitBitFieldUExtract(state, raw, safe_offset, safe_bits);
+	const auto s_ext_i = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpBitFieldSExtract, i, s_ext_i,
+	                          Unary(state, spv::OpBitcast, i, raw), safe_offset, safe_bits);
+	const auto s_ext = Unary(state, spv::OpBitcast, u, s_ext_i);
+	const auto extracted = Select(state, u, eq_u32(width_code, 6u), raw,
+	                              Select(state, u, is_signed, s_ext, u_ext));
+
+	const auto f_from_u = Unary(state, spv::OpConvertUToF, f, extracted);
+	const auto f_from_s = Unary(state, spv::OpConvertSToF, f, Unary(state, spv::OpBitcast, i, extracted));
+	const auto f_int    = Select(state, f, is_signed, f_from_s, f_from_u);
+
+	const std::array unorm_inv_words {
+	    std::bit_cast<uint32_t>(1.0f),           std::bit_cast<uint32_t>(1.0f / 3.0f),
+	    std::bit_cast<uint32_t>(1.0f / 255.0f),  std::bit_cast<uint32_t>(1.0f / 1023.0f),
+	    std::bit_cast<uint32_t>(1.0f / 2047.0f), std::bit_cast<uint32_t>(1.0f / 65535.0f),
+	    std::bit_cast<uint32_t>(1.0f),           std::bit_cast<uint32_t>(1.0f)};
+	const std::array snorm_inv_words {
+	    std::bit_cast<uint32_t>(1.0f),           std::bit_cast<uint32_t>(1.0f),
+	    std::bit_cast<uint32_t>(1.0f / 127.0f),  std::bit_cast<uint32_t>(1.0f / 511.0f),
+	    std::bit_cast<uint32_t>(1.0f / 1023.0f), std::bit_cast<uint32_t>(1.0f / 32767.0f),
+	    std::bit_cast<uint32_t>(1.0f),           std::bit_cast<uint32_t>(1.0f)};
+	const auto is_snorm  = eq_u32(type_code, static_cast<uint32_t>(Format::ComponentType::Snorm));
+	const auto unorm_inv = Unary(state, spv::OpBitcast, f,
+	                             EmitConstantU32TableLookup(state, width_code, unorm_inv_words));
+	const auto snorm_inv = Unary(state, spv::OpBitcast, f,
+	                             EmitConstantU32TableLookup(state, width_code, snorm_inv_words));
+	const auto norm_f    = Binary(state, spv::OpFMul, f, f_int,
+	                              Select(state, f, is_snorm, snorm_inv, unorm_inv));
+	const auto clamped_f   = EmitGlsl<GLSLstd450FMax, IR::Type::F32>(state, norm_f,
+	                                                                 ConstantF32Value(state, -1.0f));
+	const auto norm_bits   = Unary(state, spv::OpBitcast, u, Select(state, f, is_snorm, clamped_f, norm_f));
+	const auto scaled_bits = Unary(state, spv::OpBitcast, u, f_int);
+
+	const auto f16_bits  = EmitBitcastF32ToU32(state, EmitF16BitsToF32(state, extracted));
+	const auto uf11_bits = NormalizeFormatComponent(
+	    ctx.state, Format::GetFormatInfo(Prospero::BufferFormat::k11_11_10Float), 0u, extracted);
+	const auto uf10_bits = NormalizeFormatComponent(
+	    ctx.state, Format::GetFormatInfo(Prospero::BufferFormat::k11_11_10Float), 2u, extracted);
+	const auto float_bits = Select(
+	    state, u, eq_u32(width_code, 6u), raw,
+	    Select(state, u, eq_u32(width_code, 5u), f16_bits,
+	           Select(state, u, eq_u32(width_code, 4u), uf11_bits, uf10_bits)));
+
+	const auto is_int    = or_b(eq_u32(type_code, static_cast<uint32_t>(Format::ComponentType::Uint)),
+	                            eq_u32(type_code, static_cast<uint32_t>(Format::ComponentType::Sint)));
+	const auto is_norm   = or_b(eq_u32(type_code, static_cast<uint32_t>(Format::ComponentType::Unorm)),
+	                            is_snorm);
+	const auto is_scaled = or_b(eq_u32(type_code, static_cast<uint32_t>(Format::ComponentType::Uscaled)),
+	                            eq_u32(type_code, static_cast<uint32_t>(Format::ComponentType::Sscaled)));
+	const auto mem_value = Select(
+	    state, u, is_int, extracted,
+	    Select(state, u, is_norm, norm_bits,
+	           Select(state, u, is_scaled, scaled_bits, float_bits)));
+
+	const auto one_bits    = Select(state, u, is_int, ConstantU32(state, 1u), ConstantU32(state, 0x3f800000u));
+	const auto const_value = Select(state, u, eq_u32(selector, 1u), one_bits, ConstantU32(state, 0u));
+	const auto chosen      = Select(
+	    state, u, Binary(state, spv::OpUGreaterThanEqual, b, selector, ConstantU32(state, 4u)),
+	    mem_value, const_value);
+	const auto result = Select(
+	    state, u, eq_u32(type_code, static_cast<uint32_t>(Format::ComponentType::Unknown)),
+	    ConstantU32(state, 0u), chosen);
 	state.builder.AddFunction(spv::OpReturnValue, result);
 	state.builder.AddFunction(spv::OpFunctionEnd);
 }
 
 void DefineIndirectBufferD16(ValueEmitContext& ctx) {
-	auto& state = ctx.state;
-	const auto type = TypeU32(state);
-	constexpr auto format_count =
-	    static_cast<uint32_t>(Prospero::BufferFormat::k32_32_32_32Float) + 1u;
-	const auto function_type = state.builder.Type(spv::OpTypeFunction, type, type, type);
+	auto&      state         = ctx.state;
+	const auto u             = TypeU32(state);
+	const auto b             = TypeBool(state);
+	const auto function_type = state.builder.Type(spv::OpTypeFunction, u, u, u);
 	state.indirect_format_d16_function = state.builder.AllocateId();
 	const auto format = state.builder.AllocateId();
-	const auto value = state.builder.AllocateId();
+	const auto value  = state.builder.AllocateId();
 	state.builder.AddName(state.indirect_format_d16_function, "pack_indirect_buffer_d16");
-	state.builder.AddFunction(spv::OpFunction, type, state.indirect_format_d16_function,
-	                          spv::FunctionControlDontInlineMask, function_type);
-	state.builder.AddFunction(spv::OpFunctionParameter, type, format);
-	state.builder.AddFunction(spv::OpFunctionParameter, type, value);
+	state.builder.AddFunction(spv::OpFunction, u, state.indirect_format_d16_function,
+	                          spv::FunctionControlMaskNone, function_type);
+	state.builder.AddFunction(spv::OpFunctionParameter, u, format);
+	state.builder.AddFunction(spv::OpFunctionParameter, u, value);
 	EmitLabel(state, state.builder.AllocateId());
-	const auto kind = EmitIndexSwitch(state, format, format_count, type, [&](uint32_t candidate) {
-		const auto component_type =
-		    Format::GetFormatComponentType(static_cast<Prospero::BufferFormat>(candidate));
-		if (component_type == Format::ComponentType::Uint) return ConstantU32(state, 1u);
-		if (component_type == Format::ComponentType::Sint) return ConstantU32(state, 2u);
-		return ConstantU32(state, 0u);
-	});
-	const auto result = EmitIndexSwitch(state, kind, 3u, type, [&](uint32_t category) {
-		if (category == 1u) return EmitUMin32(state, value, ConstantU32(state, 0xffffu));
-		if (category == 2u) {
-			const auto clamped =
-			    EmitSMin32(state, EmitSMax32(state, value, ConstantU32(state, 0xffff8000u)),
-			               ConstantU32(state, 0x7fffu));
-			return Binary(state, spv::OpBitwiseAnd, type, clamped, ConstantU32(state, 0xffffu));
-		}
-		const auto pair = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 2), pair,
-		                          EmitBitCastF32U32(state, value), ConstantF32(state, 0));
-		return EmitPackHalf2x16(state, pair);
-	});
+
+	const auto format_byte = EmitPackedFormatByte(state, format);
+	const auto type_code   = Binary(state, spv::OpBitwiseAnd, u, format_byte, ConstantU32(state, 7u));
+	const auto uint_res    = EmitUMin32(state, value, ConstantU32(state, 0xffffu));
+	const auto clamped     = EmitSMin32(state, EmitSMax32(state, value, ConstantU32(state, 0xffff8000u)),
+	                                    ConstantU32(state, 0x7fffu));
+	const auto sint_res    = Binary(state, spv::OpBitwiseAnd, u, clamped, ConstantU32(state, 0xffffu));
+	const auto pair        = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 2), pair,
+	                          EmitBitCastF32U32(state, value), ConstantF32(state, 0));
+	const auto float_res = EmitPackHalf2x16(state, pair);
+	const auto result    = Select(
+	    state, u,
+	    Binary(state, spv::OpIEqual, b, type_code, ConstantU32(state, static_cast<uint32_t>(Format::ComponentType::Uint))),
+	    uint_res,
+	    Select(state, u,
+	           Binary(state, spv::OpIEqual, b, type_code, ConstantU32(state, static_cast<uint32_t>(Format::ComponentType::Sint))),
+	           sint_res, float_res));
 	state.builder.AddFunction(spv::OpReturnValue, result);
 	state.builder.AddFunction(spv::OpFunctionEnd);
 }
@@ -1409,7 +1646,7 @@ void DefineIndirectBufferLoads(ValueEmitContext& ctx) {
 			                  (memory.formatted ? "_formatted" : "");
 			state.builder.AddName(function, name.c_str());
 			state.builder.AddFunction(spv::OpFunction, result_type, function,
-			                          spv::FunctionControlDontInlineMask, signature);
+			                          spv::FunctionControlMaskNone, signature);
 			std::array<uint32_t, 8> args;
 			for (auto& arg: args) {
 				arg = state.builder.AllocateId();
