@@ -226,6 +226,9 @@ private:
 	vk::DescriptorSetLayout               m_pssr_descriptor_layout = nullptr;
 	vk::PipelineLayout                    m_pssr_pipeline_layout   = nullptr;
 	vk::Pipeline                          m_pssr_pipeline          = nullptr;
+	vk::PipelineLayout                    m_dispatch_threads_pipeline_layout = nullptr;
+	vk::Pipeline                          m_dispatch_threads_pipeline        = nullptr;
+	std::unique_ptr<StreamBuffer>         m_indirect_dispatch_buffer;
 	std::vector<UpscalerContext>          m_upscaler_contexts;
 	std::array<MipStatsCounter, 256>      m_mip_stats {};
 

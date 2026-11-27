@@ -620,8 +620,10 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		static_assert(std::is_same_v<InputInfo, ShaderComputeInputInfo>);
 		options.stage              = ShaderType::Compute;
 		options.input_info.compute = &input_info;
-		runtime.workgroup_counts   = input_info.workgroup_counts;
-		runtime.indirect_args_address = input_info.indirect_args_address;
+		runtime.workgroup_counts           = input_info.workgroup_counts;
+		runtime.workgroup_sizes            = input_info.threads_num;
+		runtime.indirect_args_address      = input_info.indirect_args_address;
+		runtime.dispatch_thread_dimensions = input_info.dispatch_thread_dimensions;
 	}
 	m_lookup_key.stage           = options.stage;
 	m_lookup_key.hash            = params.hash;

@@ -13858,7 +13858,7 @@ public:
   void CheckNativeIndirectDispatch() {
     constexpr const char *name = "NativeIndirectDispatch";
     constexpr uintptr_t base = 0x0000000204600000ull;
-    constexpr uint64_t allocation_size = 0x100000;
+    constexpr uint64_t allocation_size = 0x140000;
     constexpr uint64_t case_size = 0x10000;
     constexpr uint32_t sentinel = 0xa5a5a5a5u;
     struct DispatchCase {
@@ -13874,6 +13874,7 @@ public:
         DispatchCase{{1, 1, 0}, 0x41u, 0},
         DispatchCase{{3, 1, 1}, 0x41u, 12, true},
         DispatchCase{{8, 1, 1}, 0x61u, 8},
+        DispatchCase{{7, 1, 1}, 0x61u, 7},
     };
 
     // Separate DWORD descriptors preserve two owners until the indirect argument
@@ -14035,16 +14036,15 @@ public:
         // The writers' trailing barriers already cover indirect argument reads.
         Require(name, "no argument barrier", RecordedCommandCounter::indirect_barriers == 0,
                 "the indirect dispatch recorded its own argument barrier");
-        if (test.mode == 0x41u) {
-          Require(name, "asynchronous indirect dispatch", scheduler.CurrentTick() == tick,
-                  "workgroup-count arguments caused a host submission or readback");
-          if (!test.transfer) {
-            const auto merged = BufferCacheTestAccess::PageOwner(cache, args);
-            Require(name, "argument/output owner merge",
-                    merged && merged != first_owner && merged != second_owner &&
-                        merged == BufferCacheTestAccess::PageOwner(cache, output),
-                    "argument discovery did not merge the consumer's buffer owner");
-          }
+        Require(name, "asynchronous indirect dispatch",
+                scheduler.CurrentTick() == tick && cache.HasGpuDirtyBytes(args, sizeof(stale)),
+                "indirect dispatch caused a host submission or argument readback");
+        if (!test.transfer) {
+          const auto merged = BufferCacheTestAccess::PageOwner(cache, args);
+          Require(name, "argument/output owner merge",
+                  merged && merged != first_owner && merged != second_owner &&
+                      merged == BufferCacheTestAccess::PageOwner(cache, output),
+                  "argument discovery did not merge the consumer's buffer owner");
         }
         cache.ReadMemory(output, 16u * sizeof(u32));
         std::array<u32, 16> actual{};
@@ -14559,6 +14559,166 @@ public:
         }
       }
       host_lds_limit = saved_lds_limit;
+      // GPU-authored zero thread dimensions must stay asynchronous on GPU and write nothing.
+      for (const std::array<u32, 3> zero_dims :
+           {std::array{0u, 5u, 1u}, std::array{5u, 0u, 1u}, std::array{5u, 1u, 0u}}) {
+        constexpr auto zero_args = base + 0x100000;
+        constexpr auto zero_output = base + 0x101000;
+        Require(name, "zero thread fixture reset", context.InvalidateMemory(zero_args, 0x2000),
+                "zero thread fixture escaped its mapped allocation");
+        const std::array<u32, 3> stale_zero{};
+        std::array<u32, 16> expected_zero;
+        expected_zero.fill(sentinel);
+        LibKernel::Memory::WriteBacking(zero_args, stale_zero.data(), sizeof(stale_zero));
+        LibKernel::Memory::WriteBacking(zero_output, expected_zero.data(), sizeof(expected_zero));
+        shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(writer.data()),
+                             .num_thread_x = 1, .num_thread_y = 1, .num_thread_z = 1,
+                             .wave_size = 64, .user_sgpr = 15});
+        for (u32 i = 0; i < 3; ++i) {
+          set_buffer(i * 4u, zero_args + i * 4u, 4);
+          shaders.SetCsUserSgpr(12u + i, zero_dims[i]);
+        }
+        processor.DispatchDirect(1, 1, 1, 0x41u);
+        shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(consumer.data()),
+                             .num_thread_x = 4, .num_thread_y = 1, .num_thread_z = 1,
+                             .wave_size = 64, .user_sgpr = 4, .tgid_x_en = true});
+        set_buffer(0, zero_output, 16u * sizeof(u32));
+        const auto tick = scheduler.CurrentTick();
+        const std::array<u32, 3> packet{static_cast<u32>(zero_args),
+                                        static_cast<u32>(zero_args >> 32u), 0x61u};
+        Require(name, "zero thread indirect dispatch",
+                CpOpDispatchIndirect(processor, 0xc0021600u, packet.data(), 0, 0) == 3 &&
+                    scheduler.CurrentTick() == tick &&
+                    cache.HasGpuDirtyBytes(zero_args, sizeof(stale_zero)),
+                "GPU zero thread dimensions triggered a host readback or submission");
+        cache.ReadMemory(zero_output, sizeof(expected_zero));
+        std::array<u32, 16> actual_zero{};
+        Require(name, "zero thread output readback",
+                LibKernel::Memory::TryReadBacking(zero_output, actual_zero.data(),
+                                                  sizeof(actual_zero)) &&
+                    actual_zero == expected_zero,
+                "GPU zero thread dimensions modified output memory");
+      }
+      // Thread-dimension indirect dispatch with a WorkgroupId-indexed indirect descriptor table.
+      {
+        constexpr auto td_args = base + 0x110000;
+        constexpr auto td_keys = base + 0x111000;
+        constexpr auto td_table = base + 0x112000;
+        constexpr auto td_output = base + 0x117000;
+        std::vector<u32> td_shader{
+            EncodeSop2(0x26, 16, 13, InlineU32(12)),
+            EncodeSmem0(0x08, 16, 0), EncodeSmem1(0, 16), EncodeSopp(0x0c, 0),
+            EncodeSop2(0x26, 17, 16, 255), 192u,
+            EncodeSmem0(0x0a, 20, 2), EncodeSmem1(160, 17),
+            EncodeSmem0(0x0a, 24, 2), EncodeSmem1(176, 17), EncodeSopp(0x0c, 0),
+            EncodeMubuf0(0x83, 0, true, false), EncodeMubuf1(4, 5, 0),
+            EncodeSopp(0x0c, 0)};
+        AppendVop3(&td_shader, 0x346, 8, 13, 12, Vgpr(0));
+        td_shader.insert(td_shader.end(), {
+            EncodeMubuf0(0x1d, 0, true, false), EncodeMubuf1(4, 2, 8)});
+        AppendVMovLiteral(&td_shader, 10, 0x5au);
+        td_shader.insert(td_shader.end(), {
+            EncodeSop2(0x0e, 126, 126, 255), 0x55555555u,
+            EncodeSop2(0x0e, 127, 127, 255), 0x55555555u,
+            EncodeMubuf0(0x18, 0, true, false, true), EncodeMubuf1(10, 6, 0)});
+        AppendEnd(&td_shader);
+        ShaderMapUserData(reinterpret_cast<uint64_t>(td_shader.data()),
+            {.type = Prospero::ShaderBinaryType::kCs,
+             .code_size_bytes = static_cast<u32>(td_shader.size() * sizeof(u32))});
+        std::array<u32, 96> records;
+        records.fill(0xdeadbeefu);
+        for (u32 row = 0; row < 2u; ++row) {
+          const auto payload = base + 0x113000 + row * 0x1000;
+          const auto target = base + 0x115000 + row * 0x1000;
+          const std::array<u32, 8> descriptors{
+              static_cast<u32>(payload), static_cast<u32>(payload >> 32u) | (8u << 16u), 4u,
+              (u32(Prospero::BufferFormat::k16_16_16_16Float) << 12u) | DstSel(4, 5, 6, 7),
+              static_cast<u32>(target), static_cast<u32>(target >> 32u) | (1u << 16u), 4u, 0x5204u};
+          std::copy(descriptors.begin(), descriptors.end(), records.begin() + row * 48u + 40u);
+          const std::array<u32, 8> data{0x40003c00u + row, 0xc0003800u + row,
+              0x44004200u + row, 0xc400bc00u + row, 0x48004600u + row, 0xc800c600u + row,
+              0x4c004a00u + row, 0xcc00ca00u + row};
+          LibKernel::Memory::WriteBacking(payload, data.data(), sizeof(data));
+        }
+        LibKernel::Memory::WriteBacking(td_table, records.data(), sizeof(records));
+        const auto produce = [&](uint64_t address, u32 stride, std::array<u32, 3> values) {
+          shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(writer.data()),
+                               .num_thread_x = 1, .num_thread_y = 1, .num_thread_z = 1,
+                               .wave_size = 64, .user_sgpr = 15});
+          for (u32 word = 0; word < 3u; ++word) {
+            set_buffer(word * 4u, address + word * stride, 4u);
+            shaders.SetCsUserSgpr(12u + word, values[word]);
+          }
+          processor.DispatchDirect(1, 1, 1, 0x41u);
+        };
+        for (const u32 wave : {32u, 64u}) {
+          Require(name, "thread record fixture reset", context.InvalidateMemory(td_args, 0x8000),
+                  "thread record fixture escaped its mapped allocation");
+          const std::array<u32, 3> stale_args{};
+          std::array<u32, 10> stale_keys;
+          stale_keys.fill(sentinel);
+          LibKernel::Memory::WriteBacking(td_args, stale_args.data(), sizeof(stale_args));
+          LibKernel::Memory::WriteBacking(td_keys, stale_keys.data(), sizeof(stale_keys));
+          std::vector<u32> expected_output(wave * 4u, sentinel);
+          LibKernel::Memory::WriteBacking(td_output, expected_output.data(),
+                                          expected_output.size() * 4u);
+          const std::array<u32, 4> untouched{sentinel, sentinel, sentinel, sentinel};
+          for (u32 row = 0; row < 2u; ++row)
+            LibKernel::Memory::WriteBacking(base + 0x115000 + row * 0x1000, untouched.data(),
+                                            sizeof(untouched));
+          produce(td_args, 4u, std::array{wave + 1u, 1u, 1u});
+          produce(td_keys, 12u, std::array{1u, 0u, 22369622u});
+          shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(td_shader.data()),
+                               .num_thread_x = wave, .num_thread_y = 1, .num_thread_z = 1,
+                               .user_sgpr = 13, .tgid_x_en = true});
+          set_buffer(0, td_keys, 3u, 12u);
+          set_buffer(4, td_table, 2u, 192u);
+          set_buffer(8, td_output, wave * 2u, 8u);
+          shaders.SetCsUserSgpr(12, std::countr_zero(wave));
+          const std::array<u32, 3> packet{static_cast<u32>(td_args),
+                                          static_cast<u32>(td_args >> 32u),
+                                          0x61u | (wave == 32u ? 1u << Pm4::COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_SHIFT : 0u)};
+          const auto tick = scheduler.CurrentTick();
+          Require(name, "thread record indirect dispatch",
+                  CpOpDispatchIndirect(processor, 0xc0021600u, packet.data(), 0, 0) == 3 &&
+                      scheduler.CurrentTick() > tick && !cache.HasGpuDirtyBytes(td_args, 12u),
+                  "thread-dimension workgroup-table dispatch failed or skipped materialization");
+          cache.ReadMemory(td_output, expected_output.size() * 4u);
+          std::vector<u32> actual_output(expected_output.size());
+          Require(name, "thread record output readback",
+                  LibKernel::Memory::TryReadBacking(td_output, actual_output.data(),
+                                                    actual_output.size() * 4u),
+                  "thread record output could not be read back");
+          for (u32 g = 0; g < 2u; ++g) {
+            const auto row = 1u - g;
+            const u32 active_lanes = g == 0u ? wave : 1u;
+            for (u32 lane = 0; lane < active_lanes; ++lane) {
+              const auto out = (g * wave + lane) * 2u;
+              expected_output[out] = expected_output[out + 1u] = 0u;
+              if (lane < 4u)
+                Require(name, "unchanged formatted input",
+                        LibKernel::Memory::TryReadBacking(
+                            base + 0x113000 + row * 0x1000 + lane * 8u,
+                            expected_output.data() + out, 8u),
+                        "formatted input escaped allocation");
+            }
+          }
+          Require(name, "thread dimension workgroup table and EXEC mask",
+                  actual_output == expected_output,
+                  "thread-dimension indirect dispatch masked wrong lanes or selected wrong record");
+          for (u32 row = 0; row < 2u; ++row) {
+            const auto target = base + 0x115000 + row * 0x1000;
+            cache.ReadMemory(target, sizeof(untouched));
+            auto expected = untouched;
+            expected[0] = row == 1u ? 0xa55aa55au : 0xa5a5a55au;
+            std::array<u32, 4> actual{};
+            Require(name, "thread record byte store and canaries",
+                    LibKernel::Memory::TryReadBacking(target, actual.data(), sizeof(actual)) &&
+                        actual == expected,
+                    "thread-dimension record store corrupted neighbor bytes");
+          }
+        }
+      }
       context.UnmapMemory(base, allocation_size);
       scheduler.Finish();
     });

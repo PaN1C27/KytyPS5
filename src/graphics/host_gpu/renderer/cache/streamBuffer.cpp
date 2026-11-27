@@ -218,23 +218,21 @@ bool StreamBuffer::NormalizeReservation(bool coherent, uint64_t atom, uint64_t& 
 	return true;
 }
 
-std::pair<uint8_t*, uint64_t> StreamBuffer::Map(uint64_t size, uint64_t alignment,
-                                                bool allow_wait) {
-	if (Mapped().empty()) {
-		return {nullptr, 0};
-	}
+std::optional<uint64_t> StreamBuffer::ReserveRange(uint64_t size, uint64_t alignment,
+                                                   bool allow_wait) {
 	uint64_t   mapped_size = size;
 	const auto atom        = Graphics().physical_device_properties.limits.nonCoherentAtomSize;
-	if (!NormalizeReservation(IsCoherent(), atom, mapped_size, alignment)) {
-		return {nullptr, 0};
+	if (!NormalizeReservation(IsCoherent() || Usage() == MemoryUsage::DeviceLocal, atom, mapped_size,
+	                          alignment)) {
+		return std::nullopt;
 	}
 	if (mapped_size > Size()) {
-		return {nullptr, 0};
+		return std::nullopt;
 	}
 
 	uint64_t aligned_offset = 0;
 	if (!AlignUp(m_offset, alignment, aligned_offset)) {
-		return {nullptr, 0};
+		return std::nullopt;
 	}
 
 	const bool wrap = aligned_offset > Size() - mapped_size;
@@ -249,7 +247,7 @@ std::pair<uint8_t*, uint64_t> StreamBuffer::Map(uint64_t size, uint64_t alignmen
 	auto& pending_watches = wrap ? m_current_watches : m_previous_watches;
 	if (!WaitPendingOperations(pending_watches, invalidation_mark, aligned_offset + mapped_size,
 	                           allow_wait, wait_cursor, wait_bound)) {
-		return {nullptr, 0};
+		return std::nullopt;
 	}
 
 	if (wrap) {
@@ -262,11 +260,31 @@ std::pair<uint8_t*, uint64_t> StreamBuffer::Map(uint64_t size, uint64_t alignmen
 	m_wait_bound  = wait_bound;
 	m_offset      = aligned_offset;
 	m_mapped_size = mapped_size;
-	return {Mapped().data() + m_offset, m_offset};
+	return m_offset;
+}
+
+std::pair<uint8_t*, uint64_t> StreamBuffer::Map(uint64_t size, uint64_t alignment,
+                                                bool allow_wait) {
+	if (Mapped().empty()) {
+		return {nullptr, 0};
+	}
+	const auto offset = ReserveRange(size, alignment, allow_wait);
+	if (!offset.has_value()) {
+		return {nullptr, 0};
+	}
+	return {Mapped().data() + *offset, *offset};
+}
+
+uint64_t StreamBuffer::Reserve(uint64_t size, uint64_t alignment) {
+	const auto offset = ReserveRange(size, alignment, true);
+	EXIT_IF(!offset.has_value());
+	Commit();
+	return *offset;
 }
 
 void StreamBuffer::Commit() {
-	if (Usage() != MemoryUsage::Download && m_mapped_size != 0) {
+	if (Usage() != MemoryUsage::Download && Usage() != MemoryUsage::DeviceLocal &&
+	    m_mapped_size != 0) {
 		Flush(m_offset, m_mapped_size);
 	}
 

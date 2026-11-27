@@ -775,11 +775,28 @@ uint32_t EmitGetBuiltin(ValueEmitContext& ctx, IR::Value kind, IR::Value index) 
 }
 
 uint32_t EmitGetDispatchThreadExtent(ValueEmitContext& ctx, const IR::Inst& inst) {
-	const auto start = ctx.state.program.bindings.dispatch_thread_dword;
+	auto&      s     = ctx.state;
+	const auto start = s.program.bindings.dispatch_thread_dword;
 	if (start == IR::PushData::NoStart || !inst.Arg(0).IsImmediate() || inst.Arg(0).U32() >= 3u) {
 		ctx.Fail(inst, "invalid dispatch thread extent");
 	}
-	return EmitShaderDataDwordLoad(ctx.state, start + inst.Arg(0).U32());
+	const uint32_t axis       = inst.Arg(0).U32();
+	const auto     direct_val = EmitShaderDataDwordLoad(s, start + axis);
+	const auto     indirect   = Binary(s, spv::OpINotEqual, TypeBool(s),
+	                                   EmitShaderDataDwordLoad(s, start + 3u), ConstantU32(s, 0u));
+	return EmitValueOrDefaultIfCondition(s, indirect, TypeU32(s), direct_val, [&] {
+		const auto base = PackU64(s, EmitShaderDataDwordLoad(s, start),
+		                          EmitShaderDataDwordLoad(s, start + 1u));
+		const auto addr =
+		    Binary(s, spv::OpIAdd, TypeU64(s), base, ConstantU64(s, axis * sizeof(uint32_t)));
+		const auto ptr = Unary(
+		    s, spv::OpConvertUToPtr,
+		    TypePointer(s, spv::StorageClassPhysicalStorageBuffer, TypeU32(s)), addr);
+		const auto value = s.builder.AllocateId();
+		s.builder.AddFunction(spv::OpLoad, TypeU32(s), value, ptr, spv::MemoryAccessAlignedMask,
+		                      uint32_t {sizeof(uint32_t)});
+		return value;
+	});
 }
 
 uint32_t EmitUndefU1(EmitterState& state, const IR::Inst& inst) {

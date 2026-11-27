@@ -43,7 +43,9 @@ struct SrtRuntime {
 	void*                     userdata                   = nullptr;
 	SrtMemoryReader           read_specialization_memory = nullptr;
 	std::span<const uint32_t> workgroup_counts;
-	uint64_t                  indirect_args_address = 0;
+	std::span<const uint32_t> workgroup_sizes;
+	uint64_t                  indirect_args_address      = 0;
+	bool                      dispatch_thread_dimensions = false;
 	ImageHeapSource*          image_heap            = nullptr;
 };
 

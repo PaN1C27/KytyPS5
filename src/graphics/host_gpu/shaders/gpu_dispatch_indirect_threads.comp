@@ -1,0 +1,40 @@
+#version 460 core
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ThreadCounts {
+	uint threads[3];
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer WorkgroupCounts {
+	uint groups[3];
+};
+
+layout(push_constant, std430) uniform Parameters {
+	uint64_t src_address;
+	uint64_t dst_address;
+	uint     group_size[3];
+	uint     reserved;
+} params;
+
+void main() {
+	ThreadCounts    src = ThreadCounts(params.src_address);
+	uint            tx  = src.threads[0];
+	uint            ty  = src.threads[1];
+	uint            tz  = src.threads[2];
+	WorkgroupCounts dst = WorkgroupCounts(params.dst_address);
+	if (tx == 0u || ty == 0u || tz == 0u) {
+		dst.groups[0] = 0u;
+		dst.groups[1] = 0u;
+		dst.groups[2] = 0u;
+		return;
+	}
+	uint sx = params.group_size[0];
+	uint sy = params.group_size[1];
+	uint sz = params.group_size[2];
+	dst.groups[0] = tx / sx + uint(tx % sx != 0u);
+	dst.groups[1] = ty / sy + uint(ty % sy != 0u);
+	dst.groups[2] = tz / sz + uint(tz % sz != 0u);
+}

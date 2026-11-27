@@ -277,7 +277,7 @@ void DefineDescriptors(EmitterState& state) {
 	bindings.memory_offset_dword = static_cast<uint32_t>(info.user_data_registers.size());
 	if (info.uses_dispatch_threads) {
 		bindings.dispatch_thread_dword = bindings.memory_offset_dword;
-		bindings.memory_offset_dword += 3u;
+		bindings.memory_offset_dword += 4u;
 	}
 	if (info.ray_query) {
 		bindings.ray_query_dword = bindings.memory_offset_dword;
@@ -797,7 +797,8 @@ void DefineModule(EmitterState& state) {
 	}
 	const bool physical_addresses =
 	    state.program.info.uses_dma || state.program.info.uses_image_heap ||
-	    state.program.info.uses_device_address || state.program.info.ray_query;
+	    state.program.info.uses_device_address || state.program.info.ray_query ||
+	    state.program.info.uses_dispatch_threads;
 	if (physical_addresses) {
 		state.builder.RequireCapability(spv::CapabilityInt64);
 		state.builder.RequireCapability(spv::CapabilityPhysicalStorageBufferAddresses);

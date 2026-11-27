@@ -111,6 +111,7 @@ public:
 
 	[[nodiscard]] std::pair<uint8_t*, uint64_t> Map(uint64_t size, uint64_t alignment = 0,
 	                                                bool allow_wait = true);
+	[[nodiscard]] uint64_t                      Reserve(uint64_t size, uint64_t alignment = 0);
 	void                                        Commit();
 	[[nodiscard]] Download                      MapDownload(uint64_t size, uint64_t alignment);
 	[[nodiscard]] uint64_t Copy(const void* source, uint64_t size, uint64_t alignment = 0);
@@ -124,6 +125,9 @@ private:
 		uint64_t tick        = 0;
 		uint64_t upper_bound = 0;
 	};
+
+	[[nodiscard]] std::optional<uint64_t> ReserveRange(uint64_t size, uint64_t alignment,
+	                                                   bool allow_wait);
 
 	[[nodiscard]] static bool NormalizeReservation(bool coherent, uint64_t atom, uint64_t& size,
 	                                               uint64_t& alignment);

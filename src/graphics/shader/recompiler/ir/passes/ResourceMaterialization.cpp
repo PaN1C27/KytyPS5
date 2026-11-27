@@ -1765,6 +1765,18 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			if ((runtime.indirect_args_address & 3u) != 0u ||
 			    !ReadTable(runtime.indirect_args_address, sizeof(workgroup_counts), 0u,
 			               observed, workgroup_counts)) return false;
+			if (runtime.dispatch_thread_dimensions) {
+				if (runtime.workgroup_sizes.size() != 3u) return false;
+				if (std::ranges::find(workgroup_counts, 0u) != workgroup_counts.end()) {
+					workgroup_counts = {};
+				} else {
+					for (uint32_t axis = 0; axis < 3u; ++axis) {
+						const auto size    = std::max(runtime.workgroup_sizes[axis], 1u);
+						const auto threads = workgroup_counts[axis];
+						workgroup_counts[axis] = threads / size + (threads % size != 0u);
+					}
+				}
+			}
 			observed.workgroup_counts = workgroup_counts;
 			break;
 		}

@@ -41,7 +41,10 @@ void MemoryBarrier(vk::CommandBuffer command) {
 } // namespace
 
 RenderExecutor::~RenderExecutor() {
+	m_indirect_dispatch_buffer.reset();
 	const auto device = m_context.GetGraphics().device;
+	device.destroyPipeline(m_dispatch_threads_pipeline, nullptr);
+	device.destroyPipelineLayout(m_dispatch_threads_pipeline_layout, nullptr);
 	device.destroyPipeline(m_pssr_pipeline, nullptr);
 	device.destroyPipelineLayout(m_pssr_pipeline_layout, nullptr);
 	device.destroyDescriptorSetLayout(m_pssr_descriptor_layout, nullptr);
