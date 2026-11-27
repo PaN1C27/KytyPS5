@@ -3418,28 +3418,90 @@ private:
 		};
 		std::unordered_set<const Inst*> pred_atoms;
 		{
-			std::vector<const Inst*> work;
-			const auto               push_val = [&](Value v) {
-				if (const auto* inst = v.Resolve().TryInstruction()) work.push_back(inst);
+			std::unordered_set<const Inst*> val_seen;
+			std::vector<const Inst*>        val_work;
+			std::vector<const Inst*>        pred_work;
+			const auto                      push_val = [&](Value v) {
+				if (const auto* inst = v.Resolve().TryInstruction();
+				    inst != nullptr && val_seen.insert(inst).second) {
+					val_work.push_back(inst);
+				}
 			};
-			for (const auto* block: m_program.blocks) {
-				for (const auto& inst: *block) {
-					if (inst.GetOpcode() == ValueOpcode::ReadFirstLane && inst.NumArgs() == 2u) {
-						push_val(inst.Arg(1));
+			const auto push_pred = [&](Value v) {
+				if (const auto* inst = v.Resolve().TryInstruction();
+				    inst != nullptr && pred_atoms.insert(inst).second) {
+					pred_work.push_back(inst);
+				}
+			};
+			const auto push_phi_edges = [&](const Inst* phi) {
+				if (phi->NumPhiBlocks() != phi->NumArgs()) return;
+				for (size_t arm = 0; arm < phi->NumArgs(); ++arm) {
+					const Block* pred = phi->PhiBlock(arm);
+					if (IsUnreachablePhiEdge(pred, phi->Parent())) continue;
+					const Block* to = phi->Parent();
+					for (uint32_t hop = 0u; hop < 8u && pred != nullptr; ++hop) {
+						if (const auto edge = ConditionalEdge(pred, to);
+						    edge && edge->lanes == LaneQuantifier::All) {
+							push_pred(edge->condition);
+						}
+						if (pred->ImmPredecessors().size() != 1u) break;
+						to   = pred;
+						pred = pred->ImmPredecessors()[0];
 					}
 				}
-			}
+			};
 			for (const auto* sel: candidate_selects) {
-				push_val(sel->Arg(0));
+				push_pred(sel->Arg(0));
 			}
-			while (!work.empty()) {
-				const auto* cur = work.back();
-				work.pop_back();
-				if (cur == nullptr || !pred_atoms.insert(cur).second) continue;
-				const auto op = cur->GetOpcode();
-				if (op == ValueOpcode::LogicalAnd || op == ValueOpcode::LogicalOr ||
-				    op == ValueOpcode::LogicalNot || op == ValueOpcode::Phi) {
-					for (size_t a = 0; a < cur->NumArgs(); ++a) push_val(cur->Arg(a));
+			while (!val_work.empty() || !pred_work.empty()) {
+				while (!pred_work.empty()) {
+					const auto* cur = pred_work.back();
+					pred_work.pop_back();
+					const auto op = cur->GetOpcode();
+					if (op == ValueOpcode::LogicalAnd || op == ValueOpcode::LogicalOr ||
+					    op == ValueOpcode::LogicalNot ||
+					    (op == ValueOpcode::Phi && cur->GetType() == Type::U1)) {
+						for (size_t a = 0; a < cur->NumArgs(); ++a) push_pred(cur->Arg(a));
+						if (op == ValueOpcode::Phi) push_phi_edges(cur);
+					} else if (op == ValueOpcode::IEqual32 || op == ValueOpcode::INotEqual32 ||
+					           op == ValueOpcode::ULessThan32 ||
+					           op == ValueOpcode::ULessThanEqual32 ||
+					           op == ValueOpcode::UGreaterThan32 ||
+					           op == ValueOpcode::UGreaterThanEqual32) {
+						for (size_t a = 0; a < cur->NumArgs(); ++a) push_val(cur->Arg(a));
+					}
+				}
+				while (!val_work.empty()) {
+					const auto* cur = val_work.back();
+					val_work.pop_back();
+					switch (cur->GetOpcode()) {
+						case ValueOpcode::SelectU32:
+							push_pred(cur->Arg(0));
+							push_val(cur->Arg(1));
+							push_val(cur->Arg(2));
+							break;
+						case ValueOpcode::ReadFirstLane:
+							if (cur->NumArgs() == 2u) {
+								push_val(cur->Arg(0));
+								push_pred(cur->Arg(1));
+							}
+							break;
+						case ValueOpcode::Phi:
+							for (size_t a = 0; a < cur->NumArgs(); ++a) push_val(cur->Arg(a));
+							push_phi_edges(cur);
+							break;
+						case ValueOpcode::UMin32:
+						case ValueOpcode::BitwiseAnd32:
+						case ValueOpcode::IAdd32:
+							push_val(cur->Arg(0));
+							push_val(cur->Arg(1));
+							break;
+						case ValueOpcode::ShiftRightLogical32:
+						case ValueOpcode::ShiftLeftLogical32:
+							push_val(cur->Arg(0));
+							break;
+						default: break;
+					}
 				}
 			}
 		}
@@ -3707,6 +3769,37 @@ private:
 			return last_ans;
 		};
 
+		const auto pred_true = [&](Value root_cond, const GuardState& guards) {
+			if (guards.contradictory) return true;
+			std::vector<Value>              pending {root_cond};
+			std::unordered_set<const Inst*> seen_cond;
+			while (!pending.empty()) {
+				const auto cond = pending.back().Resolve();
+				pending.pop_back();
+				if (cond.IsImmediate()) {
+					if (cond.GetType() == Type::U1 && cond.U1()) continue;
+					return false;
+				}
+				const auto* ci = cond.TryInstruction();
+				if (ci != nullptr && !seen_cond.insert(ci).second) continue;
+				bool matched = false;
+				for (const auto* p: guards.pos) {
+					if (implies_guard(Value(const_cast<Inst*>(p)), cond)) {
+						matched = true;
+						break;
+					}
+				}
+				if (matched) continue;
+				if (ci != nullptr && ci->GetOpcode() == ValueOpcode::LogicalAnd) {
+					pending.push_back(ci->Arg(1));
+					pending.push_back(ci->Arg(0));
+					continue;
+				}
+				return false;
+			}
+			return true;
+		};
+
 		std::map<std::pair<std::vector<const Inst*>, const Block*>, std::vector<const Inst*>>
 		    inv_cache;
 		const auto invariant_guards = [&](std::span<const Inst* const> pos,
@@ -3850,23 +3943,20 @@ private:
 					}
 				}
 				for (size_t idx = 0; idx < state.neg.size() && !state.contradictory; ++idx) {
-					const auto* g  = state.neg[idx];
-					const auto  op = g->GetOpcode();
+					const auto* g = state.neg[idx];
+					if (pred_true(Value(const_cast<Inst*>(g)), state)) {
+						state.contradictory = true;
+						break;
+					}
+					const auto op = g->GetOpcode();
 					if (op == ValueOpcode::LogicalOr) {
 						add_neg(g->Arg(0), changed);
 						add_neg(g->Arg(1), changed);
 					} else if (op == ValueOpcode::LogicalNot) {
 						add_pos(g->Arg(0), changed);
 					} else if (op == ValueOpcode::LogicalAnd) {
-						const auto pos_implies = [&](Value target) {
-							for (size_t pi = 0; pi < state.pos.size(); ++pi) {
-								if (implies_guard(Value(const_cast<Inst*>(state.pos[pi])), target))
-									return true;
-							}
-							return false;
-						};
-						if (pos_implies(g->Arg(0))) add_neg(g->Arg(1), changed);
-						if (pos_implies(g->Arg(1))) add_neg(g->Arg(0), changed);
+						if (pred_true(g->Arg(0), state)) add_neg(g->Arg(1), changed);
+						if (pred_true(g->Arg(1), state)) add_neg(g->Arg(0), changed);
 					}
 				}
 			}
@@ -3918,34 +4008,6 @@ private:
 		std::map<std::pair<const Inst*, GuardState>, std::optional<Range>> eval_memo;
 		std::map<std::tuple<const Inst*, GuardState, bool>, bool>          pred_false_memo;
 		std::set<std::pair<const Inst*, GuardState>>                       visiting;
-
-		const auto pred_true = [&](Value root_cond, const GuardState& guards) {
-			std::vector<Value> pending {root_cond};
-			while (!pending.empty()) {
-				const auto cond = pending.back().Resolve();
-				pending.pop_back();
-				if (cond.IsImmediate()) {
-					if (cond.GetType() == Type::U1 && cond.U1()) continue;
-					return false;
-				}
-				bool matched = false;
-				for (const auto* p: guards.pos) {
-					if (implies_guard(Value(const_cast<Inst*>(p)), cond)) {
-						matched = true;
-						break;
-					}
-				}
-				if (matched) continue;
-				const auto* ci = cond.TryInstruction();
-				if (ci != nullptr && ci->GetOpcode() == ValueOpcode::LogicalAnd) {
-					pending.push_back(ci->Arg(1));
-					pending.push_back(ci->Arg(0));
-					continue;
-				}
-				return false;
-			}
-			return true;
-		};
 
 		enum class TaskStep : uint8_t {
 			EvalEnter,
@@ -4099,12 +4161,7 @@ private:
 							case ValueOpcode::ReadFirstLane: {
 								if (inst->NumArgs() == 2u) {
 									const auto mask = inst->Arg(1).Resolve();
-									const bool implied =
-									    mask == Value(true) ||
-									    std::ranges::any_of(t.guards.pos, [&](const Inst* p) {
-										    return implies_guard(Value(const_cast<Inst*>(p)), mask);
-									    });
-									if (implied) {
+									if (pred_true(mask, t.guards)) {
 										t.step = TaskStep::EvalShiftArg; // pass through range
 										push_eval(inst->Arg(0),
 										          add_guard(GuardState {}, mask, Value {}));
@@ -4445,6 +4502,10 @@ private:
 						}
 						t.inst        = inst;
 						const auto op = inst->GetOpcode();
+						if (op == ValueOpcode::LogicalNot && pred_true(inst->Arg(0), t.guards)) {
+							finish_pred(t, true);
+							break;
+						}
 						if (op == ValueOpcode::LogicalAnd) {
 							t.step = TaskStep::PredAndLeft;
 							push_pred(inst->Arg(0), add_guard(t.guards, inst->Arg(1), Value {}),
