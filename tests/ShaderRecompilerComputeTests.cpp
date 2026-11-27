@@ -37959,18 +37959,35 @@ void CheckSharedIndirectBufferLoads(VulkanHarness &vulkan) {
           ++profile.uses;
         }
       std::map<u32, std::string> functions;
+      std::map<u32, std::string> helper_names;
       u32 function = 0, bda = 0, inline_reads = 0;
       for (size_t offset = 5; offset < compiled.spirv.size();) {
         const auto words = std::span(compiled.spirv).subspan(offset, compiled.spirv[offset] >> 16u);
         const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
         if (opcode == spv::OpName) {
           const std::string_view name(reinterpret_cast<const char *>(words.data() + 2));
-          if (name.starts_with("load_indirect_buffer_")) functions.emplace(words[1], name);
+          if (name.starts_with("load_indirect_buffer_")) {
+            functions.emplace(words[1], name);
+            helper_names.emplace(words[1], name);
+          } else if (name == "indirect_buffer_format_geometry" ||
+                     name == "convert_indirect_buffer_format" ||
+                     name == "pack_indirect_buffer_d16") {
+            helper_names.emplace(words[1], name);
+          }
           if (name == "get_bda_pointer") bda = words[1];
         }
         if (opcode == spv::OpFunction) {
           function = words[2];
           if (functions.contains(function)) ++profiles[functions.at(function)].definitions;
+          if (helper_names.contains(function)) {
+            Require(test.name, helper_names.at(function).c_str(),
+                    (words[3] & spv::FunctionControlDontInlineMask) != 0u,
+                    "indirect load helper must be marked DontInline");
+          } else if (function == bda) {
+            Require(test.name, "get_bda_pointer",
+                    (words[3] & spv::FunctionControlDontInlineMask) == 0u,
+                    "get_bda_pointer should remain inlineable");
+          }
         }
         if (opcode == spv::OpFunctionCall) {
           if (functions.contains(words[3])) ++profiles[functions.at(words[3])].calls;

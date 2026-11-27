@@ -1272,7 +1272,7 @@ void DefineIndirectBufferFormats(ValueEmitContext& ctx) {
 		                      "indirect_buffer_format_geometry");
 		state.builder.AddFunction(spv::OpFunction, result_type,
 		                          state.indirect_format_geometry_function,
-		                          spv::FunctionControlMaskNone, function_type);
+		                          spv::FunctionControlDontInlineMask, function_type);
 		state.builder.AddFunction(spv::OpFunctionParameter, type, format);
 		EmitLabel(state, state.builder.AllocateId());
 		const auto result = EmitIndexSwitch(
@@ -1295,7 +1295,7 @@ void DefineIndirectBufferFormats(ValueEmitContext& ctx) {
 	const auto raw = state.builder.AllocateId();
 	state.builder.AddName(state.indirect_format_function, "convert_indirect_buffer_format");
 	state.builder.AddFunction(spv::OpFunction, type, state.indirect_format_function,
-	                          spv::FunctionControlMaskNone, function_type);
+	                          spv::FunctionControlDontInlineMask, function_type);
 	state.builder.AddFunction(spv::OpFunctionParameter, type, format);
 	state.builder.AddFunction(spv::OpFunctionParameter, type, selector);
 	state.builder.AddFunction(spv::OpFunctionParameter, type, component);
@@ -1342,7 +1342,7 @@ void DefineIndirectBufferD16(ValueEmitContext& ctx) {
 	const auto value = state.builder.AllocateId();
 	state.builder.AddName(state.indirect_format_d16_function, "pack_indirect_buffer_d16");
 	state.builder.AddFunction(spv::OpFunction, type, state.indirect_format_d16_function,
-	                          spv::FunctionControlMaskNone, function_type);
+	                          spv::FunctionControlDontInlineMask, function_type);
 	state.builder.AddFunction(spv::OpFunctionParameter, type, format);
 	state.builder.AddFunction(spv::OpFunctionParameter, type, value);
 	EmitLabel(state, state.builder.AllocateId());
@@ -1409,7 +1409,7 @@ void DefineIndirectBufferLoads(ValueEmitContext& ctx) {
 			                  (memory.formatted ? "_formatted" : "");
 			state.builder.AddName(function, name.c_str());
 			state.builder.AddFunction(spv::OpFunction, result_type, function,
-			                          spv::FunctionControlMaskNone, signature);
+			                          spv::FunctionControlDontInlineMask, signature);
 			std::array<uint32_t, 8> args;
 			for (auto& arg: args) {
 				arg = state.builder.AllocateId();
