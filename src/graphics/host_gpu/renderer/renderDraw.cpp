@@ -601,6 +601,7 @@ struct DrawIndexBufferSource {
 // The task shader's inputs for an indirect mesh draw: Params in gpu_mesh_indirect.task.
 struct MeshTaskParams {
 	vk::DeviceAddress records        = 0;
+	vk::DeviceAddress count_address  = 0;
 	vk::DeviceAddress index_address  = 0;
 	uint32_t          stride         = 0;
 	uint32_t          index_size     = 0;
@@ -611,6 +612,9 @@ struct MeshTaskParams {
 	uint32_t          max_instances  = 0;
 	uint32_t          max_total      = 0;
 };
+static_assert(offsetof(MeshTaskParams, count_address) == 8);
+static_assert(offsetof(MeshTaskParams, index_address) == 16);
+static_assert(sizeof(MeshTaskParams) == 56);
 
 struct PreparedIndexBuffer {
 	vk::Buffer     buffer = nullptr;
@@ -1092,6 +1096,21 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		index_end       = (index_source.address + size + 3u) & ~uint64_t {3};
 		(void)m_context.GetBufferCache().FindBuffer(index_begin, index_end - index_begin);
 	}
+	uint64_t indirect_args_size = 0;
+	if (emit.indirect.address != 0) {
+		const uint64_t min_size = draw.indexed ? sizeof(vk::DrawIndexedIndirectCommand)
+		                                       : sizeof(vk::DrawIndirectCommand);
+		indirect_args_size =
+		    static_cast<uint64_t>(emit.indirect.count - 1) * emit.indirect.stride + min_size;
+		indirect_args_size = std::max(
+		    Libs::LibKernel::Memory::ClampRangeSize(emit.indirect.address, indirect_args_size),
+		    min_size);
+		(void)m_context.GetBufferCache().FindBuffer(emit.indirect.address, indirect_args_size);
+		if (emit.indirect.count_address != 0) {
+			(void)m_context.GetBufferCache().FindBuffer(emit.indirect.count_address,
+			                                            sizeof(uint32_t));
+		}
+	}
 	auto&                            bindings = m_graphics_bindings;
 	std::array<PreparedBindings*, 4> descriptor_stages {};
 	uint32_t                         stage_count = 0;
@@ -1117,12 +1136,16 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		mesh_indices = indices->BufferDeviceAddress() + offset + (index_source.address & 3u);
 	}
 	std::pair<Buffer*, uint64_t> args_buffer {};
+	std::pair<Buffer*, uint64_t> count_buffer {};
 	if (emit.indirect.address != 0) {
-		const auto size = static_cast<uint64_t>(emit.indirect.count - 1) * emit.indirect.stride +
-		                  (draw.indexed ? sizeof(vk::DrawIndexedIndirectCommand)
-		                                : sizeof(vk::DrawIndirectCommand));
-		args_buffer = m_context.GetBufferCache().ObtainBuffer(emit.indirect.address, size, false);
+		args_buffer = m_context.GetBufferCache().ObtainBuffer(emit.indirect.address,
+		                                                      indirect_args_size, false);
 		EXIT_IF((args_buffer.second & 3u) != 0);
+		if (emit.indirect.count_address != 0) {
+			count_buffer = m_context.GetBufferCache().ObtainBuffer(emit.indirect.count_address,
+			                                                       sizeof(uint32_t), false);
+			EXIT_IF((count_buffer.second & 3u) != 0);
+		}
 	}
 	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(buffer, state, m_targets);
 	vk::ImageAspectFlags feedback_aspects;
@@ -1132,6 +1155,9 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	if (mesh_task) {
 		const MeshTaskParams params {
 		    .records        = args_buffer.first->BufferDeviceAddress() + args_buffer.second,
+		    .count_address  = count_buffer.first != nullptr
+		                          ? count_buffer.first->BufferDeviceAddress() + count_buffer.second
+		                          : 0,
 		    .index_address  = mesh_indices,
 		    .stride         = emit.indirect.stride,
 		    .index_size     = index_source.guest_element_size,
@@ -1215,6 +1241,16 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 	} else if (args_buffer.first == nullptr) {
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
+	} else if (count_buffer.first != nullptr) {
+		if (draw.indexed) {
+			vk_buffer.drawIndexedIndirectCount(args_buffer.first->Handle(), args_buffer.second,
+			                                   count_buffer.first->Handle(), count_buffer.second,
+			                                   emit.indirect.count, emit.indirect.stride);
+		} else {
+			vk_buffer.drawIndirectCount(args_buffer.first->Handle(), args_buffer.second,
+			                            count_buffer.first->Handle(), count_buffer.second,
+			                            emit.indirect.count, emit.indirect.stride);
+		}
 	} else if (draw.indexed) {
 		vk_buffer.drawIndexedIndirect(args_buffer.first->Handle(), args_buffer.second,
 		                              emit.indirect.count, emit.indirect.stride);
@@ -1235,7 +1271,8 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 // Vulkan offsets for a prepared draw, or nullopt when its indirect records need the CPU:
 // quad-list draws for counts, tessellation draws for the index/SGPR prolog and mesh draws without
 // room for the task payload. Indirect records carry their own offsets.
-static std::optional<DrawEmitInfo> ResolveDrawEmit(const HW::UserConfig&        ucfg,
+static std::optional<DrawEmitInfo> ResolveDrawEmit(const GraphicContext&        graphics,
+                                                   const HW::UserConfig&        ucfg,
                                                    const ShaderVertexInputInfo& vs,
                                                    DrawOffsetSource             source,
                                                    int32_t                      first_vertex,
@@ -1255,6 +1292,22 @@ static std::optional<DrawEmitInfo> ResolveDrawEmit(const HW::UserConfig&        
 		    ucfg.GetPrimType() == Prospero::PrimitiveType::kQuadListLegacy ||
 		    vs.indirect_offsets != indirect.offsets) {
 			return std::nullopt;
+		}
+		if (vs.logical_stage == ShaderType::Mesh) {
+			const auto&    limits = graphics.mesh_shader_properties;
+			const uint32_t max_tasks =
+			    std::min(limits.maxTaskWorkGroupCount[0], limits.maxTaskWorkGroupTotalCount);
+			if (indirect.count > max_tasks ||
+			    (indirect.count_address != 0 && indirect.count > 65536u)) {
+				return std::nullopt;
+			}
+		} else {
+			if (indirect.count > graphics.GetPhysicalDeviceProperties().limits.maxDrawIndirectCount) {
+				return std::nullopt;
+			}
+			if (indirect.count_address != 0 && !graphics.draw_indirect_count_enabled) {
+				return std::nullopt;
+			}
 		}
 		return DrawEmitInfo {.indirect = indirect};
 	}
@@ -1347,8 +1400,9 @@ bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args)
 	}
 
 	LogDrawStateIfNeeded(buffer, draw, state, m_targets, args.index_type_and_size, args.index_addr);
-	const auto emit = ResolveDrawEmit(ucfg, state.vertex_info[0], args.offset_source,
-	                                  args.base_vertex, args.first_instance, args.indirect);
+	const auto emit = ResolveDrawEmit(m_context.GetGraphics(), ucfg, state.vertex_info[0],
+	                                  args.offset_source, args.base_vertex, args.first_instance,
+	                                  args.indirect);
 	if (emit) {
 		ExecutePreparedDraw(buffer, draw, state, *emit, index_source);
 	}
@@ -1425,9 +1479,9 @@ bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args) {
 	}
 
 	LogDrawStateIfNeeded(buffer, draw, state, m_targets, 0, nullptr);
-	const auto emit = ResolveDrawEmit(ucfg, state.vertex_info[0], args.offset_source,
-	                                  static_cast<int32_t>(args.first_vertex), args.first_instance,
-	                                  args.indirect);
+	const auto emit = ResolveDrawEmit(m_context.GetGraphics(), ucfg, state.vertex_info[0],
+	                                  args.offset_source, static_cast<int32_t>(args.first_vertex),
+	                                  args.first_instance, args.indirect);
 	if (emit) {
 		ExecutePreparedDraw(buffer, draw, state, *emit, {});
 	}

@@ -252,18 +252,17 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 		return;
 	}
 	auto& cache = context.GetBufferCache();
-	if (indirect_args != 0) {
-		cache.ReadMemory(indirect_args, sizeof(vk::DispatchIndirectCommand));
-		std::memcpy(input.workgroup_counts, reinterpret_cast<const void*>(indirect_args),
-		            sizeof(input.workgroup_counts));
-	}
 	// LDS has no contents to preserve between dispatches. The existing shader hazard
 	// barriers also order other users of this GPU-only utility buffer.
 	auto& storage = cache.GetUtilityBuffer(MemoryUsage::DeviceLocal);
 	const auto limit = std::min<uint64_t>(storage.Size(),
 	    context.GetGraphics().GetPhysicalDeviceProperties().limits.maxStorageBufferRange);
 	uint64_t size = sizeof(uint32_t);
-	if (std::ranges::find(input.workgroup_counts, 0u) == std::end(input.workgroup_counts)) {
+	if (indirect_args != 0) {
+		// Avoid synchronous readback of GPU-written indirect dispatch dimensions; bind the full
+		// scratch range up to the storage buffer limit.
+		size = limit;
+	} else if (std::ranges::find(input.workgroup_counts, 0u) == std::end(input.workgroup_counts)) {
 		size = uint64_t {input.lds_size_dwords} * sizeof(uint32_t);
 		EXIT_IF(size == 0 || size > limit);
 		for (const auto count: input.workgroup_counts) {

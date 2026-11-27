@@ -1268,7 +1268,8 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			const auto& offsets  = options.input_info.vertex->indirect_offsets;
 			for (const auto [slot, parameter]:
 			     {std::pair {offsets.vertex, 1u},
-			      std::pair {offsets.instance, IR::PushData::MeshDrawDwordCount}}) {
+			      std::pair {offsets.instance, IR::PushData::MeshDrawDwordCount},
+			      std::pair {offsets.draw_index, IR::PushData::MeshDrawDwordCount + 1u}}) {
 				if (indirect && 8u + slot < options.user_data_count) {
 					entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(8u + slot), draw(parameter));
 				}
@@ -1445,6 +1446,12 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(8),
 			                      index(offsets.instance, IR::StageInputKind::InstanceIndex,
 			                            IR::StageInputKind::BaseInstance));
+			if (options.input_info.vertex->indirect_draw &&
+			    offsets.draw_index < options.user_data_count) {
+				entry_ir.SetScalarReg(
+				    static_cast<IR::ScalarReg>(options.user_data_base + offsets.draw_index),
+				    builtin(IR::StageInputKind::DrawIndex));
+			}
 		}
 	}
 	for (const auto& cfg_block: cfg.blocks) {

@@ -176,7 +176,7 @@ void CommandProcessor::Reset() {
 	m_index_buffer_size                = 0;
 	m_index_base_addr                  = 0;
 	m_num_instances                    = 1;
-	m_num_instances_addr               = 0;
+	m_indirect_num_instances         = {};
 	m_predicate_skip                   = false;
 	m_draw_indirect_args_base_addr     = 0;
 	m_dispatch_indirect_args_base_addr = 0;
@@ -680,14 +680,24 @@ void CommandProcessor::SetNumInstances(uint32_t num_instances) {
 		num_instances = 1;
 	}
 
-	m_num_instances      = num_instances;
-	m_num_instances_addr = 0;
+	m_num_instances          = num_instances;
+	m_indirect_num_instances = {};
 }
 
 uint32_t CommandProcessor::NumInstances() {
-	if (m_num_instances_addr != 0) {
-		m_num_instances      = *reinterpret_cast<const uint32_t*>(m_num_instances_addr);
-		m_num_instances_addr = 0;
+	if (m_indirect_num_instances.args_addr != 0) {
+		const auto state         = m_indirect_num_instances;
+		m_indirect_num_instances = {};
+		const uint32_t draw_count =
+		    state.count_addr == nullptr
+		        ? state.max_count
+		        : std::min(uint32_t {*state.count_addr}, state.max_count);
+		if (draw_count != 0) {
+			const uint64_t instance_addr =
+			    state.args_addr + static_cast<uint64_t>(draw_count - 1) * state.stride +
+			    offsetof(vk::DrawIndirectCommand, instanceCount);
+			m_num_instances = *reinterpret_cast<const uint32_t*>(instance_addr);
+		}
 	}
 	return m_num_instances;
 }
@@ -788,14 +798,14 @@ static void PatchIndirectDrawOffsets(CommandProcessor& cp, IndirectDrawRegisters
 }
 
 // Writes the GS user-data slots the packet patches; false when the shaders cannot read the
-// offsets from GPU records: a first-index or subdraw-index destination, or another stage's
-// user data.
+// offsets from GPU records: a first-index destination, or another stage's user data.
 static bool IndirectDrawOffsets(IndirectDrawRegisters registers, ShaderIndirectOffsets& offsets) {
-	if (registers.index_offset != Pm4::SH_NOP || registers.draw_index != Pm4::SH_NOP) {
+	if (registers.index_offset != Pm4::SH_NOP) {
 		return false;
 	}
 	for (const auto [location, slot]: {std::pair {registers.vertex_offset, &offsets.vertex},
-	                                   std::pair {registers.instance_offset, &offsets.instance}}) {
+	                                   std::pair {registers.instance_offset, &offsets.instance},
+	                                   std::pair {registers.draw_index, &offsets.draw_index}}) {
 		if (location == Pm4::SH_NOP) {
 			continue;
 		}
@@ -820,34 +830,51 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	                     stride_in_bytes < (indexed ? sizeof(vk::DrawIndexedIndirectCommand)
 	                                                : sizeof(vk::DrawIndirectCommand)));
 
-	const auto draw_count = count_addr == nullptr
-	                            ? max_count_or_count
-	                            : std::min(uint32_t {*count_addr}, max_count_or_count);
+	if (max_count_or_count == 0) {
+		return;
+	}
+	uint32_t max_count = max_count_or_count;
+	if (count_addr != nullptr &&
+	    !m_renderer.GetBufferCache().IsRegionGpuModified(reinterpret_cast<uint64_t>(count_addr),
+	                                                     sizeof(uint32_t))) {
+		max_count  = std::min(uint32_t {*count_addr}, max_count_or_count);
+		count_addr = nullptr;
+		if (max_count == 0) {
+			return;
+		}
+	}
+
+	auto&      executor  = m_renderer.GetRenderExecutor();
+	const auto args_addr = m_draw_indirect_args_base_addr + data_offset;
+	// NUM_INSTANCES keeps the last draw's instance count; resolve lazily only if inherited.
+	m_indirect_num_instances = {args_addr, count_addr, max_count, stride_in_bytes};
+	// The GPU reads the records and optional indirect count if the shaders allow; the VS prolog
+	// removes Vulkan's bases from the index VGPRs and copies them only to the user SGPRs the
+	// packet patches.
+	DrawIndirectArgs records {args_addr, reinterpret_cast<uint64_t>(count_addr), max_count,
+	                          stride_in_bytes};
+	if (IndirectDrawOffsets(registers, records.offsets)) {
+		const bool gpu_submitted =
+		    !indexed
+		        ? executor.DrawAuto(CurrentBuffer(), {.indirect = records})
+		        : (m_index_buffer_size != 0 &&
+		           executor.DrawIndex(CurrentBuffer(), {.index_count         = m_index_buffer_size,
+		                                                .index_addr          = IndexAddress(0),
+		                                                .index_type_and_size = m_index_type_and_size,
+		                                                .indirect            = records}));
+		if (gpu_submitted) {
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::IndirectDraws, max_count);
+			return;
+		}
+	}
+
+	const auto draw_count =
+	    count_addr == nullptr ? max_count : std::min(uint32_t {*count_addr}, max_count);
 	if (draw_count == 0) {
 		return;
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::IndirectDraws, draw_count);
-
-	auto&      executor  = m_renderer.GetRenderExecutor();
-	const auto args_addr = m_draw_indirect_args_base_addr + data_offset;
-	// NUM_INSTANCES keeps the last draw's instance count.
-	m_num_instances_addr = args_addr + static_cast<uint64_t>(draw_count - 1) * stride_in_bytes +
-	                       offsetof(vk::DrawIndirectCommand, instanceCount);
-	// The GPU reads the records if the shaders allow; the VS prolog removes Vulkan's bases
-	// from the index VGPRs and copies them only to the user SGPRs the packet patches.
-	DrawIndirectArgs records {args_addr, draw_count, stride_in_bytes};
-	if (IndirectDrawOffsets(registers, records.offsets)) {
-		if (!indexed && executor.DrawAuto(CurrentBuffer(), {.indirect = records})) {
-			return;
-		}
-		if (indexed && m_index_buffer_size != 0 &&
-		    executor.DrawIndex(CurrentBuffer(), {.index_count         = m_index_buffer_size,
-		                                         .index_addr          = IndexAddress(0),
-		                                         .index_type_and_size = m_index_type_and_size,
-		                                         .indirect            = records})) {
-			return;
-		}
-	}
+	m_indirect_num_instances = {args_addr, nullptr, draw_count, stride_in_bytes};
 
 	const uint32_t max_indices = m_index_buffer_size != 0 ? m_index_buffer_size : UINT32_MAX;
 	for (uint32_t i = 0; i < draw_count; i++) {

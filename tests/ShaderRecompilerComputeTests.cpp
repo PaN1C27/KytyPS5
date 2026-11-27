@@ -14436,11 +14436,14 @@ public:
                              .tgid_y_en = true, .tgid_z_en = true, .lds_size = 128});
         set_buffer(0, lds_output, lds_words * sizeof(u32));
         if (indirect) {
+          const auto tick = scheduler.CurrentTick();
           const std::array<u32, 3> packet{static_cast<u32>(lds_args),
                                          static_cast<u32>(lds_args >> 32u), 0x41u};
           Require(name, "indirect storage LDS dispatch",
-                  CpOpDispatchIndirect(processor, 0xc0021600u, packet.data(), 0, 0) == 3,
-                  "the GPU-authored LDS dispatch was not consumed");
+                  CpOpDispatchIndirect(processor, 0xc0021600u, packet.data(), 0, 0) == 3 &&
+                      scheduler.CurrentTick() == tick &&
+                      cache.HasGpuDirtyBytes(lds_args, 3 * sizeof(u32)),
+                  "the GPU-authored LDS dispatch was not consumed or triggered a synchronous readback");
         } else {
           processor.DispatchDirect(2, 2, 2, 0x41u);
         }
@@ -22556,7 +22559,10 @@ public:
           shaders.SetEsShaderBase(vertex_shader);
           TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), sparse_color.image_id,
               {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
-          const DrawIndirectArgs records{args_address + first * stride, 2, stride, offsets};
+          const DrawIndirectArgs records{.address = args_address + first * stride,
+                                         .count   = 2,
+                                         .stride  = stride,
+                                         .offsets = offsets};
           const bool drawn = indexed
               ? RenderExecutorTestAccess::DrawIndex(executor, scheduler.Current(),
                     {.index_count = 3, .index_addr = reinterpret_cast<const void *>(index_address),
@@ -22601,6 +22607,87 @@ public:
         check("auto unpatched vertex offset", indirect_vs, false, records_per_kind + 4);
         check("indexed unpatched instance offset", indirect_vs, true, 6);
         check("auto unpatched instance offset", indirect_vs, false, records_per_kind + 6);
+        {
+          // GPU-written indirect count and draw_index SGPR run without CPU readbacks.
+          static const auto draw_index_vertex = [] {
+            auto code = indirect_vertex;
+            const auto exp = std::ranges::find(code, EncodeExp0(0x0c, 0xf));
+            code.insert(exp, {EncodeVop1(0x01, 7, 10), EncodeVopc(0xc2, InlineU32(1), 7),
+                              EncodeVop2(0x01, 3, Vgpr(1), 3), EncodeVop2(0x01, 4, Vgpr(1), 4)});
+            return code;
+          }();
+          const auto draw_index_vs = reinterpret_cast<uint64_t>(draw_index_vertex.data());
+          ShaderMapUserData(draw_index_vs,
+              {.type = Prospero::ShaderBinaryType::kGs, .user_data = &native_user_data,
+               .code_size_bytes = static_cast<uint32_t>(draw_index_vertex.size() * sizeof(u32))});
+          shaders.SetEsShaderBase(draw_index_vs);
+          shaders.SetGsShaderResource2({.user_sgpr = 3});
+          shaders.SetGsUserSgpr(2, 99);
+          constexpr uint64_t counted_args = depth_address + 0x3c000;
+          constexpr uint64_t gpu_count_addr = depth_address + 0x34000;
+          std::array<u32, 3 * stride / 4> counted_records{};
+          const vk::DrawIndexedIndirectCommand raw_counted_records[3]{
+              {0, 1, 0, 0, 0}, {3, 1, 0, 7, 5}, {3, 1, 0, 7, 5}};
+          for (u32 i = 0; i < 3; i++) {
+            std::memcpy(counted_records.data() + i * (stride / 4), &raw_counted_records[i],
+                        sizeof(raw_counted_records[i]));
+          }
+          auto &buf_cache = context.GetBufferCache();
+          buf_cache.InvalidateMemory(counted_args, sizeof(counted_records));
+          Require("GpuCountedIndirectDraw", "seed records",
+                  LibKernel::Memory::TryWriteBacking(counted_args, counted_records.data(),
+                                                     sizeof(counted_records)),
+                  "failed to write seed indirect records");
+          (void)buf_cache.ObtainBuffer(counted_args, sizeof(counted_records), false);
+          (void)buf_cache.ObtainBuffer(counted_args, sizeof(counted_records), true);
+          const std::array<u32, sizeof(counted_records) / 4> zero_args{};
+          Require("GpuCountedIndirectDraw", "args backing",
+                  LibKernel::Memory::TryWriteBacking(counted_args, zero_args.data(),
+                                                     sizeof(zero_args)),
+                  "failed to clear CPU backing of indirect records");
+          CommandProcessor processor(context, 0);
+          processor.SetDrawIndirectArgsBaseAddress(counted_args);
+          processor.SetIndexBaseAddress(index_address);
+          processor.SetIndexBufferSize(3);
+          processor.SetIndexType(1);
+          for (const u32 gpu_count : {1u, 2u}) {
+            auto [count_buf, count_off] =
+                buf_cache.ObtainBuffer(gpu_count_addr, sizeof(u32), true);
+            count_buf->Fill(count_off, sizeof(u32), gpu_count);
+            constexpr u32 stale_count = 99u;
+            Require("GpuCountedIndirectDraw", "count backing",
+                    LibKernel::Memory::TryWriteBacking(gpu_count_addr, &stale_count,
+                                                       sizeof(stale_count)) &&
+                        buf_cache.HasGpuDirtyBytes(gpu_count_addr, sizeof(u32)),
+                    "count_addr did not remain GPU-owned with stale CPU backing");
+            TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), sparse_color.image_id,
+                {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
+            const auto tick = scheduler.CurrentTick();
+            processor.DrawIndirectMulti(
+                0, 3u, reinterpret_cast<const volatile uint32_t *>(gpu_count_addr), stride,
+                {Pm4::SPI_SHADER_USER_DATA_GS_0 + 0, Pm4::SPI_SHADER_USER_DATA_GS_0 + 1,
+                 Pm4::SH_NOP, Pm4::SPI_SHADER_USER_DATA_GS_0 + 2},
+                0u, true);
+            Require("GpuCountedIndirectDraw", "no CPU readback stall",
+                    scheduler.CurrentTick() == tick &&
+                        buf_cache.HasGpuDirtyBytes(gpu_count_addr, sizeof(u32)) &&
+                        buf_cache.HasGpuDirtyBytes(counted_args, sizeof(counted_records)),
+                    "DrawIndirectMulti synchronized or downloaded GPU-owned count or args");
+            const auto pixels = ReadCachedTexel(name, context, sparse_color.image_id,
+                                                {}, {extent, extent, 1});
+            const bool expect_drawn = gpu_count >= 2u;
+            for (size_t component = 0; component < pixels.size(); component++) {
+              const u32 expected = expect_drawn
+                                       ? (component % 4 == 3 ? 0x3f800000u : 0x3e800000u)
+                                       : 0u;
+              Require("GpuCountedIndirectDraw", gpu_count == 1u ? "clamped out" : "draw_index=1",
+                      pixels[component] == expected,
+                      "GPU indirect count or BuiltInDrawIndex did not produce the expected result");
+            }
+          }
+          shaders.SetGsShaderResource2({.user_sgpr = 2});
+          shaders.SetEsShaderBase(indirect_vs);
+        }
         // Overlapping vertex buffers bind into one merged host range, sized by the buffer
         // that ends last; an empty buffer binds the null buffer with no bytes.
         {
@@ -22763,8 +22850,10 @@ public:
                                bool covered = true) {
           TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), sparse_color.image_id,
               {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
-          const DrawIndirectArgs records{mesh_args_address + first * stride, count, stride,
-                                         offsets};
+          const DrawIndirectArgs records{.address = mesh_args_address + first * stride,
+                                         .count   = count,
+                                         .stride  = stride,
+                                         .offsets = offsets};
           read_covered(step, indexed
               ? RenderExecutorTestAccess::DrawIndex(executor, scheduler.Current(),
                     {.index_count = index_buffer_size,
@@ -22809,6 +22898,80 @@ public:
         check("auto subgroups", false, 4, 2, {0, 1});
         // Index reads stop at INDEX_BUFFER_SIZE: two of the record's three indices remain.
         check("index buffer size", true, 2, 1, {0, 1}, 8, false);
+        {
+          // GPU-written indirect count and draw_index SGPR work through the task shader without CPU readbacks.
+          static const auto mesh_draw_index_code = [] {
+            auto code = mesh_code;
+            const auto exp = std::ranges::find(code, EncodeExp0(0x0c, 0xf));
+            code.insert(exp, {EncodeVop1(0x01, 7, 10), EncodeVopc(0xc2, InlineU32(1), 7),
+                              EncodeVop2(0x01, 3, Vgpr(1), 3), EncodeVop2(0x01, 4, Vgpr(1), 4)});
+            return code;
+          }();
+          const auto mesh_draw_index_addr = reinterpret_cast<uint64_t>(mesh_draw_index_code.data());
+          ShaderMapUserData(mesh_draw_index_addr,
+              {.type = Prospero::ShaderBinaryType::kGs, .user_data = &native_user_data,
+               .code_size_bytes = static_cast<uint32_t>(mesh_draw_index_code.size() * sizeof(u32))});
+          shaders.SetEsShaderBase(mesh_draw_index_addr);
+          shaders.SetGsShaderResource2({.user_sgpr = 3, .lds_size = 1});
+          shaders.SetGsUserSgpr(2, 99);
+          constexpr uint64_t counted_mesh_args = depth_address + 0x3d000;
+          constexpr uint64_t gpu_mesh_count_addr = depth_address + 0x35000;
+          std::array<u32, 3 * stride / 4> counted_mesh_records{};
+          const vk::DrawIndexedIndirectCommand raw_counted_mesh_records[3]{
+              indexed_records[0], indexed_records[1], indexed_records[1]};
+          for (u32 i = 0; i < 3; i++) {
+            std::memcpy(counted_mesh_records.data() + i * (stride / 4),
+                        &raw_counted_mesh_records[i], sizeof(raw_counted_mesh_records[i]));
+          }
+          context.GetBufferCache().InvalidateMemory(counted_mesh_args, sizeof(counted_mesh_records));
+          Require("GpuMeshCountedIndirectDraw", "seed records",
+                  LibKernel::Memory::TryWriteBacking(counted_mesh_args, counted_mesh_records.data(),
+                                                     sizeof(counted_mesh_records)),
+                  "failed to write seed mesh indirect records");
+          (void)context.GetBufferCache().ObtainBuffer(
+              counted_mesh_args, sizeof(counted_mesh_records), false);
+          (void)context.GetBufferCache().ObtainBuffer(
+              counted_mesh_args, sizeof(counted_mesh_records), true);
+          const std::array<u32, sizeof(counted_mesh_records) / 4> zero_mesh_args{};
+          Require("GpuMeshCountedIndirectDraw", "clear CPU backing",
+                  LibKernel::Memory::TryWriteBacking(counted_mesh_args, zero_mesh_args.data(),
+                                                     sizeof(zero_mesh_args)),
+                  "failed to clear CPU backing of mesh indirect records");
+          CommandProcessor processor(context, 0);
+          processor.SetDrawIndirectArgsBaseAddress(counted_mesh_args);
+          processor.SetIndexBaseAddress(mesh_indices_address);
+          processor.SetIndexBufferSize(9);
+          processor.SetIndexType(1);
+          for (const u32 gpu_count : {1u, 2u}) {
+            auto [count_buf, count_off] =
+                context.GetBufferCache().ObtainBuffer(gpu_mesh_count_addr, sizeof(u32), true);
+            count_buf->Fill(count_off, sizeof(u32), gpu_count);
+            constexpr u32 stale_count = 99u;
+            Require("GpuMeshCountedIndirectDraw", "count backing",
+                    LibKernel::Memory::TryWriteBacking(gpu_mesh_count_addr, &stale_count,
+                                                       sizeof(stale_count)) &&
+                        context.GetBufferCache().HasGpuDirtyBytes(gpu_mesh_count_addr, sizeof(u32)),
+                    "mesh count_addr did not remain GPU-owned with stale CPU backing");
+            TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), sparse_color.image_id,
+                {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
+            const auto tick = scheduler.CurrentTick();
+            processor.DrawIndirectMulti(
+                0, 3u, reinterpret_cast<const volatile uint32_t *>(gpu_mesh_count_addr), stride,
+                {Pm4::SPI_SHADER_USER_DATA_GS_0 + 0, Pm4::SPI_SHADER_USER_DATA_GS_0 + 1,
+                 Pm4::SH_NOP, Pm4::SPI_SHADER_USER_DATA_GS_0 + 2},
+                0u, true);
+            Require("GpuMeshCountedIndirectDraw", "no CPU readback stall",
+                    scheduler.CurrentTick() == tick &&
+                        context.GetBufferCache().HasGpuDirtyBytes(gpu_mesh_count_addr, sizeof(u32)) &&
+                        context.GetBufferCache().HasGpuDirtyBytes(counted_mesh_args,
+                                                                  sizeof(counted_mesh_records)),
+                    "mesh DrawIndirectMulti synchronized or downloaded GPU-owned count or args");
+            read_covered(gpu_count == 1u ? "mesh clamped out" : "mesh draw_index=1", true,
+                         gpu_count >= 2u);
+          }
+          shaders.SetGsShaderResource2({.user_sgpr = 2, .lds_size = 1});
+          shaders.SetEsShaderBase(mesh_address);
+        }
         LibKernel::Memory::InstallGpuResources(nullptr);
       }
 
@@ -23093,8 +23256,10 @@ public:
       m_device.destroySampler(packed_sampler);
       DestroyBuffer(&stencil_readback);
     }
-    resources.UnmapMemory(depth_address, allocation_size);
     scheduler.Finish();
+    resources.InitializeGpu(nullptr);
+    resources.UnmapMemory(depth_address, allocation_size);
+    resources.ShutdownGpu();
     DestroyBuffer(&buffer);
     m_device.destroyShaderModule(pixel_shader.module);
     m_device.destroyShaderModule(vertex_shader.module);
@@ -24749,6 +24914,7 @@ private:
     m_runtime_context.r8g8_srgb_views = m_runtime_context.SamplesFiltered(vk::Format::eR8G8Srgb);
     m_runtime_context.conditional_rendering_enabled = true;
     m_runtime_context.sampler_filter_minmax_enabled = true;
+    m_runtime_context.draw_indirect_count_enabled = true;
     m_runtime_context.attachment_feedback_loop_enabled = m_rasterization_supported;
     m_runtime_context.provoking_vertex_last_enabled = m_rasterization_supported;
     m_runtime_context.mesh_shader_enabled = true;
@@ -25011,6 +25177,7 @@ private:
     auto device_features12 = WindowContext::RequiredVulkan12Features();
     device_features12.shaderSharedInt64Atomics = true;
     device_features12.samplerFilterMinmax = true;
+    device_features12.drawIndirectCount = available_features12.drawIndirectCount;
     vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR workgroup_layout{};
     workgroup_layout.workgroupMemoryExplicitLayout = true;
     device_features12.pNext = &device_features11;

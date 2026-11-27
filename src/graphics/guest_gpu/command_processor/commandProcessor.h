@@ -136,10 +136,16 @@ private:
 	uint64_t       m_index_base_addr                  = 0;
 	uint64_t       m_draw_indirect_args_base_addr     = 0;
 	uint64_t       m_dispatch_indirect_args_base_addr = 0;
-	// Persistent draw state. Indirect draws leave the address of their last instance count,
-	// read only when a later draw inherits it.
-	uint32_t m_num_instances      = 1;
-	uint64_t m_num_instances_addr = 0;
+	// Persistent draw state. Indirect draws leave the record and optional count range of their
+	// last instance count, read only when a later draw inherits it.
+	struct IndirectNumInstances {
+		uint64_t                 args_addr  = 0;
+		const volatile uint32_t* count_addr = nullptr;
+		uint32_t                 max_count  = 0;
+		uint32_t                 stride     = 0;
+	};
+	uint32_t             m_num_instances = 1;
+	IndirectNumInstances m_indirect_num_instances {};
 
 	const int      m_interrupt_event_id;
 	const uint32_t m_flush_draws                 = Config::GetFlushDraws();

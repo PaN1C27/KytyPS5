@@ -178,6 +178,7 @@ void AddBuiltinInput(ShaderInfo& info, StageInputKind kind) {
 			break;
 		case StageInputKind::BaseVertex: AddInput(info, kind, 0, 1, "gl_BaseVertex"); break;
 		case StageInputKind::BaseInstance: AddInput(info, kind, 0, 1, "gl_BaseInstance"); break;
+		case StageInputKind::DrawIndex: AddInput(info, kind, 0, 1, "gl_DrawID"); break;
 		case StageInputKind::PackedAncillary:
 		case StageInputKind::Parameter: break;
 	}
@@ -461,6 +462,7 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 				case StageInputKind::LocalInvocationIndex:
 				case StageInputKind::BaseVertex:
 				case StageInputKind::BaseInstance:
+				case StageInputKind::DrawIndex:
 					if (component != 0u) {
 						return Fail("typed scalar builtin component is out of range");
 					}

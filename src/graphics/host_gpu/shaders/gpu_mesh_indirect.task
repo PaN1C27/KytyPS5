@@ -11,9 +11,13 @@ layout(local_size_x = 1) in;
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Record {
 	uint dwords[5];
 };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Count {
+	uint value;
+};
 // MeshTaskParams in renderDraw.cpp.
 layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer Params {
 	uint64_t records;
+	uint64_t count_address;
 	uint64_t index_address;
 	uint     stride;
 	uint     index_size;
@@ -28,9 +32,13 @@ layout(push_constant) uniform Push {
 	Params params;
 };
 
-taskPayloadSharedEXT uint payload[6];
+taskPayloadSharedEXT uint payload[7];
 
 void main() {
+	if (params.count_address != 0 && gl_WorkGroupID.x >= Count(params.count_address).value) {
+		EmitMeshTasksEXT(0, 0, 0);
+		return;
+	}
 	Record   record        = Record(params.records + uint64_t(gl_WorkGroupID.x) * params.stride);
 	uint     count         = record.dwords[0];
 	uint     instances     = record.dwords[1];
@@ -50,6 +58,7 @@ void main() {
 	payload[3] = uint(index_address);
 	payload[4] = uint(index_address >> 32);
 	payload[5] = record.dwords[base + 1];
+	payload[6] = gl_WorkGroupID.x;
 	uint groups =
 	    count < params.primitive_size ? 0 : (count - params.primitive_size) / params.group_step + 1;
 	// Past the host launch limits, where direct draws exit, the record draws nothing.
