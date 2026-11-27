@@ -5,10 +5,12 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
+#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "SrtWalkerTestMemory.h"
 
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cstring>
 #include <iostream>
 #include <limits>
@@ -9804,6 +9806,229 @@ void TestMalformedMemoryKindsRejected() {
   }
 }
 
+void TestInductiveSelectorConvergenceOnDeepMultiLoopDag() {
+  Fixture fixture;
+  auto *entry = fixture.block;
+  auto *preheader = fixture.AddBlock();
+  auto *loop_hdr = fixture.AddBlock();
+  auto *loop_body = fixture.AddBlock();
+  auto *exit_blk = fixture.AddBlock();
+  const auto branch = [](Block *from, Block *to) {
+    from->AddBranch(to);
+    from->terminator = {
+        .kind = Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Branch,
+        .true_block = to};
+  };
+  const auto choose = [](Block *from, Block *yes, Block *no, Value condition) {
+    from->AddBranch(yes);
+    from->AddBranch(no);
+    from->condition = condition;
+    from->terminator = {
+        .kind = Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch,
+        .true_block = yes,
+        .false_block = no};
+  };
+  branch(entry, preheader);
+  branch(preheader, loop_hdr);
+  branch(loop_body, loop_hdr);
+
+  fixture.block = entry;
+  const auto ud0 = fixture.UserData(0);
+  const auto ud1 = fixture.UserData(1);
+  const auto ud2 = fixture.UserData(2);
+  const auto ud3 = fixture.UserData(3);
+
+  fixture.block = preheader;
+  Value dag_v = ud0;
+  for (uint32_t step = 0; step < 32u; ++step) {
+    const auto masked = fixture.Emit(ValueOpcode::BitwiseAnd32,
+                                     {ud1, Value(1u << step)});
+    const auto bit = fixture.Emit(ValueOpcode::INotEqual32, {masked, Value(0u)});
+    const auto inc = fixture.Emit(ValueOpcode::IAdd32, {dag_v, Value(1u)});
+    dag_v = fixture.Emit(ValueOpcode::SelectU32, {bit, inc, dag_v});
+  }
+
+  auto &ind = loop_hdr->AppendNewInst(ValueOpcode::Phi);
+  ind.SetFlags(Type::U32);
+  std::array<Inst *, 4> loop_phis{};
+  for (uint32_t i = 0; i < 4u; ++i) {
+    loop_phis[i] = &loop_hdr->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+  }
+  const auto loop_cond = fixture.Emit(ValueOpcode::ULessThan32,
+                                      {Value(&ind), Value(4u)}, 0, loop_hdr);
+  choose(loop_hdr, loop_body, exit_blk, loop_cond);
+
+  fixture.block = loop_body;
+  const auto ind_next = fixture.Emit(ValueOpcode::IAdd32, {Value(&ind), Value(1u)});
+  ind.AddPhiOperand(preheader, Value(0u));
+  ind.AddPhiOperand(loop_body, ind_next);
+  for (uint32_t i = 0; i < 4u; ++i) {
+    const auto init_v = i == 0u ? dag_v : Value(loop_phis[i - 1u]);
+    const auto bit = fixture.Emit(ValueOpcode::INotEqual32,
+                                  {fixture.Emit(ValueOpcode::BitwiseAnd32, {ud1, Value(1u << i)}),
+                                   Value(0u)});
+    const auto added = fixture.Emit(ValueOpcode::IAdd32, {Value(loop_phis[i]), dag_v});
+    const auto next_v = fixture.Emit(ValueOpcode::SelectU32, {bit, added, Value(loop_phis[i])});
+    loop_phis[i]->AddPhiOperand(preheader, init_v);
+    loop_phis[i]->AddPhiOperand(loop_body, next_v);
+  }
+
+  const auto in_range = fixture.Emit(ValueOpcode::IEqual32, {Value(&ind), Value(2u)});
+  const auto keep_sel = fixture.Emit(ValueOpcode::SelectU32, {in_range, ud2, ud3});
+  fixture.Emit(ValueOpcode::ReferenceU32, {keep_sel});
+
+  const auto out_range = fixture.Emit(ValueOpcode::IEqual32, {Value(&ind), Value(99u)});
+  const auto dead_val = fixture.Emit(ValueOpcode::UndefU32);
+  const auto dead_sel = fixture.Emit(ValueOpcode::SelectU32, {out_range, dead_val, ud2});
+  fixture.Emit(ValueOpcode::ReferenceU32, {dead_sel});
+  fixture.Emit(ValueOpcode::ReferenceU32, {Value(loop_phis[3])});
+
+  const auto start = std::chrono::steady_clock::now();
+  fixture.PlanAndTrack();
+  const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now() - start)
+                              .count();
+  Check(elapsed_ms < 500, "deep multi-loop inductive selector tracking exceeded 500 ms");
+  bool dead_sel_present = false;
+  bool keep_sel_present = false;
+  for (const auto *blk : fixture.program.blocks) {
+    for (const auto &inst : *blk) {
+      if (&inst == dead_sel.TryInstruction() && inst.HasUses()) dead_sel_present = true;
+      if (&inst == keep_sel.TryInstruction() && inst.HasUses()) keep_sel_present = true;
+    }
+  }
+  Check(!dead_sel_present, "out-of-range inductive selector arm was not folded");
+  Check(keep_sel_present, "in-range inductive selector was unexpectedly folded");
+}
+
+void TestValidateRuntimeValueSccAndMaskedDag() {
+  {
+    Fixture fixture;
+    auto *entry = fixture.block;
+    auto *hdr = fixture.AddBlock();
+    auto *body = fixture.AddBlock();
+    entry->AddBranch(hdr);
+    entry->terminator = {
+        .kind = Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Branch,
+        .true_block = hdr};
+    hdr->AddBranch(body);
+    hdr->terminator = {
+        .kind = Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Branch,
+        .true_block = body};
+    body->AddBranch(hdr);
+    body->terminator = {
+        .kind = Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Branch,
+        .true_block = hdr};
+
+    fixture.block = entry;
+    const auto ud0 = fixture.UserData(0);
+    const auto ud1 = fixture.UserData(1);
+    const auto ud2 = fixture.UserData(2);
+    const auto lane = fixture.Emit(ValueOpcode::LaneId);
+    const auto mask = fixture.Emit(ValueOpcode::ULessThan32, {lane, Value(32u)});
+
+    auto &cyc_phi = hdr->AppendNewInst(ValueOpcode::Phi);
+    cyc_phi.SetFlags(Type::U32);
+    const auto cyc_next = fixture.Emit(ValueOpcode::IAdd32, {Value(&cyc_phi), ud2}, 0, body);
+    cyc_phi.AddPhiOperand(entry, ud1);
+    cyc_phi.AddPhiOperand(body, cyc_next);
+
+    fixture.block = body;
+    Value dep_dag = Value(&cyc_phi);
+    Value mask_dag = ud0;
+    for (uint32_t i = 0; i < 48u; ++i) {
+      const auto dep_sum = fixture.Emit(ValueOpcode::IAdd32, {dep_dag, Value(1u)});
+      dep_dag = fixture.Emit(ValueOpcode::BitwiseXor32, {dep_dag, dep_sum});
+      const auto inc = fixture.Emit(ValueOpcode::IAdd32, {mask_dag, Value(1u)});
+      mask_dag = fixture.Emit(ValueOpcode::SelectU32, {mask, inc, mask_dag});
+    }
+    const auto cycle_root = fixture.Emit(
+        ValueOpcode::ReadFirstLane,
+        {fixture.Emit(ValueOpcode::SelectU32, {mask, ud0, dep_dag}), mask});
+    const auto masked_root = fixture.Emit(ValueOpcode::ReadFirstLane, {mask_dag, mask});
+
+    ResourcePlan plan;
+    plan.stage = ShaderType::Compute;
+    plan.user_data_count = fixture.program.user_data_count;
+
+    const auto start = std::chrono::steady_clock::now();
+    Check(ValidateRuntimeValue(plan, cycle_root, RuntimeValueType::Integer),
+          "deep DAG above dependency cycle failed validation");
+    Check(ValidateRuntimeValue(plan, masked_root, RuntimeValueType::Integer),
+          "deep masked uniform DAG failed validation");
+    const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - start)
+                                .count();
+    Check(elapsed_ms < 500, "ValidateRuntimeValue deep DAG validation exceeded 500 ms");
+  }
+  {
+    Fixture fixture;
+    auto *entry = fixture.block;
+    auto *hdr = fixture.AddBlock();
+    auto *body = fixture.AddBlock();
+    entry->AddBranch(hdr);
+    entry->terminator = {
+        .kind = Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Branch,
+        .true_block = hdr};
+    hdr->AddBranch(body);
+    hdr->terminator = {
+        .kind = Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Branch,
+        .true_block = body};
+    body->AddBranch(hdr);
+    body->terminator = {
+        .kind = Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Branch,
+        .true_block = hdr};
+
+    fixture.block = entry;
+    const auto ud0 = fixture.UserData(0);
+    const auto lane = fixture.Emit(ValueOpcode::LaneId);
+    const auto mask = fixture.Emit(ValueOpcode::ULessThan32, {lane, Value(32u)});
+    MemoryInfo mem;
+    mem.kind = ResourceKind::Buffer;
+    mem.data_bits = 32;
+    mem.data_dwords = 4;
+    const auto mem_flags = fixture.AddMemory(mem, 0x100);
+    const auto buf_handle = fixture.Buffer({ud0, fixture.UserData(1), fixture.UserData(2),
+                                            fixture.UserData(3)}, 0x100);
+    const auto bad_load = fixture.Emit(
+        ValueOpcode::CompositeExtractU32x4,
+        {fixture.Emit(ValueOpcode::LoadBufferU32x4,
+                      {buf_handle, Value(0u), Value(0u), Value(0u), Value(true)}, mem_flags),
+         Value(0u)});
+
+    auto &phi_a = hdr->AppendNewInst(ValueOpcode::Phi);
+    phi_a.SetFlags(Type::U32);
+    auto &phi_b = hdr->AppendNewInst(ValueOpcode::Phi);
+    phi_b.SetFlags(Type::U32);
+    phi_a.AddPhiOperand(body, Value(&phi_b));
+    phi_a.AddPhiOperand(entry, bad_load);
+    phi_b.AddPhiOperand(body, Value(&phi_a));
+    phi_b.AddPhiOperand(entry, ud0);
+
+    fixture.block = body;
+    const auto root_ab = fixture.Emit(
+        ValueOpcode::ReadFirstLane,
+        {fixture.Emit(ValueOpcode::SelectU32,
+                      {mask, ud0, fixture.Emit(ValueOpcode::IAdd32, {Value(&phi_a), Value(&phi_b)})}),
+         mask});
+    const auto root_ba = fixture.Emit(
+        ValueOpcode::ReadFirstLane,
+        {fixture.Emit(ValueOpcode::SelectU32,
+                      {mask, ud0, fixture.Emit(ValueOpcode::IAdd32, {Value(&phi_b), Value(&phi_a)})}),
+         mask});
+
+    ResourcePlan plan;
+    plan.stage = ShaderType::Compute;
+    plan.user_data_count = fixture.program.user_data_count;
+    plan.memory_info = fixture.program.memory_info;
+
+    Check(!ValidateRuntimeValue(plan, root_ab, RuntimeValueType::ImmutableInteger),
+          "dependency cycle with invalid leaf passed ImmutableInteger validation (AB)");
+    Check(!ValidateRuntimeValue(plan, root_ba, RuntimeValueType::ImmutableInteger),
+          "dependency cycle with invalid leaf passed ImmutableInteger validation (BA)");
+  }
+}
+
 } // namespace
 
 int main() {
@@ -9893,6 +10118,8 @@ int main() {
     Run("live shader data collection", TestLiveShaderDataCollection);
     Run("resource limit", TestResourceLimitIsTransactional);
     Run("malformed memory kinds", TestMalformedMemoryKindsRejected);
+    Run("deep multi-loop inductive selector", TestInductiveSelectorConvergenceOnDeepMultiLoopDag);
+    Run("validate runtime value SCC and masked DAG", TestValidateRuntimeValueSccAndMaskedDag);
   } catch (const std::exception &exception) {
     std::cerr << "resource tracking test failed: " << exception.what() << '\n';
     return 1;

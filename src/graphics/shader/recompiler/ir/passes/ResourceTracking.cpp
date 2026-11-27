@@ -8,8 +8,8 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
-#include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <fmt/format.h>
 #include <functional>
 #include <map>
@@ -32,12 +32,19 @@ constexpr uint32_t SamplerDword3ReservedMask = 0x3ffff000u;
 
 // value and every value reaching it through Phi arms, each once, in depth-first order.
 std::vector<Value> PhiWeb(Value value) {
-	std::vector<Value> web;
-	std::vector<Value> pending {value};
+	std::vector<Value>              web;
+	std::vector<Value>              pending {value};
+	std::unordered_set<const Inst*> seen_insts;
+	std::vector<Value>              seen_other;
 	while (!pending.empty()) {
 		const auto current = pending.back().Resolve();
 		pending.pop_back();
-		if (std::ranges::find(web, current) != web.end()) continue;
+		if (const auto* inst = current.TryInstruction()) {
+			if (!seen_insts.insert(inst).second) continue;
+		} else {
+			if (std::ranges::find(seen_other, current) != seen_other.end()) continue;
+			seen_other.push_back(current);
+		}
 		web.push_back(current);
 		const auto* phi = current.TryInstruction();
 		if (phi == nullptr || phi->GetOpcode() != ValueOpcode::Phi) continue;
@@ -778,6 +785,10 @@ public:
 	    : m_program(program), m_decoded(decoded), m_native_cfg(native_cfg), m_input(input),
 	      m_scalar_writes(std::move(program.scalar_writes)), m_info(program.info) {
 		std::ranges::sort(m_scalar_writes, {}, &Program::ScalarWrite::pc);
+		m_block_index.reserve(m_program.blocks.size());
+		for (uint32_t i = 0; i < m_program.blocks.size(); ++i) {
+			m_block_index.emplace(m_program.blocks[i], i);
+		}
 		m_info.buffers.clear();
 		m_info.images.clear();
 		m_info.samplers.clear();
@@ -1837,16 +1848,35 @@ private:
 		return edge && edge->positive ? edge->condition : Value {};
 	}
 
+	struct BlockSet {
+		const std::unordered_map<const Block*, uint32_t>& index;
+		std::vector<uint8_t>                              seen;
+		std::unordered_set<const Block*>                  overflow;
+
+		BlockSet(const std::unordered_map<const Block*, uint32_t>& idx, size_t n)
+		    : index(idx), seen(n, 0u) {}
+
+		bool insert(const Block* b) {
+			if (const auto it = index.find(b); it != index.end() && it->second < seen.size()) {
+				if (seen[it->second] != 0u) return false;
+				seen[it->second] = 1u;
+				return true;
+			}
+			return overflow.insert(b).second;
+		}
+	};
+
 	bool GuardedOnEntry(const Block* block, const auto& stops, const auto& accepts) const {
+		BlockSet                  visited(m_block_index, m_program.blocks.size());
 		std::vector<const Block*> pending {block};
+		visited.insert(block);
 		for (size_t i = 0; i < pending.size(); ++i) {
 			const auto* current = pending[i];
 			if (stops(current) || current->ImmPredecessors().empty()) return false;
 			for (const auto* previous: current->ImmPredecessors()) {
 				const auto edge = ConditionalEdge(previous, current);
 				if (edge && accepts(*edge)) continue;
-				if (std::ranges::find(pending, previous) == pending.end())
-					pending.push_back(previous);
+				if (visited.insert(previous)) pending.push_back(previous);
 			}
 		}
 		return true;
@@ -2639,12 +2669,14 @@ private:
 	}
 
 	bool Reaches(const Block* from, const Block* to, const Block* stop = nullptr) const {
+		BlockSet                  visited(m_block_index, m_program.blocks.size());
 		std::vector<const Block*> pending {to};
+		visited.insert(to);
 		for (size_t index = 0; index < pending.size(); ++index) {
 			if (pending[index] == stop) continue;
 			if (pending[index] == from) return true;
 			for (const auto* previous: pending[index]->ImmPredecessors())
-				if (std::ranges::find(pending, previous) == pending.end()) pending.push_back(previous);
+				if (visited.insert(previous)) pending.push_back(previous);
 		}
 		return false;
 	}
@@ -2668,7 +2700,9 @@ private:
 		// such as an all-inactive or an all-nonzero bypass.
 		const auto* negated = SimplifyGuard(witness).TryInstruction();
 		const bool nonzero = negated != nullptr && negated->GetOpcode() == ValueOpcode::LogicalNot;
+		BlockSet                  visited(m_block_index, m_program.blocks.size());
 		std::vector<const Block*> pending {use};
+		visited.insert(use);
 		for (size_t index = 0; index < pending.size(); ++index) {
 			const auto* current = pending[index];
 			if (current == initial) continue;
@@ -2680,7 +2714,7 @@ private:
 					    (edge->positive ? nonzero && Implies(edge->condition, negated->Arg(0))
 					                    : Implies(witness, edge->condition))) continue;
 				}
-				if (std::ranges::find(pending, previous) == pending.end()) pending.push_back(previous);
+				if (visited.insert(previous)) pending.push_back(previous);
 			}
 		}
 		return true;
@@ -3364,6 +3398,84 @@ private:
 			}
 		}
 		if (candidate_selects.empty()) return;
+		const auto is_pos_range_op = [](const Inst* g) -> bool {
+			const auto op = g->GetOpcode();
+			if (op == ValueOpcode::ULessThan32 || op == ValueOpcode::ULessThanEqual32 ||
+			    op == ValueOpcode::UGreaterThan32 || op == ValueOpcode::UGreaterThanEqual32) {
+				return true;
+			}
+			return op == ValueOpcode::INotEqual32 &&
+			       (g->Arg(0).Resolve() == Value(0u) || g->Arg(1).Resolve() == Value(0u));
+		};
+		const auto is_neg_range_op = [](const Inst* g) -> bool {
+			const auto op = g->GetOpcode();
+			if (op == ValueOpcode::UGreaterThanEqual32 || op == ValueOpcode::UGreaterThan32 ||
+			    op == ValueOpcode::ULessThanEqual32 || op == ValueOpcode::ULessThan32) {
+				return true;
+			}
+			return op == ValueOpcode::IEqual32 &&
+			       (g->Arg(0).Resolve() == Value(0u) || g->Arg(1).Resolve() == Value(0u));
+		};
+		std::unordered_set<const Inst*> pred_atoms;
+		{
+			std::vector<const Inst*> work;
+			const auto               push_val = [&](Value v) {
+				if (const auto* inst = v.Resolve().TryInstruction()) work.push_back(inst);
+			};
+			for (const auto* block: m_program.blocks) {
+				for (const auto& inst: *block) {
+					if (inst.GetOpcode() == ValueOpcode::ReadFirstLane && inst.NumArgs() == 2u) {
+						push_val(inst.Arg(1));
+					}
+				}
+			}
+			for (const auto* sel: candidate_selects) {
+				push_val(sel->Arg(0));
+			}
+			while (!work.empty()) {
+				const auto* cur = work.back();
+				work.pop_back();
+				if (cur == nullptr || !pred_atoms.insert(cur).second) continue;
+				const auto op = cur->GetOpcode();
+				if (op == ValueOpcode::LogicalAnd || op == ValueOpcode::LogicalOr ||
+				    op == ValueOpcode::LogicalNot || op == ValueOpcode::Phi) {
+					for (size_t a = 0; a < cur->NumArgs(); ++a) push_val(cur->Arg(a));
+				}
+			}
+		}
+		std::unordered_map<const Inst*, bool> affect_cache;
+		const auto can_affect_inductive = [&](Value cond) -> bool {
+			cond = cond.Resolve();
+			if (cond.IsImmediate()) return true;
+			const auto* root = cond.TryInstruction();
+			if (root == nullptr) return false;
+			if (const auto found = affect_cache.find(root); found != affect_cache.end()) {
+				return found->second;
+			}
+			std::vector<const Inst*>        work {root};
+			std::unordered_set<const Inst*> seen;
+			bool                            relevant = false;
+			while (!work.empty()) {
+				const auto* cur = work.back();
+				work.pop_back();
+				if (cur == nullptr || !seen.insert(cur).second) continue;
+				if (is_pos_range_op(cur) || is_neg_range_op(cur) || pred_atoms.contains(cur)) {
+					relevant = true;
+					break;
+				}
+				const auto op = cur->GetOpcode();
+				if (op == ValueOpcode::LogicalAnd || op == ValueOpcode::LogicalOr ||
+				    op == ValueOpcode::LogicalNot) {
+					for (size_t a = 0; a < cur->NumArgs(); ++a) {
+						if (const auto* ch = cur->Arg(a).Resolve().TryInstruction()) {
+							work.push_back(ch);
+						}
+					}
+				}
+			}
+			affect_cache.emplace(root, relevant);
+			return relevant;
+		};
 
 		// Precompute exact Dominates bitset matching Tracker::Dominates(def, use).
 		const size_t n_blocks = m_program.blocks.size();
@@ -3611,15 +3723,17 @@ private:
 				const auto* g = pending.back();
 				pending.pop_back();
 				if (g == nullptr || !seen.insert(g).second) continue;
-				if (strictly_dominates(g->Parent(), target_blk)) {
-					cand.push_back(g);
-					continue;
-				}
 				const auto op = g->GetOpcode();
 				if (op == ValueOpcode::LogicalAnd) {
 					pending.push_back(g->Arg(1).Resolve().TryInstruction());
 					pending.push_back(g->Arg(0).Resolve().TryInstruction());
-				} else if (op == ValueOpcode::Phi && g->NumArgs() != 0u &&
+					continue;
+				}
+				if (strictly_dominates(g->Parent(), target_blk)) {
+					if (is_pos_range_op(g) || pred_atoms.contains(g)) cand.push_back(g);
+					continue;
+				}
+				if (op == ValueOpcode::Phi && g->NumArgs() != 0u &&
 				           g->NumPhiBlocks() == g->NumArgs()) {
 					for (size_t i = 0; i < g->NumArgs(); ++i) {
 						if (dominates_fast(g->Parent(), g->PhiBlock(i))) continue;
@@ -3631,22 +3745,25 @@ private:
 							const auto* x = sub_pending.back();
 							sub_pending.pop_back();
 							if (x == nullptr || !sub_seen.insert(x).second) continue;
-							if (strictly_dominates(x->Parent(), target_blk)) {
-								sub.push_back(x);
-								continue;
-							}
 							const auto xop = x->GetOpcode();
 							if (xop == ValueOpcode::LogicalAnd) {
 								sub_pending.push_back(x->Arg(1).Resolve().TryInstruction());
 								sub_pending.push_back(x->Arg(0).Resolve().TryInstruction());
-							} else if (xop == ValueOpcode::Phi) {
+								continue;
+							}
+							if (strictly_dominates(x->Parent(), target_blk)) {
+								sub.push_back(x);
+								continue;
+							}
+							if (xop == ValueOpcode::Phi) {
 								for (size_t j = x->NumArgs(); j-- > 0;) {
 									sub_pending.push_back(x->Arg(j).Resolve().TryInstruction());
 								}
 							}
 						}
 						for (const auto* s: sub) {
-							if (implies_guard(Value(const_cast<Inst*>(g)),
+							if ((is_pos_range_op(s) || pred_atoms.contains(s)) &&
+							    implies_guard(Value(const_cast<Inst*>(g)),
 							                  Value(const_cast<Inst*>(s)))) {
 								cand.push_back(s);
 							}
@@ -3672,8 +3789,11 @@ private:
 		        const Block* target_blk) -> std::vector<const Inst*> {
 			std::vector<const Inst*> out;
 			for (const auto* g: neg) {
-				if (g != nullptr && strictly_dominates(g->Parent(), target_blk) &&
-				    std::ranges::find(out, g) == out.end()) {
+				if (g == nullptr || !strictly_dominates(g->Parent(), target_blk)) continue;
+				const bool keep = is_neg_range_op(g) || pred_atoms.contains(g) ||
+				    (g->GetOpcode() == ValueOpcode::LogicalAnd &&
+				     can_affect_inductive(Value(const_cast<Inst*>(g))));
+				if (keep && std::ranges::find(out, g) == out.end()) {
 					out.push_back(g);
 				}
 			}
@@ -3786,19 +3906,45 @@ private:
 
 			auto operator<=>(const PhiKey&) const = default;
 		};
-		std::map<PhiKey, std::optional<Range>>                             phi_ranges;
+		std::map<PhiKey, uint32_t>                                         phi_id_map;
 		std::vector<PhiKey>                                                phi_order;
+		std::vector<std::optional<Range>>                                  phi_slots;
+		std::vector<std::pair<uint32_t, uint32_t>>                         widen_counts;
+		std::vector<std::vector<uint32_t>>                                 dependents;
+		std::vector<uint8_t>                                               queued;
+		std::deque<uint32_t>                                               worklist;
+		uint32_t                                                           current_phi_id = UINT32_MAX;
+		bool                                                               seeding_phis   = true;
 		std::map<std::pair<const Inst*, GuardState>, std::optional<Range>> eval_memo;
 		std::map<std::tuple<const Inst*, GuardState, bool>, bool>          pred_false_memo;
 		std::set<std::pair<const Inst*, GuardState>>                       visiting;
 
-		const auto pred_true = [&](Value cond, const GuardState& guards) {
-			cond = cond.Resolve();
-			if (cond.IsImmediate()) return cond.GetType() == Type::U1 && cond.U1();
-			for (const auto* p: guards.pos) {
-				if (implies_guard(Value(const_cast<Inst*>(p)), cond)) return true;
+		const auto pred_true = [&](Value root_cond, const GuardState& guards) {
+			std::vector<Value> pending {root_cond};
+			while (!pending.empty()) {
+				const auto cond = pending.back().Resolve();
+				pending.pop_back();
+				if (cond.IsImmediate()) {
+					if (cond.GetType() == Type::U1 && cond.U1()) continue;
+					return false;
+				}
+				bool matched = false;
+				for (const auto* p: guards.pos) {
+					if (implies_guard(Value(const_cast<Inst*>(p)), cond)) {
+						matched = true;
+						break;
+					}
+				}
+				if (matched) continue;
+				const auto* ci = cond.TryInstruction();
+				if (ci != nullptr && ci->GetOpcode() == ValueOpcode::LogicalAnd) {
+					pending.push_back(ci->Arg(1));
+					pending.push_back(ci->Arg(0));
+					continue;
+				}
+				return false;
 			}
-			return false;
+			return true;
 		};
 
 		enum class TaskStep : uint8_t {
@@ -3824,6 +3970,7 @@ private:
 			const Inst*          inst         = nullptr;
 			bool                 optimistic   = false;
 			bool                 in_visiting  = false;
+			bool                 dep_on_cycle = false;
 			std::optional<Range> range_a;
 			std::optional<Range> range_b;
 			size_t               guard_idx    = 0u;
@@ -3846,21 +3993,26 @@ private:
 			std::optional<Range> last_range;
 			bool                 last_bool = false;
 
-			const auto finish_eval = [&](Task& t, std::optional<Range> res) {
+			const auto finish_eval = [&](Task& t, std::optional<Range> res,
+			                             bool hit_cycle = false) {
+				const bool cycle = t.dep_on_cycle || hit_cycle;
 				if (t.in_visiting) {
 					const auto mk = std::pair {t.inst, t.guards};
 					visiting.erase(mk);
-					eval_memo.emplace(mk, res);
+					if (!cycle) eval_memo.emplace(mk, res);
 				}
 				last_range = res;
 				stack.pop_back();
+				if (!stack.empty()) stack.back().dep_on_cycle |= cycle;
 			};
-			const auto finish_pred = [&](Task& t, bool res) {
-				if (t.inst != nullptr && visiting.empty()) {
+			const auto finish_pred = [&](Task& t, bool res, bool hit_cycle = false) {
+				const bool cycle = t.dep_on_cycle || hit_cycle;
+				if (t.inst != nullptr && !cycle) {
 					pred_false_memo.emplace(std::tuple {t.inst, t.guards, t.optimistic}, res);
 				}
 				last_bool = res;
 				stack.pop_back();
+				if (!stack.empty()) stack.back().dep_on_cycle |= cycle;
 			};
 			const auto push_eval = [&](Value v, const GuardState& g) {
 				stack.push_back(Task {.step = TaskStep::EvalEnter, .v = v, .guards = g});
@@ -3906,7 +4058,7 @@ private:
 							break;
 						}
 						if (!visiting.insert(mk).second) {
-							finish_eval(t, Range {});
+							finish_eval(t, Range {}, true);
 							break;
 						}
 						t.in_visiting = true;
@@ -3917,10 +4069,31 @@ private:
 								const auto   inv_neg =
 								    invariant_neg_guards(t.guards.neg, inst->Parent());
 								const PhiKey key {inst, inv, inv_neg};
-								const auto [it, inserted] =
-								    phi_ranges.try_emplace(key, std::nullopt);
-								if (inserted) phi_order.push_back(key);
-								start_refine(t, it->second);
+								if (!seeding_phis) {
+									const auto found = phi_id_map.find(key);
+									start_refine(t, found != phi_id_map.end()
+									                    ? phi_slots[found->second]
+									                    : std::optional<Range> {Range {}});
+									break;
+								}
+								const auto [it, inserted] = phi_id_map.try_emplace(
+								    key, static_cast<uint32_t>(phi_order.size()));
+								const uint32_t id = it->second;
+								if (inserted) {
+									phi_order.push_back(key);
+									phi_slots.push_back(std::nullopt);
+									widen_counts.emplace_back(0u, 0u);
+									dependents.emplace_back();
+									queued.push_back(1u);
+									worklist.push_back(id);
+								}
+								if (current_phi_id != UINT32_MAX) {
+									auto& deps = dependents[id];
+									if (std::ranges::find(deps, current_phi_id) == deps.end()) {
+										deps.push_back(current_phi_id);
+									}
+								}
+								start_refine(t, phi_slots[id]);
 								break;
 							}
 							case ValueOpcode::ReadFirstLane: {
@@ -3992,13 +4165,24 @@ private:
 							break;
 						}
 						t.step = TaskStep::EvalSelectTrueArm;
-						push_eval(inst->Arg(1), add_guard(t.guards, inst->Arg(0), Value {}));
+						const auto next_guards = can_affect_inductive(inst->Arg(0))
+						                             ? add_guard(t.guards, inst->Arg(0), Value {})
+						                             : t.guards;
+						push_eval(inst->Arg(1), next_guards);
 						break;
 					}
 					case TaskStep::EvalSelectTrueArm: {
+						if (last_range && last_range->low == 0u &&
+						    last_range->high == UINT32_MAX) {
+							start_refine(t, last_range);
+							break;
+						}
 						t.range_a = last_range;
 						t.step    = TaskStep::EvalSelectFalseArm;
-						push_eval(t.inst->Arg(2), add_guard(t.guards, Value {}, t.inst->Arg(0)));
+						const auto next_guards = can_affect_inductive(t.inst->Arg(0))
+						                             ? add_guard(t.guards, Value {}, t.inst->Arg(0))
+						                             : t.guards;
+						push_eval(t.inst->Arg(2), next_guards);
 						break;
 					}
 					case TaskStep::EvalSelectFalseArm: {
@@ -4334,66 +4518,73 @@ private:
 			pred_false(select->Arg(0), empty_guards, true);
 		}
 
-		std::map<PhiKey, std::pair<uint32_t, uint32_t>> widen_counts;
-		bool                                            changed = true;
-		while (changed) {
+		while (!worklist.empty()) {
+			const uint32_t id = worklist.front();
+			worklist.pop_front();
+			queued[id] = 0u;
+			auto& cur_slot = phi_slots[id];
+			if (cur_slot && cur_slot->low == 0u && cur_slot->high == UINT32_MAX) continue;
 			eval_memo.clear();
 			pred_false_memo.clear();
-			changed = false;
-			for (size_t idx = 0; idx < phi_order.size(); ++idx) {
-				const auto  key = phi_order[idx];
-				const auto* phi = key.phi;
-				GuardState  guards;
-				guards.pos = key.pos;
-				guards.neg = key.neg;
-				guards     = expand_guards(std::move(guards));
-				std::optional<Range> joined;
-				if (!guards.contradictory) {
-					const bool has_blocks = phi->NumPhiBlocks() == phi->NumArgs();
-					for (size_t arm = 0; arm < phi->NumArgs(); ++arm) {
-						GuardState arm_guards = guards;
-						if (has_blocks) {
-							const Block* pred = phi->PhiBlock(arm);
-							if (IsUnreachablePhiEdge(pred, phi->Parent())) continue;
-							const Block* to = phi->Parent();
-							for (uint32_t hop = 0u; hop < 8u && pred != nullptr; ++hop) {
-								if (const auto edge = ConditionalEdge(pred, to);
-								    edge && edge->lanes == LaneQuantifier::All) {
-									const auto pos_add =
-									    edge->positive ? edge->condition : Value {};
-									const auto neg_add =
-									    edge->positive ? Value {} : edge->condition;
-									arm_guards = add_guard(arm_guards, pos_add, neg_add);
-									if (arm_guards.contradictory) break;
-								}
-								if (pred->ImmPredecessors().size() != 1u) break;
-								to   = pred;
-								pred = pred->ImmPredecessors()[0];
+			current_phi_id = id;
+			const auto  key = phi_order[id];
+			const auto* phi = key.phi;
+			GuardState  guards;
+			guards.pos = key.pos;
+			guards.neg = key.neg;
+			guards     = expand_guards(std::move(guards));
+			std::optional<Range> joined;
+			if (!guards.contradictory) {
+				const bool has_blocks = phi->NumPhiBlocks() == phi->NumArgs();
+				for (size_t arm = 0; arm < phi->NumArgs(); ++arm) {
+					GuardState arm_guards = guards;
+					if (has_blocks) {
+						const Block* pred = phi->PhiBlock(arm);
+						if (IsUnreachablePhiEdge(pred, phi->Parent())) continue;
+						const Block* to = phi->Parent();
+						for (uint32_t hop = 0u; hop < 8u && pred != nullptr; ++hop) {
+							if (const auto edge = ConditionalEdge(pred, to);
+							    edge && edge->lanes == LaneQuantifier::All) {
+								const auto pos_add = edge->positive ? edge->condition : Value {};
+								const auto neg_add = edge->positive ? Value {} : edge->condition;
+								arm_guards         = add_guard(arm_guards, pos_add, neg_add);
+								if (arm_guards.contradictory) break;
 							}
-							if (arm_guards.contradictory) continue;
+							if (pred->ImmPredecessors().size() != 1u) break;
+							to   = pred;
+							pred = pred->ImmPredecessors()[0];
 						}
-						const auto arm_range = eval_range(phi->Arg(arm), arm_guards);
-						if (!arm_range) continue;
-						if (!joined) joined = arm_range;
-						else {
-							joined->low  = std::min(joined->low, arm_range->low);
-							joined->high = std::max(joined->high, arm_range->high);
-						}
+						if (arm_guards.contradictory) continue;
 					}
+					const auto arm_range = eval_range(phi->Arg(arm), arm_guards);
+					if (!arm_range) continue;
+					if (!joined) joined = arm_range;
+					else {
+						joined->low  = std::min(joined->low, arm_range->low);
+						joined->high = std::max(joined->high, arm_range->high);
+					}
+					if (joined->low == 0u && joined->high == UINT32_MAX) break;
 				}
-				auto& slot = phi_ranges.at(key);
-				if (joined && slot) {
-					auto& [lo_widen, hi_widen] = widen_counts[key];
-					if (joined->low < slot->low && ++lo_widen > 32u) joined->low = 0u;
-					if (joined->high > slot->high && ++hi_widen > 32u) joined->high = UINT32_MAX;
-				}
-				if (joined != slot) {
-					slot    = joined;
-					changed = true;
+			}
+			current_phi_id = UINT32_MAX;
+			auto& slot     = phi_slots[id];
+			if (joined && slot) {
+				auto& [lo_widen, hi_widen] = widen_counts[id];
+				if (joined->low < slot->low && ++lo_widen > 32u) joined->low = 0u;
+				if (joined->high > slot->high && ++hi_widen > 32u) joined->high = UINT32_MAX;
+			}
+			if (joined != slot) {
+				slot = joined;
+				for (const uint32_t dep: dependents[id]) {
+					if (queued[dep] == 0u) {
+						queued[dep] = 1u;
+						worklist.push_back(dep);
+					}
 				}
 			}
 		}
 
+		seeding_phis = false;
 		eval_memo.clear();
 		pred_false_memo.clear();
 		bool folded_any = false;
@@ -6387,6 +6578,7 @@ private:
 	std::vector<IndirectDescriptorPlan>             m_indirect_descriptors;
 	std::map<const Inst*, Value>              m_descriptor_values;
 	mutable std::unordered_map<const Inst*, bool>   m_loop_proofs; // By loop-bound comparison.
+	std::unordered_map<const Block*, uint32_t>    m_block_index;
 	bool                                       m_shader_writes      = false;
 	bool                                       m_has_address_writes = false;
 };

@@ -10,7 +10,9 @@
 #include <bit>
 #include <cstring>
 #include <deque>
+#include <limits>
 #include <map>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -268,26 +270,129 @@ private:
 		bool             require_uniform  = true;
 		RuntimeValueType type             = RuntimeValueType::Integer;
 		Value            saved_mask;
-		bool             has_saved_mask   = false;
-		size_t           saved_lane_reads = 0;
-		size_t           arg_index        = 0;
-		bool             in_visiting      = false;
-		bool             tail_only        = false;
+		bool             has_saved_mask       = false;
+		size_t           arg_index            = 0;
+		bool             in_visiting          = false;
+		bool             tail_only            = false;
+		bool             dep_on_uniform_cycle = false;
+		uint32_t         mask_context         = 0;
+		size_t           stack_depth          = 0;
+		size_t           lowlink              = std::numeric_limits<size_t>::max();
+		size_t           pending_base         = 0;
 	};
 
 	std::unordered_set<const Inst*>& VisitingSet(RuntimeValueType type) {
-		return type == RuntimeValueType::Any ? m_visiting_any : m_visiting;
+		return type == RuntimeValueType::Any ? m_visiting_any_uniform : m_visiting_uniform;
 	}
 
-	std::unordered_set<const Inst*>& ValidatedSet(RuntimeValueType type, bool require_uniform) {
-		if (type == RuntimeValueType::Any) {
-			return require_uniform ? m_validated_any_uniform : m_validated_any_deps;
-		}
-		return require_uniform ? m_validated_uniform : m_validated_dependencies;
+	std::unordered_map<const Inst*, size_t>& VisitingDepDepths(RuntimeValueType type) {
+		return type == RuntimeValueType::Any ? m_visiting_any_dep_depths : m_visiting_dep_depths;
+	}
+
+	std::unordered_set<const Inst*>& ValidatedDepSet(RuntimeValueType type) {
+		return type == RuntimeValueType::Any ? m_validated_any_deps : m_validated_dependencies;
+	}
+
+	std::unordered_set<const Inst*>& InvalidDepSet(RuntimeValueType type) {
+		return type == RuntimeValueType::Any ? m_invalid_any_deps : m_invalid_dependencies;
+	}
+
+	std::map<std::pair<const Inst*, uint32_t>, bool>& UniformMemo(RuntimeValueType type) {
+		return type == RuntimeValueType::Any ? m_any_uniform_memo : m_uniform_memo;
+	}
+
+	uint32_t MaskContext(Value mask) {
+		mask = mask.Resolve();
+		if (mask.IsEmpty()) return 0u;
+		const auto found = std::ranges::find(m_masks, mask);
+		if (found != m_masks.end()) return static_cast<uint32_t>(found - m_masks.begin());
+		m_masks.push_back(mask);
+		return static_cast<uint32_t>(m_masks.size() - 1u);
 	}
 
 	bool ValidateIterative(Value root) {
-		std::vector<ValidateFrame> stack;
+		std::unordered_set<const Inst*> in_cycle;
+		{
+			struct SccNode {
+				uint32_t index    = UINT32_MAX;
+				uint32_t lowlink  = UINT32_MAX;
+				bool     on_stack = false;
+			};
+			struct TarjanFrame {
+				const Inst* inst = nullptr;
+				size_t      edge = 0;
+			};
+			std::unordered_map<const Inst*, SccNode> info;
+			std::vector<const Inst*>                 scc_stack;
+			std::vector<TarjanFrame>                 dfs;
+			uint32_t                                 next_index = 0;
+			if (const auto* root_inst = root.Resolve().TryInstruction()) {
+				info.emplace(root_inst, SccNode {.index = 0u, .lowlink = 0u, .on_stack = true});
+				next_index = 1u;
+				scc_stack.push_back(root_inst);
+				dfs.push_back({.inst = root_inst, .edge = 0u});
+			}
+			while (!dfs.empty()) {
+				auto&       f        = dfs.back();
+				const auto  n_args   = f.inst->NumArgs();
+				const bool  is_rc    = f.inst->GetOpcode() == ValueOpcode::ReadConst && n_args == 2u;
+				const bool  has_more = f.edge < n_args || (f.edge == n_args && is_rc);
+				if (has_more) {
+					const Inst* ch = nullptr;
+					if (f.edge < n_args) {
+						ch = f.inst->Arg(f.edge++).Resolve().TryInstruction();
+					} else {
+						++f.edge;
+						const auto slot = f.inst->Arg(1).Resolve();
+						if (slot.IsImmediate() && slot.GetType() == Type::U32 &&
+						    slot.U32() < m_program.srt_reads.size()) {
+							ch = m_program.srt_reads[slot.U32()].value.Resolve().TryInstruction();
+						}
+					}
+					if (ch == nullptr) continue;
+					const auto [it, inserted] = info.try_emplace(ch);
+					if (inserted) {
+						it->second = {.index = next_index, .lowlink = next_index, .on_stack = true};
+						++next_index;
+						scc_stack.push_back(ch);
+						dfs.push_back({.inst = ch, .edge = 0u});
+					} else {
+						if (ch == f.inst) in_cycle.insert(f.inst);
+						if (it->second.on_stack) {
+							auto& cur   = info[f.inst];
+							cur.lowlink = std::min(cur.lowlink, it->second.index);
+						}
+					}
+					continue;
+				}
+				const auto* done = f.inst;
+				dfs.pop_back();
+				const auto& done_info = info[done];
+				if (!dfs.empty()) {
+					auto& parent_info   = info[dfs.back().inst];
+					parent_info.lowlink = std::min(parent_info.lowlink, done_info.lowlink);
+				}
+				if (done_info.lowlink == done_info.index) {
+					size_t count = 0;
+					while (true) {
+						const auto* w = scc_stack.back();
+						scc_stack.pop_back();
+						info[w].on_stack = false;
+						++count;
+						if (w == done) break;
+						in_cycle.insert(w);
+					}
+					if (count > 1u) in_cycle.insert(done);
+				}
+			}
+		}
+		std::vector<ValidateFrame>                        stack;
+		std::vector<std::pair<const Inst*, RuntimeValueType>> scc_pending;
+		std::unordered_map<const Inst*, size_t>               tentative_dep_valid;
+		std::unordered_map<const Inst*, size_t>               tentative_any_valid;
+		const auto tentative_map = [&](RuntimeValueType type) -> std::unordered_map<const Inst*, size_t>& {
+			return type == RuntimeValueType::Any ? tentative_any_valid : tentative_dep_valid;
+		};
 		stack.push_back(ValidateFrame {
 		    .step            = ValidateFrame::Step::Enter,
 		    .value           = root,
@@ -296,20 +401,57 @@ private:
 		});
 		bool last_result = false;
 
-		const auto finish_frame = [&](ValidateFrame& frame, bool valid) {
+		const auto finish_frame = [&](ValidateFrame& frame, bool valid,
+		                              size_t hit_cycle_depth =
+		                                  std::numeric_limits<size_t>::max(),
+		                              bool hit_uniform_cycle = false) {
+			size_t     propagate_lowlink = std::numeric_limits<size_t>::max();
+			const bool uniform_cycle =
+			    frame.require_uniform && (frame.dep_on_uniform_cycle || hit_uniform_cycle);
 			if (frame.has_saved_mask) {
 				m_active_mask = frame.saved_mask;
 			}
 			if (frame.in_visiting) {
-				VisitingSet(frame.type).erase(frame.inst);
-				const bool cacheable = !frame.require_uniform || m_active_mask.IsEmpty();
-				if (valid && cacheable &&
-				    (!frame.require_uniform || frame.saved_lane_reads == m_lane_reads)) {
-					ValidatedSet(frame.type, frame.require_uniform).insert(frame.inst);
+				if (frame.require_uniform) {
+					VisitingSet(frame.type).erase(frame.inst);
+					if (!uniform_cycle && !in_cycle.contains(frame.inst)) {
+						UniformMemo(frame.type).emplace(
+						    std::pair {frame.inst, frame.mask_context}, valid);
+					}
+				} else {
+					VisitingDepDepths(frame.type).erase(frame.inst);
+					const size_t eff_low = std::min(frame.lowlink, hit_cycle_depth);
+					if (!valid) {
+						InvalidDepSet(frame.type).insert(frame.inst);
+						for (size_t i = frame.pending_base; i < scc_pending.size(); ++i) {
+							tentative_map(scc_pending[i].second).erase(scc_pending[i].first);
+						}
+						scc_pending.resize(frame.pending_base);
+					} else if (eff_low >= frame.stack_depth) {
+						ValidatedDepSet(frame.type).insert(frame.inst);
+						for (size_t i = frame.pending_base; i < scc_pending.size(); ++i) {
+							tentative_map(scc_pending[i].second).erase(scc_pending[i].first);
+							ValidatedDepSet(scc_pending[i].second).insert(scc_pending[i].first);
+						}
+						scc_pending.resize(frame.pending_base);
+					} else {
+						tentative_map(frame.type).insert_or_assign(frame.inst, eff_low);
+						scc_pending.emplace_back(frame.inst, frame.type);
+						propagate_lowlink = eff_low;
+					}
 				}
+			} else if (!frame.require_uniform) {
+				propagate_lowlink = hit_cycle_depth;
 			}
 			last_result = valid;
 			stack.pop_back();
+			if (!stack.empty()) {
+				if (stack.back().require_uniform) {
+					stack.back().dep_on_uniform_cycle |= uniform_cycle;
+				} else if (propagate_lowlink < stack.back().lowlink) {
+					stack.back().lowlink = propagate_lowlink;
+				}
+			}
 		};
 
 		const auto push_child = [&](Value v, bool req_unif, RuntimeValueType ty) {
@@ -354,23 +496,48 @@ private:
 					finish_frame(frame, ok);
 					continue;
 				}
-				frame.value = value;
-				frame.inst  = inst;
-				if (frame.require_uniform && MaskImplies(m_active_mask, value)) {
-					finish_frame(frame, true);
-					continue;
+				frame.value       = value;
+				frame.inst        = inst;
+				frame.stack_depth = stack.size() - 1u;
+				if (frame.require_uniform) {
+					if (MaskImplies(m_active_mask, value)) {
+						finish_frame(frame, true);
+						continue;
+					}
+					frame.mask_context = MaskContext(m_active_mask);
+					const auto& memo   = UniformMemo(frame.type);
+					if (const auto found = memo.find(std::pair {inst, frame.mask_context});
+					    found != memo.end()) {
+						finish_frame(frame, found->second);
+						continue;
+					}
+					if (!VisitingSet(frame.type).insert(inst).second) {
+						finish_frame(frame, false, std::numeric_limits<size_t>::max(), true);
+						continue;
+					}
+				} else {
+					if (ValidatedDepSet(frame.type).contains(inst)) {
+						finish_frame(frame, true);
+						continue;
+					}
+					if (InvalidDepSet(frame.type).contains(inst)) {
+						finish_frame(frame, false);
+						continue;
+					}
+					const auto& tmap = tentative_map(frame.type);
+					if (const auto t_it = tmap.find(inst); t_it != tmap.end()) {
+						finish_frame(frame, true, t_it->second);
+						continue;
+					}
+					const auto [it, inserted] =
+					    VisitingDepDepths(frame.type).try_emplace(inst, frame.stack_depth);
+					if (!inserted) {
+						finish_frame(frame, true, it->second);
+						continue;
+					}
+					frame.pending_base = scc_pending.size();
 				}
-				const bool cacheable = !frame.require_uniform || m_active_mask.IsEmpty();
-				if (cacheable && ValidatedSet(frame.type, frame.require_uniform).contains(inst)) {
-					finish_frame(frame, true);
-					continue;
-				}
-				if (!VisitingSet(frame.type).insert(inst).second) {
-					finish_frame(frame, !frame.require_uniform);
-					continue;
-				}
-				frame.in_visiting      = true;
-				frame.saved_lane_reads = m_lane_reads;
+				frame.in_visiting = true;
 
 				const auto op = inst->GetOpcode();
 				if (frame.type == RuntimeValueType::ImmutableInteger &&
@@ -481,7 +648,6 @@ private:
 					continue;
 				}
 				if (op == ValueOpcode::ReadFirstLane) {
-					++m_lane_reads;
 					if (inst->NumArgs() != 2 || inst->Arg(0).GetType() != Type::U32 ||
 					    inst->Arg(1).GetType() != Type::U1) {
 						finish_frame(frame, false);
@@ -689,13 +855,17 @@ private:
 	RuntimeValueType                m_type;
 	bool                            m_wave_uniform;
 	Value                           m_active_mask;
-	std::unordered_set<const Inst*> m_visiting;
-	std::unordered_set<const Inst*> m_visiting_any;
-	std::unordered_set<const Inst*> m_validated_dependencies;
-	std::unordered_set<const Inst*> m_validated_uniform;
-	std::unordered_set<const Inst*> m_validated_any_deps;
-	std::unordered_set<const Inst*> m_validated_any_uniform;
-	size_t                          m_lane_reads = 0;
+	std::vector<Value>                              m_masks {Value {}};
+	std::unordered_set<const Inst*>                 m_visiting_uniform;
+	std::unordered_set<const Inst*>                 m_visiting_any_uniform;
+	std::unordered_map<const Inst*, size_t>         m_visiting_dep_depths;
+	std::unordered_map<const Inst*, size_t>         m_visiting_any_dep_depths;
+	std::unordered_set<const Inst*>                 m_validated_dependencies;
+	std::unordered_set<const Inst*>                 m_validated_any_deps;
+	std::unordered_set<const Inst*>                 m_invalid_dependencies;
+	std::unordered_set<const Inst*>                 m_invalid_any_deps;
+	std::map<std::pair<const Inst*, uint32_t>, bool> m_uniform_memo;
+	std::map<std::pair<const Inst*, uint32_t>, bool> m_any_uniform_memo;
 };
 
 // Emits one x86 function per plan. Each value, per EXEC-mask context, is a memoized thunk with a
