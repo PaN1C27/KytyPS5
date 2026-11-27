@@ -360,6 +360,15 @@ struct TextureCacheTestAccess {
     cache.m_gc_tick += frames;
   }
 
+  static void SetGcThresholds(TextureCache &cache, uint64_t trigger,
+                              uint64_t pressure = UINT64_MAX,
+                              uint64_t critical = UINT64_MAX) {
+    cache.m_trigger_gc_memory = trigger;
+    cache.m_pressure_gc_memory = pressure;
+    cache.m_critical_gc_memory = critical;
+    cache.m_total_used_memory = UINT64_MAX / 2;
+  }
+
   static std::unique_lock<TrackingSpinLock> Lock(TextureCache &cache) {
     return std::unique_lock(cache.m_lock);
   }
@@ -5783,8 +5792,8 @@ public:
       constexpr uint64_t page_fault_offset = page_owner_offset + 0x100;
       constexpr uint64_t page_inside_offset =
           page_owner_offset + page_size - sizeof(uint32_t);
-      // The 512 KiB readback window is clamped to the owner's start.
-      constexpr uint64_t download_window = 0x80000;
+      // The 64 KiB readback window stops before the next window.
+      constexpr uint64_t download_window = 0x10000;
       constexpr uint64_t page_window_offset =
           page_owner_offset + download_window - sizeof(uint32_t);
       constexpr uint64_t page_outside_offset =
@@ -6465,6 +6474,67 @@ public:
       cache.ReadMemory(base + reacquire_disjoint_offset,
                        sizeof(reacquire_value));
 
+      constexpr uint64_t wf_owner_offset = 0x2400000;
+      constexpr uint64_t wf_owner_size = 0x20000;
+      constexpr uint64_t wf_fault_offset = wf_owner_offset + 0x100;
+      constexpr uint64_t wf_4k_neighbor = wf_owner_offset + 0x1100;
+      constexpr uint64_t wf_64k_neighbor = wf_owner_offset + 0x10100;
+      constexpr uint32_t wf_stale = 0x0badf00du;
+      constexpr uint32_t wf_fault_value = 0x11223344u;
+      constexpr uint32_t wf_4k_value = 0x55667788u;
+      constexpr uint32_t wf_64k_value = 0x99aabbccu;
+      std::memcpy(memory + wf_fault_offset, &wf_stale, sizeof(wf_stale));
+      std::memcpy(memory + wf_4k_neighbor, &wf_stale, sizeof(wf_stale));
+      std::memcpy(memory + wf_64k_neighbor, &wf_stale, sizeof(wf_stale));
+      auto wf_owner =
+          cache.ObtainBuffer(base + wf_owner_offset, wf_owner_size, false);
+      Require(name, "write fault owner", wf_owner.first != nullptr,
+              "failed to allocate 128 KiB write-fault test owner");
+      const auto write_gpu_dword = [&](uint64_t offset, uint32_t value) {
+        (void)cache.ObtainBuffer(base + offset, sizeof(value), true, false);
+        cache.FillBuffer(base + offset, sizeof(value), value, false);
+      };
+      write_gpu_dword(wf_fault_offset, wf_fault_value);
+      write_gpu_dword(wf_4k_neighbor, wf_4k_value);
+      write_gpu_dword(wf_64k_neighbor, wf_64k_value);
+      Require(name, "write fault invalidate",
+              resources.InvalidateMemory(base + wf_fault_offset,
+                                         sizeof(wf_fault_value)),
+              "write-fault InvalidateMemory returned false");
+      uint32_t wf_fault_backing = 0;
+      uint32_t wf_4k_backing = 0;
+      uint32_t wf_64k_backing = 0;
+      Require(name, "write fault 64 KiB coalescing and isolation",
+              Libs::LibKernel::Memory::TryReadBacking(
+                  base + wf_fault_offset, &wf_fault_backing,
+                  sizeof(wf_fault_backing)) &&
+                  wf_fault_backing == wf_fault_value &&
+                  !cache.IsRegionGpuModified(base + wf_fault_offset,
+                                             sizeof(wf_fault_value)) &&
+                  Libs::LibKernel::Memory::TryReadBacking(
+                      base + wf_4k_neighbor, &wf_4k_backing,
+                      sizeof(wf_4k_backing)) &&
+                  wf_4k_backing == wf_4k_value &&
+                  !cache.IsRegionGpuModified(base + wf_4k_neighbor,
+                                             sizeof(wf_4k_value)) &&
+                  cache.IsRegionGpuModified(base + wf_64k_neighbor,
+                                            sizeof(wf_64k_value)) &&
+                  Libs::LibKernel::Memory::TryReadBacking(
+                      base + wf_64k_neighbor, &wf_64k_backing,
+                      sizeof(wf_64k_backing)) &&
+                  wf_64k_backing == wf_stale,
+              "write-fault ReadMemory failed 64 KiB coalescing or downloaded beyond 64 KiB window");
+      cache.ReadMemory(base + wf_64k_neighbor, sizeof(wf_64k_value), false);
+      uint32_t wf_64k_after = 0;
+      Require(name, "write fault 64 KiB neighbor publish",
+              Libs::LibKernel::Memory::TryReadBacking(
+                  base + wf_64k_neighbor, &wf_64k_after,
+                  sizeof(wf_64k_after)) &&
+                  wf_64k_after == wf_64k_value &&
+                  !cache.IsRegionGpuModified(base + wf_64k_neighbor,
+                                             sizeof(wf_64k_value)),
+              "CPU ReadMemory failed to publish 64 KiB neighbor");
+
       resources.UnmapMemory(base, allocation_size);
       scheduler.Finish();
     }
@@ -7013,6 +7083,36 @@ public:
       Require(name, "frame aging",
               !TextureCacheTestAccess::Contains(textures, released[0]),
               "an alias kept a heap image unused for 17 frames");
+
+      TextureCacheTestAccess::SetGcThresholds(textures, 0u);
+      write(2, descriptor(45, Format::k8_8_8_8UNorm));
+      Require(name, "lru release acquire", heap.Acquire(small_request, view),
+              "the small table was declined for LRU release test");
+      draw();
+      const auto gc_released =
+          TextureCacheTestAccess::FindImages(textures, texture(45), 64u);
+      Require(name, "lru release pinned",
+              gc_released.size() == 1u &&
+                  textures.GetImage(gc_released[0]).heap_refs.load() == 1u,
+              "resolved descriptor was not heap-pinned before skip");
+      TextureCacheTestAccess::SkipFrames(textures, 165u);
+      write(2, {});
+      Require(name, "lru release unpin", heap.Acquire(small_request, view),
+              "the small table was declined when releasing descriptor");
+      draw();
+      Require(name, "lru release unpinned",
+              textures.GetImage(gc_released[0]).heap_refs.load() == 0u,
+              "overwriting descriptor did not drop heap_refs");
+      textures.RunGarbageCollector();
+      Require(name, "lru release survived",
+              TextureCacheTestAccess::Contains(textures, gc_released[0]),
+              "released heap image was evicted immediately by TextureCache GC");
+      TextureCacheTestAccess::SkipFrames(textures, 161u);
+      textures.RunGarbageCollector();
+      Require(name, "lru release aged",
+              !TextureCacheTestAccess::Contains(textures, gc_released[0]),
+              "released heap image survived past 160 frames after release");
+
       context.UnmapMemory(base, idle_table - base);
       scheduler.Finish();
       device.destroyPipelineLayout(layout, nullptr);

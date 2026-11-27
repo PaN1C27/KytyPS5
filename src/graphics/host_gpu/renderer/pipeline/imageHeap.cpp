@@ -351,11 +351,13 @@ void ImageHeap::Release(uint32_t entry) {
 	if (index == 0u || --m_elements[index].refs != 0u) return;
 	auto& element = m_elements[index];
 	Mark(index, State::Stale);
-	auto& textures = m_context.GetTextureCache();
+	auto&            textures = m_context.GetTextureCache();
+	std::scoped_lock lock {textures.m_lock};
 	if (auto* image = textures.m_slot_images.try_get(element.image);
 	    image != nullptr && image->serial == element.serial) {
 		image->heap_refs.fetch_sub(1u, std::memory_order_relaxed);
 		image->tick_accessed_last = textures.m_gc_tick;
+		textures.TouchImage(*image);
 	}
 	m_released.push_back(index);
 }
