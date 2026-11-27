@@ -75,6 +75,27 @@ struct ImageDefinition {
 	uint32_t sampled_type = 0;
 };
 
+struct IndirectResourceGroup {
+	uint32_t resource   = 0;
+	uint32_t count      = 0;
+	bool     needs_slot = false;
+};
+
+struct IndirectResourcePlan {
+	std::vector<IndirectResourceGroup> groups;
+	std::vector<uint32_t>              ordinal_groups;
+	std::vector<uint32_t>              ordinal_slots;
+	std::vector<uint8_t>               ordinal_needs_slot;
+	uint32_t                           transition_count = 0;
+	uint32_t                           map_offset       = UINT32_MAX;
+	bool                               dynamic_slot     = false;
+};
+
+struct SelectedIndirectGroup {
+	uint32_t group_index = 0;
+	uint32_t slot        = 0;
+};
+
 struct EmitterState {
 	EmitterState(IR::Program& program_, ShaderStageInputInfo input_info_, const Profile& profile_)
 	    : builder(program_.stage == ShaderType::Mesh ? 0x00010400u : 0x00010300u),
@@ -171,6 +192,7 @@ struct EmitterState {
 	std::vector<InputBinding>  inputs;
 	std::vector<OutputBinding> outputs;
 	std::vector<uint32_t>      interface_variables;
+	std::unordered_map<const IR::Inst*, IndirectResourcePlan> indirect_plans;
 };
 
 uint32_t TypeVoid(EmitterState& state);
@@ -399,6 +421,8 @@ inline constexpr auto EmitAddU32 = EmitNative<spv::OpIAdd, IR::Type::U32, uint32
 uint32_t EmitBinaryU32(EmitterState& state, spv::Op opcode, uint32_t lhs, uint32_t rhs);
 
 uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index);
+uint32_t EmitShaderDataDwordLoadDynamic(EmitterState& state, uint32_t base_dword,
+                                        uint32_t dynamic_offset);
 uint32_t EmitPushDataLoad(EmitterState& state, uint32_t index);
 
 uint32_t StorageBufferPackedStride(const EmitterState& state, const IR::MemoryInfo& mem);
@@ -406,6 +430,16 @@ uint32_t StorageBufferPackedStride(const EmitterState& state, const IR::MemoryIn
 Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::MemoryInfo& mem);
 
 uint32_t SharedIndirectBufferResource(const EmitterState& state, uint32_t resource);
+
+bool IsEmptyIndirectBufferCandidate(const EmitterState& state, uint32_t resource);
+IndirectResourcePlan BuildIndirectBufferPlan(const EmitterState& state,
+                                             const IR::MemoryInfo& mem);
+IndirectResourcePlan BuildIndirectImagePlan(const EmitterState& state, uint32_t root_resource,
+                                            bool is_image_write);
+void PlanIndirectResourceMaps(EmitterState& state);
+SelectedIndirectGroup SelectIndirectResourceGroup(EmitterState& state,
+                                                  const IndirectResourcePlan& plan,
+                                                  uint32_t selected);
 
 void EmitMemoryBindings(EmitterState& state);
 

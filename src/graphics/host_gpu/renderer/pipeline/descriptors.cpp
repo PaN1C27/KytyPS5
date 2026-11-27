@@ -850,6 +850,8 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		prepared.shader_data[layout.MemorySizeDword() + index] =
 		    static_cast<uint32_t>(prepared.buffer_sources[index].size + buffer_offset);
 	}
+	std::ranges::copy(layout.indirect_map,
+	                  prepared.shader_data.begin() + layout.IndirectMapDword());
 	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::FlattenedSrt)] != 0) {
 		prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
 	}

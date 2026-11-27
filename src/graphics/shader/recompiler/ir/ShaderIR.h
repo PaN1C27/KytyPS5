@@ -510,6 +510,7 @@ struct Bindings {
 	uint32_t dispatch_thread_dword = PushData::NoStart;
 	uint32_t ray_query_dword       = PushData::NoStart; // Device address of the context.
 	uint32_t memory_offset_dword = 0;
+	std::vector<uint32_t> indirect_map;
 
 	// Packed 8-bit binding offsets, then each binding's bound range in bytes: OpArrayLength
 	// reads 0 for ranges of 2 GiB or more on NVIDIA.
@@ -517,9 +518,12 @@ struct Bindings {
 		return memory_offset_dword +
 		       (descriptor_counts[static_cast<size_t>(DescriptorBindingKind::Buffers)] + 3u) / 4u;
 	}
-	[[nodiscard]] uint32_t ShaderDataDwords() const {
+	[[nodiscard]] uint32_t IndirectMapDword() const {
 		return MemorySizeDword() +
 		       descriptor_counts[static_cast<size_t>(DescriptorBindingKind::Buffers)];
+	}
+	[[nodiscard]] uint32_t ShaderDataDwords() const {
+		return IndirectMapDword() + static_cast<uint32_t>(indirect_map.size());
 	}
 	[[nodiscard]] bool UsesPushData() const {
 		return push_data_start_dword != PushData::NoStart;

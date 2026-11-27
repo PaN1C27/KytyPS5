@@ -296,18 +296,14 @@ auto EmitBufferAccess(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInf
 	auto& state = ctx.state;
 	constexpr bool has_result = !std::is_void_v<
 	    std::invoke_result_t<Fn, const IR::MemoryInfo&, const MemoryResourceAccess&>>;
-	const auto access = [&](uint32_t resource) {
+	const auto access = [&](uint32_t resource, uint32_t array_index = 0u) {
 		mem.resource = resource;
-		if (mem.kind == IR::ResourceKind::Buffer) {
-			const auto& buffer = state.program.info.buffers[resource];
-			if (buffer.packed_stride == 0u &&
-			    buffer.source < state.program.descriptor_sources.size() &&
-			    state.program.descriptor_sources[buffer.source].indirect_descriptor) {
-				// Empty candidates still carry the format/swizzle needed for OOB loads.
-				return emit(mem, MemoryResourceAccess{});
-			}
+		if (mem.kind == IR::ResourceKind::Buffer &&
+		    IsEmptyIndirectBufferCandidate(state, resource)) {
+			// Empty candidates still carry the format/swizzle needed for OOB loads.
+			return emit(mem, MemoryResourceAccess{});
 		}
-		return emit(mem, PrepareMemoryResourceAccess(state, mem));
+		return emit(mem, PrepareMemoryResourceAccess(state, mem, array_index));
 	};
 	if (mem.kind != IR::ResourceKind::Buffer ||
 	    state.program.info.buffers[mem.resource].indirect_root != mem.resource) {
@@ -333,13 +329,31 @@ auto EmitBufferAccess(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInf
 			mem.resource = representative;
 			return emit(mem, PrepareMemoryResourceAccess(state, mem, slot));
 		}
-		return EmitIndexSwitch(state, selected, buffer.indirect_resources.size(),
-		                       has_result ? TypeU32Composite(state, components) : 0u,
-		                       [&](uint32_t item) { return access(buffer.indirect_resources[item]); });
+		if (buffer.indirect_resources.empty()) {
+			if constexpr (has_result) {
+				return ConstantU32CompositeZero(state, components);
+			} else {
+				return;
+			}
+		}
+		const auto plan_it = state.indirect_plans.find(&inst);
+		IndirectResourcePlan fallback_plan;
+		if (plan_it == state.indirect_plans.end()) {
+			fallback_plan = BuildIndirectBufferPlan(state, mem);
+		}
+		const auto& plan = plan_it != state.indirect_plans.end() ? plan_it->second : fallback_plan;
+		const auto [group_index, slot] = SelectIndirectResourceGroup(state, plan, selected);
+		const auto EmitGroup = [&](uint32_t index) {
+			const auto& group = plan.groups[index];
+			return access(group.resource, group.needs_slot ? slot : 0u);
+		};
+		return plan.groups.size() == 1u
+		           ? EmitGroup(0u)
+		           : EmitIndexSwitch(state, group_index,
+		                             static_cast<uint32_t>(plan.groups.size()),
+		                             has_result ? TypeU32Composite(state, components) : 0u,
+		                             EmitGroup);
 	};
-	if constexpr (!has_result) {
-		if (!shared) return selected_access();
-	}
 	auto valid = Binary(state, spv::OpULessThan, TypeBool(state), selected,
 	                          ConstantU32(state, buffer.indirect_resources.size()));
 	if constexpr (has_result) {

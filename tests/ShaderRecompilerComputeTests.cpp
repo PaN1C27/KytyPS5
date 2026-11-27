@@ -2027,6 +2027,9 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
     packed_user_data[result.program.bindings.memory_offset_dword + index / 4u] |=
         offset << ((index % 4u) * 8u);
   }
+  std::ranges::copy(
+      result.program.bindings.indirect_map,
+      packed_user_data.begin() + result.program.bindings.IndirectMapDword());
   return {std::move(result.spirv), std::move(result.program),
           std::move(resources), std::move(packed_user_data)};
 }
@@ -20925,6 +20928,8 @@ public:
       write.pBufferInfo = buffer_infos.data();
       writes.push_back(write);
     }
+    std::ranges::copy(layout.indirect_map,
+                      shader_data.begin() + layout.IndirectMapDword());
     if (Count(Kind::FlattenedSrt) != 0) {
       flattened_buffer =
           CreateStorageBuffer(test.name, compiled.resources.flattened_srt,

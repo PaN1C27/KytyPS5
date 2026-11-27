@@ -32,6 +32,16 @@ uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index) {
 	return EmitShaderDataDwordLoadAt(state, ConstantU32(state, dword_index));
 }
 
+uint32_t EmitShaderDataDwordLoadDynamic(EmitterState& state, uint32_t base_dword,
+                                        uint32_t dynamic_offset) {
+	const auto& bindings = state.program.bindings;
+	if (bindings.UsesPushData()) {
+		base_dword += bindings.push_data_start_dword;
+	}
+	return EmitShaderDataDwordLoadAt(
+	    state, EmitAddU32(state, ConstantU32(state, base_dword), dynamic_offset));
+}
+
 uint32_t EmitBinaryU32(EmitterState& state, spv::Op opcode, uint32_t lhs, uint32_t rhs) {
 	const auto ret = state.builder.AllocateId();
 	state.builder.AddFunction(opcode, TypeU32(state), ret, lhs, rhs);
@@ -152,6 +162,259 @@ uint32_t SharedIndirectBufferResource(const EmitterState& state, uint32_t resour
 		if (ordinal != 0u) next_child_slot = candidate.descriptor_index + 1u;
 	}
 	return representative;
+}
+
+bool IsEmptyIndirectBufferCandidate(const EmitterState& state, uint32_t resource) {
+	const auto& candidate = state.program.info.buffers[resource];
+	return candidate.packed_stride == 0u &&
+	       candidate.source < state.program.descriptor_sources.size() &&
+	       state.program.descriptor_sources[candidate.source].indirect_descriptor.has_value();
+}
+
+static void FinalizeIndirectPlan(IndirectResourcePlan& plan) {
+	plan.dynamic_slot = std::ranges::any_of(plan.groups, [](const IndirectResourceGroup& group) {
+		return group.needs_slot;
+	});
+	plan.ordinal_needs_slot.resize(plan.ordinal_groups.size());
+	for (uint32_t ordinal = 0; ordinal < plan.ordinal_groups.size(); ++ordinal) {
+		plan.ordinal_needs_slot[ordinal] =
+		    plan.groups[plan.ordinal_groups[ordinal]].needs_slot ? 1u : 0u;
+	}
+	uint32_t previous_bias = 0u;
+	bool has_previous_bias = false;
+	for (uint32_t ordinal = 0; ordinal < plan.ordinal_groups.size(); ++ordinal) {
+		const bool needs_slot = plan.ordinal_needs_slot[ordinal] != 0u;
+		const uint32_t bias = plan.ordinal_slots[ordinal] - ordinal;
+		if (ordinal != 0u) {
+			const bool select_group =
+			    plan.ordinal_groups[ordinal] != plan.ordinal_groups[ordinal - 1u];
+			const bool select_slot =
+			    plan.dynamic_slot && needs_slot && (!has_previous_bias || bias != previous_bias);
+			if (select_group || select_slot) {
+				++plan.transition_count;
+			}
+		}
+		if (needs_slot) {
+			previous_bias = bias;
+			has_previous_bias = true;
+		}
+	}
+}
+
+IndirectResourcePlan BuildIndirectBufferPlan(const EmitterState& state,
+                                             const IR::MemoryInfo& mem) {
+	const auto& buffers = state.program.info.buffers;
+	const auto& sources = state.program.descriptor_sources;
+	const auto& root = buffers.at(mem.resource);
+	const bool check_format_swizzle = mem.formatted && !mem.typed;
+	const auto IsIndexed = [&](uint32_t resource) {
+		const auto& buf = buffers[resource];
+		return buf.source < sources.size() && sources[buf.source].indirect_descriptor &&
+		       sources[buf.source].indirect_descriptor->indexed;
+	};
+	const auto SameGroup = [&](uint32_t lhs, uint32_t rhs) {
+		const bool lhs_empty = IsEmptyIndirectBufferCandidate(state, lhs);
+		const bool rhs_empty = IsEmptyIndirectBufferCandidate(state, rhs);
+		if (lhs_empty != rhs_empty) return false;
+		const auto& first = buffers[lhs];
+		const auto& second = buffers[rhs];
+		if (check_format_swizzle &&
+		    (first.descriptor_format != second.descriptor_format ||
+		     first.descriptor_swizzle != second.descriptor_swizzle)) {
+			return false;
+		}
+		if (lhs_empty) return true;
+		auto first_mem = mem;
+		auto second_mem = mem;
+		first_mem.resource = lhs;
+		second_mem.resource = rhs;
+		return first.packed_stride == second.packed_stride &&
+		       IR::StorageBufferElementBits(state.program, first_mem) ==
+		           IR::StorageBufferElementBits(state.program, second_mem) &&
+		       IsIndexed(lhs) == IsIndexed(rhs);
+	};
+	IndirectResourcePlan plan;
+	plan.ordinal_groups.reserve(root.indirect_resources.size());
+	plan.ordinal_slots.reserve(root.indirect_resources.size());
+	for (const auto resource : root.indirect_resources) {
+		const bool empty = IsEmptyIndirectBufferCandidate(state, resource);
+		const uint32_t slot = empty ? 0u : buffers[resource].descriptor_index;
+		EXIT_IF(!empty && slot == UINT32_MAX);
+		const auto found = std::ranges::find_if(plan.groups, [&](const IndirectResourceGroup& group) {
+			return SameGroup(resource, group.resource);
+		});
+		plan.ordinal_groups.push_back(static_cast<uint32_t>(found - plan.groups.begin()));
+		plan.ordinal_slots.push_back(slot);
+		if (found == plan.groups.end()) {
+			plan.groups.push_back({resource, 1u, false});
+		} else {
+			++found->count;
+		}
+	}
+	for (auto& group : plan.groups) {
+		group.needs_slot = !IsEmptyIndirectBufferCandidate(state, group.resource) && group.count > 1u;
+	}
+	FinalizeIndirectPlan(plan);
+	return plan;
+}
+
+IndirectResourcePlan BuildIndirectImagePlan(const EmitterState& state, uint32_t root_resource,
+                                            bool is_image_write) {
+	const auto& images = state.program.info.images;
+	const auto& root = images.at(root_resource);
+	const auto SameType = [&](uint32_t lhs, uint32_t rhs) {
+		const auto& first = images[lhs];
+		const auto& second = images[rhs];
+		return first.dimension == second.dimension && first.cube == second.cube &&
+		       IR::DescriptorBindingForImage(first) == IR::DescriptorBindingForImage(second) &&
+		       (!is_image_write || first.shader_swizzle == second.shader_swizzle) &&
+		       first.mip_count == 1u && second.mip_count == 1u;
+	};
+	IndirectResourcePlan plan;
+	plan.ordinal_groups.reserve(root.indirect_resources.size());
+	plan.ordinal_slots.reserve(root.indirect_resources.size());
+	for (const auto resource : root.indirect_resources) {
+		const uint32_t slot = images[resource].descriptor_index;
+		EXIT_IF(slot == UINT32_MAX);
+		const auto found = std::ranges::find_if(plan.groups, [&](const IndirectResourceGroup& group) {
+			return SameType(resource, group.resource);
+		});
+		plan.ordinal_groups.push_back(static_cast<uint32_t>(found - plan.groups.begin()));
+		plan.ordinal_slots.push_back(slot);
+		if (found == plan.groups.end()) {
+			plan.groups.push_back({resource, 1u, false});
+		} else {
+			++found->count;
+		}
+	}
+	for (auto& group : plan.groups) {
+		group.needs_slot = group.count > 1u;
+	}
+	FinalizeIndirectPlan(plan);
+	return plan;
+}
+
+void PlanIndirectResourceMaps(EmitterState& state) {
+	constexpr uint32_t MaxInlineIndirectTransitions = 8u;
+	auto& indirect_map = state.program.bindings.indirect_map;
+	const auto InternMap = [&](IndirectResourcePlan& plan) {
+		if (plan.transition_count <= MaxInlineIndirectTransitions ||
+		    plan.ordinal_groups.empty()) {
+			return;
+		}
+		std::vector<uint32_t> entries(plan.ordinal_groups.size());
+		for (size_t ordinal = 0; ordinal < plan.ordinal_groups.size(); ++ordinal) {
+			const uint32_t group_index = plan.ordinal_groups[ordinal];
+			const uint32_t slot = plan.ordinal_slots[ordinal];
+			EXIT_IF(group_index >= (1u << 12u) || slot >= (1u << 20u));
+			entries[ordinal] = (group_index << 20u) | (slot & 0xfffffu);
+		}
+		const auto match = std::ranges::search(indirect_map, entries);
+		if (!match.empty()) {
+			plan.map_offset = static_cast<uint32_t>(match.begin() - indirect_map.begin());
+			return;
+		}
+		plan.map_offset = static_cast<uint32_t>(indirect_map.size());
+		indirect_map.insert(indirect_map.end(), entries.begin(), entries.end());
+	};
+	ValueEmitContext ctx(state);
+	for (const auto* block : state.program.blocks) {
+		for (const auto& inst : *block) {
+			const auto op = inst.GetOpcode();
+			const auto buffer_components = IR::BufferComponentCount(op);
+			const auto buffer_access = IR::BufferAccessOf(op);
+			if (buffer_components != 0u && op != IR::ValueOpcode::ReadConstBuffer) {
+				const auto& mem = ctx.Memory(inst);
+				const bool enters_emit_buffer_access =
+				    buffer_access == IR::BufferAccess::Write ||
+				    buffer_components > 1u ||
+				    (op == IR::ValueOpcode::LoadBufferU32 && mem.formatted);
+				if (enters_emit_buffer_access && mem.kind == IR::ResourceKind::Buffer) {
+					const auto& buf = state.program.info.buffers.at(mem.resource);
+					if (buf.indirect_root == mem.resource &&
+					    !buf.indirect_resources.empty() &&
+					    SharedIndirectBufferResource(state, mem.resource) == UINT32_MAX) {
+						auto plan = BuildIndirectBufferPlan(state, mem);
+						InternMap(plan);
+						state.indirect_plans.emplace(&inst, std::move(plan));
+					}
+				}
+			}
+			const auto image_info = IR::ImageOpcodeInfoOf(op);
+			if (image_info.access != IR::ImageAccess::None &&
+			    image_info.access != IR::ImageAccess::Atomic) {
+				const auto& mem = ctx.Memory(inst);
+				const auto& image = state.program.info.images.at(mem.resource);
+				if (!image.heap && image.indirect_root == mem.resource &&
+				    image.indirect_resources.size() >= 2u) {
+					auto plan = BuildIndirectImagePlan(
+					    state, mem.resource, op == IR::ValueOpcode::ImageWrite);
+					InternMap(plan);
+					state.indirect_plans.emplace(&inst, std::move(plan));
+				}
+			}
+		}
+	}
+}
+
+SelectedIndirectGroup SelectIndirectResourceGroup(EmitterState& state,
+                                                  const IndirectResourcePlan& plan,
+                                                  uint32_t selected) {
+	if (plan.map_offset != UINT32_MAX) {
+		const auto clamped = EmitUMin32(
+		    state, selected,
+		    ConstantU32(state, static_cast<uint32_t>(plan.ordinal_groups.size() - 1u)));
+		const auto packed = EmitShaderDataDwordLoadDynamic(
+		    state, state.program.bindings.IndirectMapDword() + plan.map_offset, clamped);
+		const auto group_index =
+		    plan.groups.size() > 1u
+		        ? Binary(state, spv::OpShiftRightLogical, TypeU32(state), packed,
+		                 ConstantU32(state, 20u))
+		        : ConstantU32(state, 0u);
+		const auto slot =
+		    plan.dynamic_slot
+		        ? Binary(state, spv::OpBitwiseAnd, TypeU32(state), packed,
+		                 ConstantU32(state, 0xfffffu))
+		        : 0u;
+		return {group_index, slot};
+	}
+	auto group_index = ConstantU32(state, 0u);
+	uint32_t initial_bias = 0u;
+	bool has_previous_bias = false;
+	for (uint32_t ordinal = 0; ordinal < plan.ordinal_groups.size(); ++ordinal) {
+		if (plan.ordinal_needs_slot[ordinal] != 0u) {
+			initial_bias = plan.ordinal_slots[ordinal] - ordinal;
+			has_previous_bias = true;
+			break;
+		}
+	}
+	auto slot_bias = ConstantU32(state, initial_bias);
+	uint32_t previous_bias = initial_bias;
+	for (uint32_t ordinal = 1; ordinal < plan.ordinal_groups.size(); ++ordinal) {
+		const bool needs_slot = plan.ordinal_needs_slot[ordinal] != 0u;
+		const uint32_t bias = plan.ordinal_slots[ordinal] - ordinal;
+		const bool select_group =
+		    plan.ordinal_groups[ordinal] != plan.ordinal_groups[ordinal - 1u];
+		const bool select_slot =
+		    plan.dynamic_slot && needs_slot && (!has_previous_bias || bias != previous_bias);
+		if (needs_slot) {
+			previous_bias = bias;
+			has_previous_bias = true;
+		}
+		if (!select_group && !select_slot) continue;
+		const auto at_or_after = Binary(state, spv::OpUGreaterThanEqual, TypeBool(state),
+		                                selected, ConstantU32(state, ordinal));
+		if (select_group) {
+			group_index = Select(state, TypeU32(state), at_or_after,
+			                     ConstantU32(state, plan.ordinal_groups[ordinal]), group_index);
+		}
+		if (select_slot) {
+			slot_bias = Select(state, TypeU32(state), at_or_after,
+			                   ConstantU32(state, bias), slot_bias);
+		}
+	}
+	const auto slot = plan.dynamic_slot ? EmitAddU32(state, selected, slot_bias) : 0u;
+	return {group_index, slot};
 }
 
 void EmitMemoryBindings(EmitterState& state) {

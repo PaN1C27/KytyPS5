@@ -698,57 +698,21 @@ auto EmitImageAccess(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t resul
 	}
 	const auto selected = EmitIndirectResourceIndex(
 	    state, key, image.indirect_mapping_offset, image.indirect_search_iterations, 0u);
-	const auto SameType = [&](uint32_t lhs, uint32_t rhs) {
-		const auto& first = state.program.info.images[lhs];
-		const auto& second = state.program.info.images[rhs];
-		return first.dimension == second.dimension && first.cube == second.cube &&
-		       IR::DescriptorBindingForImage(first) == IR::DescriptorBindingForImage(second) &&
-		       (inst.GetOpcode() != IR::ValueOpcode::ImageWrite ||
-		        first.shader_swizzle == second.shader_swizzle) &&
-		       first.mip_count == 1u && second.mip_count == 1u;
-	};
-	// Descriptor order is unrelated to image type. Share each typed access and
-	// select its descriptor slot independently, including gaps between native roots.
-	struct ImageGroup { uint32_t resource; uint32_t count; };
-	std::vector<ImageGroup> groups;
-	std::vector<uint32_t> ordinal_groups;
-	for (const auto resource: image.indirect_resources) {
-		const auto found = std::ranges::find_if(groups, [&](const ImageGroup& group) {
-			return SameType(resource, group.resource);
-		});
-		ordinal_groups.push_back(static_cast<uint32_t>(found - groups.begin()));
-		if (found == groups.end()) groups.push_back({resource, 1u});
-		else ++found->count;
+	const auto plan_it = state.indirect_plans.find(&inst);
+	IndirectResourcePlan fallback_plan;
+	if (plan_it == state.indirect_plans.end()) {
+		fallback_plan = BuildIndirectImagePlan(
+		    state, mem.resource, inst.GetOpcode() == IR::ValueOpcode::ImageWrite);
 	}
-	const bool dynamic_slot = std::ranges::any_of(groups, [](const ImageGroup& group) {
-		return group.count > 1u;
-	});
-	auto group_index = ConstantU32(state, 0u);
-	auto slot_bias = ConstantU32(state, image.descriptor_index);
-	auto previous_bias = image.descriptor_index;
-	for (uint32_t ordinal = 1; ordinal < image.indirect_resources.size(); ++ordinal) {
-		const auto& candidate = state.program.info.images[image.indirect_resources[ordinal]];
-		const auto bias = candidate.descriptor_index - ordinal;
-		const bool select_group = ordinal_groups[ordinal] != ordinal_groups[ordinal - 1u];
-		const bool select_slot = dynamic_slot && bias != previous_bias;
-		previous_bias = bias;
-		if (!select_group && !select_slot) continue;
-		const auto at_or_after = Binary(state, spv::OpUGreaterThanEqual, TypeBool(state),
-		                               selected, ConstantU32(state, ordinal));
-		if (select_group) group_index = Select(state, TypeU32(state), at_or_after,
-		                                      ConstantU32(state, ordinal_groups[ordinal]), group_index);
-		if (select_slot) slot_bias = Select(state, TypeU32(state), at_or_after,
-		                                   ConstantU32(state, bias), slot_bias);
-	}
-	const auto slot = dynamic_slot
-	    ? Binary(state, spv::OpIAdd, TypeU32(state), selected, slot_bias) : 0u;
+	const auto& plan = plan_it != state.indirect_plans.end() ? plan_it->second : fallback_plan;
+	const auto [group_index, slot] = SelectIndirectResourceGroup(state, plan, selected);
 	const auto EmitGroup = [&](uint32_t index) {
-		const auto& group = groups[index];
-		return emit(group.resource, group.count == 1u ? 0u : slot);
+		const auto& group = plan.groups[index];
+		return emit(group.resource, group.needs_slot ? slot : 0u);
 	};
-	return groups.size() == 1u
+	return plan.groups.size() == 1u
 	           ? EmitGroup(0u)
-	           : EmitIndexSwitch(state, group_index, static_cast<uint32_t>(groups.size()),
+	           : EmitIndexSwitch(state, group_index, static_cast<uint32_t>(plan.groups.size()),
 	                             result_type, EmitGroup);
 }
 

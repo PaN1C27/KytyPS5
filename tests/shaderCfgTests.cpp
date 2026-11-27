@@ -14004,6 +14004,186 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
   CheckSpirvBlockSourceMapping(dispatcher_result);
 }
 
+void TestLargeMixedIndirectBufferAndImageUsesCompactShaderDataMap() {
+  using namespace ShaderRecompiler;
+  using namespace ShaderRecompiler::IR;
+
+  Program program;
+  program.stage = ShaderType::Compute;
+  program.wave_size = 32u;
+  program.srt_plan_complete = true;
+  program.resource_tracking_complete = true;
+  program.block_storage.push_back(std::make_unique<Block>());
+  auto *block = program.block_storage.back().get();
+  program.blocks.push_back(block);
+
+  auto &lane = block->AppendNewInst(ValueOpcode::LaneId);
+  auto &buf_selection =
+      block->AppendNewInst(ValueOpcode::GetBufferResourceIndex, {Value(&lane)});
+  buf_selection.SetFlags<uint32_t>(0u);
+  auto &buf_handle = block->AppendNewInst(
+      ValueOpcode::GetBufferResource,
+      {Value(&buf_selection), Value(0u), Value(0u), Value(0u)});
+  buf_handle.SetFlags<uint32_t>(0u);
+
+  auto &load0 = block->AppendNewInst(
+      ValueOpcode::LoadBufferU32x2,
+      {Value(&buf_handle), Value(&lane), Value(0u), Value(0u), Value(true)});
+  load0.SetFlags<MemoryFlags>({.index = 0u});
+  auto &load1 = block->AppendNewInst(
+      ValueOpcode::LoadBufferU32x2,
+      {Value(&buf_handle), Value(&lane), Value(8u), Value(0u), Value(true)});
+  load1.SetFlags<MemoryFlags>({.index = 0u});
+
+  auto &img_handle = block->AppendNewInst(
+      ValueOpcode::GetImageResource,
+      {Value(&lane), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
+       Value(0u), Value(0u)});
+  img_handle.SetFlags<uint32_t>(0u);
+  auto &smp_handle = block->AppendNewInst(
+      ValueOpcode::GetSamplerResource,
+      {Value(0u), Value(0u), Value(0u), Value(0u)});
+  smp_handle.SetFlags<uint32_t>(0u);
+  auto &addr = block->AppendNewInst(
+      ValueOpcode::MakeImageAddress,
+      {Value(0x3f000000u), Value(0x3f000000u), Value(0u), Value(0u), Value(0u),
+       Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
+       Value(0u), Value(0u)});
+
+  auto &sample0 = block->AppendNewInst(
+      ValueOpcode::ImageSampleRaw,
+      {Value(&img_handle), Value(&smp_handle), Value(&addr), Value(true)});
+  sample0.SetFlags<MemoryFlags>({.index = 1u});
+  auto &sample1 = block->AppendNewInst(
+      ValueOpcode::ImageSampleRaw,
+      {Value(&img_handle), Value(&smp_handle), Value(&addr), Value(true)});
+  sample1.SetFlags<MemoryFlags>({.index = 1u});
+
+  auto &load0_x = block->AppendNewInst(
+      ValueOpcode::CompositeExtractU32x2, {Value(&load0), Value(0u)});
+  auto &load1_x = block->AppendNewInst(
+      ValueOpcode::CompositeExtractU32x2, {Value(&load1), Value(0u)});
+  auto &sample0_x = block->AppendNewInst(
+      ValueOpcode::CompositeExtractU32x4, {Value(&sample0), Value(0u)});
+  auto &sample1_x = block->AppendNewInst(
+      ValueOpcode::CompositeExtractU32x4, {Value(&sample1), Value(0u)});
+  auto &mix0 = block->AppendNewInst(ValueOpcode::IAdd32,
+                                    {Value(&load0_x), Value(&load1_x)});
+  auto &mix1 = block->AppendNewInst(ValueOpcode::IAdd32,
+                                    {Value(&sample0_x), Value(&sample1_x)});
+  auto &out_word =
+      block->AppendNewInst(ValueOpcode::IAdd32, {Value(&mix0), Value(&mix1)});
+  auto &out_handle = block->AppendNewInst(
+      ValueOpcode::GetBufferResource,
+      {Value(0u), Value(0u), Value(0u), Value(0u)});
+  out_handle.SetFlags<uint32_t>(64u);
+  auto &out_store = block->AppendNewInst(
+      ValueOpcode::StoreBufferU32,
+      {Value(&out_handle), Value(0u), Value(&lane), Value(0u), Value(&out_word),
+       Value(true)});
+  out_store.SetFlags<MemoryFlags>({.index = 2u});
+
+  program.memory_info.push_back({.kind = ResourceKind::Buffer,
+                                 .data_dwords = 2u,
+                                 .data_bits = 32u,
+                                 .component_count = 2u,
+                                 .formatted = true,
+                                 .idxen = true});
+  program.memory_info.push_back({.kind = ResourceKind::Image,
+                                 .resource = 0u,
+                                 .sampler = 0u,
+                                 .dmask = 0x1u,
+                                 .data_dwords = 1u,
+                                 .data_bits = 32u,
+                                 .component_count = 4u,
+                                 .image_sample_flags = Decoder::ImageSampleFlagLevelZero,
+                                 .image_dimension = Decoder::ImageDimension::Dim2DArray,
+                                 .image_address_components = 3u});
+  program.memory_info.push_back({.kind = ResourceKind::Buffer,
+                                 .resource = 64u,
+                                 .data_dwords = 1u,
+                                 .data_bits = 32u,
+                                 .component_count = 1u,
+                                 .offen = true});
+
+  program.descriptor_sources.resize(3u);
+  program.descriptor_sources[0].indirect_descriptor =
+      DescriptorSource::IndirectDescriptor{.table_stride = 16u, .indexed = true};
+  program.descriptor_sources[1].indirect_descriptor =
+      DescriptorSource::IndirectDescriptor{.table_stride = 32u};
+
+  constexpr uint32_t CandidateCount = 64u;
+  program.info.buffers.resize(CandidateCount + 1u);
+  for (uint32_t i = 0; i < CandidateCount; ++i) {
+    auto &buf = program.info.buffers[i];
+    buf.source = 0u;
+    buf.read = true;
+    buf.formatted = true;
+    buf.indirect_root = 0u;
+    if (i == 0u) {
+      buf.packed_stride = 0u;
+      buf.descriptor_format = Prospero::BufferFormat::k32_32Float;
+      buf.indirect_mapping_offset = 0u;
+      buf.indirect_search_iterations = 6u;
+      buf.indirect_resources.resize(CandidateCount);
+      for (uint32_t j = 0; j < CandidateCount; ++j) buf.indirect_resources[j] = j;
+    } else if ((i & 1u) == 0u) {
+      buf.packed_stride = 16u;
+      buf.descriptor_format = Prospero::BufferFormat::k32_32Float;
+    } else {
+      buf.packed_stride = 8u;
+      buf.descriptor_format = Prospero::BufferFormat::k16_16Float;
+    }
+  }
+  auto &out_buf = program.info.buffers[CandidateCount];
+  out_buf.source = 2u;
+  out_buf.packed_stride = 4u;
+  out_buf.written = true;
+
+  program.info.images.resize(CandidateCount);
+  for (uint32_t i = 0; i < CandidateCount; ++i) {
+    auto &img = program.info.images[i];
+    img.source = 1u;
+    img.resource_class = ImageResourceClass::Sampled;
+    img.numeric_class = Prospero::TextureNumericClass::Float;
+    img.dimension = (i & 1u) == 0u ? Decoder::ImageDimension::Dim2D
+                                   : Decoder::ImageDimension::Dim2DArray;
+    img.mip_mode = ImageMipMode::None;
+    img.mip_count = 1u;
+    img.read = true;
+    img.indirect_root = 0u;
+    if (i == 0u) {
+      img.indirect_mapping_offset = 128u;
+      img.indirect_search_iterations = 6u;
+      img.indirect_resources.resize(CandidateCount);
+      for (uint32_t j = 0; j < CandidateCount; ++j) {
+        img.indirect_resources[j] = j;
+      }
+    }
+  }
+  program.info.samplers.push_back(SamplerResource{});
+
+  ShaderComputeInputInfo compute{};
+  compute.wave_size = 32u;
+  compute.host_subgroup_size = 32u;
+  compute.threads_num[0] = 32u;
+  compute.threads_num[1] = 1u;
+  compute.threads_num[2] = 1u;
+  CollectShaderInfo(program, {.compute = &compute});
+
+  const auto spirv = Spirv::EmitProgram(program, {.compute = &compute});
+  CheckSpirvBinaryValidates(spirv);
+  Check(program.bindings.indirect_map.size() == 128u,
+        "repeated 64-entry indirect buffer and image tables did not deduplicate in indirect_map");
+  Check(SpirvInstructionOpcodeCount(spirv, 251u) <= 4u,
+        "mixed indirect buffer/image shader emitted unexpected OpSwitch branching");
+  Check(spirv.size() < 8000u,
+        "mixed indirect buffer/image shader exploded in SPIR-V size instead of using indirect_map");
+  Check(SpirvContainsCapability(spirv, spv::CapabilityStorageBufferArrayNonUniformIndexing) &&
+            SpirvContainsCapability(spirv, spv::CapabilitySampledImageArrayNonUniformIndexing),
+        "compact mixed indirect emission missed required NonUniform indexing capabilities");
+}
+
 #include "ShaderRayTracingTests.inc"
 
 } // namespace
@@ -14231,6 +14411,7 @@ int main() {
   TestNewShaderRecompilerUnsupportedMemoryDecode();
 
   TestNewShaderRecompilerVop3LaneReadDestinationEncoding();
+  TestLargeMixedIndirectBufferAndImageUsesCompactShaderDataMap();
 
   return 0;
 }
