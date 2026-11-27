@@ -1096,15 +1096,23 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		index_end       = (index_source.address + size + 3u) & ~uint64_t {3};
 		(void)m_context.GetBufferCache().FindBuffer(index_begin, index_end - index_begin);
 	}
+	const uint64_t indirect_min_size =
+	    draw.indexed ? sizeof(vk::DrawIndexedIndirectCommand) : sizeof(vk::DrawIndirectCommand);
 	uint64_t indirect_args_size = 0;
 	if (emit.indirect.address != 0) {
-		const uint64_t min_size = draw.indexed ? sizeof(vk::DrawIndexedIndirectCommand)
-		                                       : sizeof(vk::DrawIndirectCommand);
+		if (!m_context.IsMapped(emit.indirect.address, indirect_min_size) ||
+		    (emit.indirect.count_address != 0 &&
+		     !m_context.IsMapped(emit.indirect.count_address, sizeof(uint32_t)))) {
+			return;
+		}
+		const uint64_t requested_size =
+		    static_cast<uint64_t>(emit.indirect.count - 1) * emit.indirect.stride +
+		    indirect_min_size;
 		indirect_args_size =
-		    static_cast<uint64_t>(emit.indirect.count - 1) * emit.indirect.stride + min_size;
-		indirect_args_size = std::max(
-		    Libs::LibKernel::Memory::ClampRangeSize(emit.indirect.address, indirect_args_size),
-		    min_size);
+		    Libs::LibKernel::Memory::ClampRangeSize(emit.indirect.address, requested_size);
+		if (indirect_args_size < indirect_min_size) {
+			return;
+		}
 		(void)m_context.GetBufferCache().FindBuffer(emit.indirect.address, indirect_args_size);
 		if (emit.indirect.count_address != 0) {
 			(void)m_context.GetBufferCache().FindBuffer(emit.indirect.count_address,
@@ -1137,10 +1145,18 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	}
 	std::pair<Buffer*, uint64_t> args_buffer {};
 	std::pair<Buffer*, uint64_t> count_buffer {};
+	uint32_t                     max_draw_count = emit.indirect.count;
 	if (emit.indirect.address != 0) {
 		args_buffer = m_context.GetBufferCache().ObtainBuffer(emit.indirect.address,
 		                                                      indirect_args_size, false);
 		EXIT_IF((args_buffer.second & 3u) != 0);
+		const uint64_t avail_bytes =
+		    std::min(indirect_args_size, args_buffer.first->Size() - args_buffer.second);
+		if (avail_bytes < indirect_min_size) {
+			return;
+		}
+		max_draw_count = static_cast<uint32_t>(std::min<uint64_t>(
+		    emit.indirect.count, (avail_bytes - indirect_min_size) / emit.indirect.stride + 1u));
 		if (emit.indirect.count_address != 0) {
 			count_buffer = m_context.GetBufferCache().ObtainBuffer(emit.indirect.count_address,
 			                                                       sizeof(uint32_t), false);
@@ -1236,7 +1252,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	auto&         occlusion_queries = m_context.GetOcclusionQueries();
 	const int32_t occlusion_query   = occlusion_queries.Begin(vk_buffer);
 	if (mesh_task) {
-		vk_buffer.drawMeshTasksEXT(emit.indirect.count, 1, 1);
+		vk_buffer.drawMeshTasksEXT(max_draw_count, 1, 1);
 	} else if (mesh_active) {
 		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 	} else if (args_buffer.first == nullptr) {
@@ -1245,18 +1261,18 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		if (draw.indexed) {
 			vk_buffer.drawIndexedIndirectCount(args_buffer.first->Handle(), args_buffer.second,
 			                                   count_buffer.first->Handle(), count_buffer.second,
-			                                   emit.indirect.count, emit.indirect.stride);
+			                                   max_draw_count, emit.indirect.stride);
 		} else {
 			vk_buffer.drawIndirectCount(args_buffer.first->Handle(), args_buffer.second,
 			                            count_buffer.first->Handle(), count_buffer.second,
-			                            emit.indirect.count, emit.indirect.stride);
+			                            max_draw_count, emit.indirect.stride);
 		}
 	} else if (draw.indexed) {
 		vk_buffer.drawIndexedIndirect(args_buffer.first->Handle(), args_buffer.second,
-		                              emit.indirect.count, emit.indirect.stride);
+		                              max_draw_count, emit.indirect.stride);
 	} else {
 		vk_buffer.drawIndirect(args_buffer.first->Handle(), args_buffer.second,
-		                       emit.indirect.count, emit.indirect.stride);
+		                       max_draw_count, emit.indirect.stride);
 	}
 	occlusion_queries.End(vk_buffer, occlusion_query);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Draws);

@@ -5787,13 +5787,13 @@ public:
               "wrapped fault batch lost contents of its download window");
 
       constexpr uint64_t page_size = TRACKER_PAGE_SIZE;
-      constexpr uint64_t page_owner_offset = 0x240000;
-      constexpr uint64_t page_owner_size = 0xc0000;
+      constexpr uint64_t page_owner_offset = 0x400000;
+      constexpr uint64_t page_owner_size = 0xc00000;
       constexpr uint64_t page_fault_offset = page_owner_offset + 0x100;
       constexpr uint64_t page_inside_offset =
           page_owner_offset + page_size - sizeof(uint32_t);
-      // The 64 KiB readback window stops before the next window.
-      constexpr uint64_t download_window = 0x10000;
+      // The 8 MiB readback window is clamped to the owner's start.
+      constexpr uint64_t download_window = 0x800000;
       constexpr uint64_t page_window_offset =
           page_owner_offset + download_window - sizeof(uint32_t);
       constexpr uint64_t page_outside_offset =
@@ -6474,11 +6474,11 @@ public:
       cache.ReadMemory(base + reacquire_disjoint_offset,
                        sizeof(reacquire_value));
 
-      constexpr uint64_t wf_owner_offset = 0x2400000;
-      constexpr uint64_t wf_owner_size = 0x20000;
+      constexpr uint64_t wf_owner_offset = 0x2900000;
+      constexpr uint64_t wf_owner_size = 0xc00000;
       constexpr uint64_t wf_fault_offset = wf_owner_offset + 0x100;
-      constexpr uint64_t wf_4k_neighbor = wf_owner_offset + 0x1100;
-      constexpr uint64_t wf_64k_neighbor = wf_owner_offset + 0x10100;
+      constexpr uint64_t wf_4k_neighbor = wf_owner_offset + 0x100000;
+      constexpr uint64_t wf_64k_neighbor = wf_owner_offset + 0x800100;
       constexpr uint32_t wf_stale = 0x0badf00du;
       constexpr uint32_t wf_fault_value = 0x11223344u;
       constexpr uint32_t wf_4k_value = 0x55667788u;
@@ -6489,7 +6489,7 @@ public:
       auto wf_owner =
           cache.ObtainBuffer(base + wf_owner_offset, wf_owner_size, false);
       Require(name, "write fault owner", wf_owner.first != nullptr,
-              "failed to allocate 128 KiB write-fault test owner");
+              "failed to allocate 12 MiB write-fault test owner");
       const auto write_gpu_dword = [&](uint64_t offset, uint32_t value) {
         (void)cache.ObtainBuffer(base + offset, sizeof(value), true, false);
         cache.FillBuffer(base + offset, sizeof(value), value, false);
@@ -6504,7 +6504,7 @@ public:
       uint32_t wf_fault_backing = 0;
       uint32_t wf_4k_backing = 0;
       uint32_t wf_64k_backing = 0;
-      Require(name, "write fault 64 KiB coalescing and isolation",
+      Require(name, "write fault 8 MiB coalescing and isolation",
               Libs::LibKernel::Memory::TryReadBacking(
                   base + wf_fault_offset, &wf_fault_backing,
                   sizeof(wf_fault_backing)) &&
@@ -6523,17 +6523,17 @@ public:
                       base + wf_64k_neighbor, &wf_64k_backing,
                       sizeof(wf_64k_backing)) &&
                   wf_64k_backing == wf_stale,
-              "write-fault ReadMemory failed 64 KiB coalescing or downloaded beyond 64 KiB window");
+              "write-fault ReadMemory failed 8 MiB coalescing or downloaded beyond 8 MiB window");
       cache.ReadMemory(base + wf_64k_neighbor, sizeof(wf_64k_value), false);
       uint32_t wf_64k_after = 0;
-      Require(name, "write fault 64 KiB neighbor publish",
+      Require(name, "write fault 8 MiB neighbor publish",
               Libs::LibKernel::Memory::TryReadBacking(
                   base + wf_64k_neighbor, &wf_64k_after,
                   sizeof(wf_64k_after)) &&
                   wf_64k_after == wf_64k_value &&
                   !cache.IsRegionGpuModified(base + wf_64k_neighbor,
                                              sizeof(wf_64k_value)),
-              "CPU ReadMemory failed to publish 64 KiB neighbor");
+              "CPU ReadMemory failed to publish 8 MiB neighbor");
 
       resources.UnmapMemory(base, allocation_size);
       scheduler.Finish();
@@ -22763,8 +22763,9 @@ public:
             TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), sparse_color.image_id,
                 {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
             const auto tick = scheduler.CurrentTick();
+            const u32 max_draws = gpu_count == 2u ? 50000u : 3u;
             processor.DrawIndirectMulti(
-                0, 3u, reinterpret_cast<const volatile uint32_t *>(gpu_count_addr), stride,
+                0, max_draws, reinterpret_cast<const volatile uint32_t *>(gpu_count_addr), stride,
                 {Pm4::SPI_SHADER_USER_DATA_GS_0 + 0, Pm4::SPI_SHADER_USER_DATA_GS_0 + 1,
                  Pm4::SH_NOP, Pm4::SPI_SHADER_USER_DATA_GS_0 + 2},
                 0u, true);
@@ -22784,6 +22785,33 @@ public:
                       pixels[component] == expected,
                       "GPU indirect count or BuiltInDrawIndex did not produce the expected result");
             }
+          }
+          {
+            constexpr uint64_t cpu_count_addr = gpu_count_addr + 64u;
+            constexpr u32 zero_count = 0u;
+            Require("GpuCountedIndirectDraw", "same-page clean count backing",
+                    LibKernel::Memory::TryWriteBacking(cpu_count_addr, &zero_count,
+                                                       sizeof(zero_count)) &&
+                        buf_cache.IsRegionGpuModified(cpu_count_addr, sizeof(u32)) &&
+                        !buf_cache.HasGpuDirtyBytes(cpu_count_addr, sizeof(u32)),
+                    "same-page CPU count setup failed dirty-byte preconditions");
+            TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), sparse_color.image_id,
+                {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
+            const auto tick = scheduler.CurrentTick();
+            processor.DrawIndirectMulti(
+                0, 50000u, reinterpret_cast<const volatile uint32_t *>(cpu_count_addr), stride,
+                {Pm4::SPI_SHADER_USER_DATA_GS_0 + 0, Pm4::SPI_SHADER_USER_DATA_GS_0 + 1,
+                 Pm4::SH_NOP, Pm4::SPI_SHADER_USER_DATA_GS_0 + 2},
+                0u, true);
+            Require("GpuCountedIndirectDraw", "same-page CPU zero early-out",
+                    scheduler.CurrentTick() == tick &&
+                        buf_cache.HasGpuDirtyBytes(gpu_count_addr, sizeof(u32)),
+                    "same-page clean count_addr caused a readback or wrong draw");
+            const auto pixels = ReadCachedTexel(name, context, sparse_color.image_id,
+                                                {}, {extent, extent, 1});
+            Require("GpuCountedIndirectDraw", "same-page CPU zero pixels",
+                    std::ranges::all_of(pixels, [](u32 v) { return v == 0u; }),
+                    "same-page clean count_addr=0 drew geometry instead of skipping");
           }
           shaders.SetGsShaderResource2({.user_sgpr = 2});
           shaders.SetEsShaderBase(indirect_vs);
@@ -23055,8 +23083,10 @@ public:
             TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), sparse_color.image_id,
                 {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
             const auto tick = scheduler.CurrentTick();
+            const u32 max_mesh_draws = gpu_count == 2u ? 50000u : 3u;
             processor.DrawIndirectMulti(
-                0, 3u, reinterpret_cast<const volatile uint32_t *>(gpu_mesh_count_addr), stride,
+                0, max_mesh_draws,
+                reinterpret_cast<const volatile uint32_t *>(gpu_mesh_count_addr), stride,
                 {Pm4::SPI_SHADER_USER_DATA_GS_0 + 0, Pm4::SPI_SHADER_USER_DATA_GS_0 + 1,
                  Pm4::SH_NOP, Pm4::SPI_SHADER_USER_DATA_GS_0 + 2},
                 0u, true);

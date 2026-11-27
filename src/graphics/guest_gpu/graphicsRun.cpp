@@ -834,13 +834,18 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		return;
 	}
 	uint32_t max_count = max_count_or_count;
-	if (count_addr != nullptr &&
-	    !m_renderer.GetBufferCache().IsRegionGpuModified(reinterpret_cast<uint64_t>(count_addr),
-	                                                     sizeof(uint32_t))) {
-		max_count  = std::min(uint32_t {*count_addr}, max_count_or_count);
-		count_addr = nullptr;
-		if (max_count == 0) {
-			return;
+	if (count_addr != nullptr) {
+		const auto count_vaddr = reinterpret_cast<uint64_t>(count_addr);
+		if (!m_renderer.GetBufferCache().HasGpuDirtyBytes(count_vaddr, sizeof(uint32_t))) {
+			uint32_t cpu_count = 0;
+			if (!LibKernel::Memory::TryReadBacking(count_vaddr, &cpu_count, sizeof(cpu_count))) {
+				cpu_count = *count_addr;
+			}
+			max_count  = std::min(cpu_count, max_count_or_count);
+			count_addr = nullptr;
+			if (max_count == 0) {
+				return;
+			}
 		}
 	}
 
